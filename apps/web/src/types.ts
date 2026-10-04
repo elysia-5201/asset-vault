@@ -105,6 +105,16 @@ export interface AssetTreeResponse {
   truncated?: boolean;
   passwordProtected?: boolean;
   note?: string;
+  /** ?nested=<包内路径> 时返回的是内层压缩包的目录 */
+  path?: string;
+}
+/** 压缩包里解析出来的那个 .unitypackage（一个压缩包里可能有好几个）。 */
+export interface UnityPackageInside {
+  label: string;
+  source: string;
+  size: number;
+  assets: number;
+  note?: string;
 }
 export interface UnityPackageResponse {
   assets: UnityPackageAsset[];
@@ -112,6 +122,9 @@ export interface UnityPackageResponse {
   /** 服务端已算好的总数/类型统计（实测返回 {assets,total,byType}），缺失时前端自行统计 */
   total?: number;
   byType?: Record<string, number>;
+  /** 这个资产里包含的 .unitypackage（容器是压缩包时非空） */
+  packages?: UnityPackageInside[];
+  container?: string;
 }
 
 /** api.md 之外的扩展：POST /scan {dryRun:true} 只读预览（lead 已确认服务端支持） */

@@ -23,7 +23,7 @@ const NESTED_ZIP_MAX_BYTES = 512 * 1024 * 1024;
 const NESTED_CACHE_MAX = 64;
 
 /** 取文件名：本服务可能在 WSL 里跑而路径是 Windows 形式，path.basename 在 POSIX 下不认反斜杠。 */
-const baseName = (p: string): string => String(p).split(/[\\/]/).filter(Boolean).pop() ?? String(p);
+export const baseName = (p: string): string => String(p).split(/[\\/]/).filter(Boolean).pop() ?? String(p);
 
 export interface UnityEditorInfo {
   endpoint: string; serverName: string; dataPath: string; projectPath: string; projectName: string;

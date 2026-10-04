@@ -10,7 +10,7 @@ import {
 import type { AvatarCard, ItemDetailWeb } from "../types";
 import { formatBytes, formatDate, formatYen } from "../util";
 import { ArchiveView } from "./ArchiveView";
-import { Badge, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
+import { Badge, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
 export interface ProjectLite { id: number; name: string; path: string }
 
@@ -517,11 +517,9 @@ export function ItemDetail(props: {
               </div>
               <div className="asset-list">
                 {detail.avatars.map((a) => (
-                  <div className="evidence" key={"ev" + a.id}>
-                    <b>@{a.name}</b> source={a.source ?? "—"}
-                    {a.evidence ? " · 证据来源：" + a.evidence : " · 证据来源：API 未返回 evidence 字段"}
-                  </div>
+                  <EvidenceLine key={"ev" + a.id} name={a.name} source={a.source} evidence={a.evidence} confidence={a.confidence} />
                 ))}
+                {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
               </div>
               <div className="row" style={{ marginTop: "7px" }}>
                 <select value={compatPick} onChange={(e) => setCompatPick(e.target.value ? Number(e.target.value) : "")}>

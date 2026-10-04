@@ -1,5 +1,48 @@
 /** 纯工具：格式化 / 路径解析 / 树构建。无副作用，便于自测。 */
 
+/** 证据来源（avatar evidence）大多是 {"sources":[…],"evidence":[…]}; 也可能是纯文本。 */
+export interface EvidenceGroup { key: string; items: string[] }
+export function parseEvidence(ev: string | null | undefined): { sources: string[]; groups: EvidenceGroup[] } {
+  const raw = String(ev ?? "").trim();
+  const m = /\{[\s\S]*\}/.exec(raw);
+  if (m) {
+    try {
+      const j = JSON.parse(m[0]) as { sources?: unknown; evidence?: unknown };
+      const sources = Array.isArray(j.sources) ? j.sources.map((s) => String(s)) : [];
+      const list = Array.isArray(j.evidence) ? j.evidence.map((s) => String(s)) : [];
+      const map = new Map<string, string[]>();
+      for (const e of list) {
+        const i = e.indexOf(":");
+        const key = i > 0 ? e.slice(0, i).trim() : "其它";
+        const val = (i > 0 ? e.slice(i + 1) : e).trim().replace(/^"|"$/g, "");
+        const arr = map.get(key) ?? [];
+        arr.push(val);
+        map.set(key, arr);
+      }
+      return { sources, groups: [...map].map(([key, items]) => ({ key, items })).sort((a, b) => b.items.length - a.items.length) };
+    } catch { /* 不是 JSON 就当纯文本 */ }
+  }
+  if (raw) {
+    const i = raw.indexOf(":");
+    return { sources: [], groups: i > 0 ? [{ key: raw.slice(0, i).trim(), items: [raw.slice(i + 1).trim()] }] : [{ key: "证据", items: [raw] }] };
+  }
+  return { sources: [], groups: [] };
+}
+
+/** 长路径只留尾巴几段（证据里动辄 200 字符的 unitypackage 路径）。 */
+export function shortenPath(s: string, max = 72): string {
+  const t = String(s ?? "");
+  if (t.length <= max) return t;
+  const parts = t.split("/");
+  let out = parts[parts.length - 1] ?? t;
+  for (let i = parts.length - 2; i >= 0; i--) {
+    const cand = parts[i] + "/" + out;
+    if (cand.length + 2 > max) break;
+    out = cand;
+  }
+  return out === t ? t : "…/" + out;
+}
+
 export function formatBytes(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return "—";
   if (n < 1024) return n + " B";

@@ -1,5 +1,8 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
-import { createReadStream, readFileSync, statSync, existsSync } from "node:fs";
+import { createReadStream, readFileSync, statSync, existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { listArchive } from "../../../../packages/core/src/archive/list";
+import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
 import { basename, extname } from "node:path";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { BoothClient, parseBoothUrl } from "../../../../packages/core/src/source/booth";
@@ -16,7 +19,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
 import { importBoothUrl } from "../services/booth";
-import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, sleep } from "../services/unity";
+import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, baseName, sleep } from "../services/unity";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -265,11 +268,25 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return { asset: a, avatars: repo.listAssetAvatars(a.id) };
     } catch (e) { return fail(reply, e); }
   });
+  /**
+   * 列压缩包目录；?nested=<包内路径> 时列**内层压缩包**的目录（懒展开，避免一次解出所有内层包）。
+   * 很多 VRChat 素材是"一个 zip 里 N 个 per-avatar zip / 一个 zip 里放着 unitypackage"，只列外层等于没看到内容。
+   */
   app.get("/api/assets/:id/tree", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
       const a = repo.getAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
+      const nestedPath = String((req.query as any).nested ?? "");
+      if (nestedPath) {
+        const { readArchiveEntry } = await import("../../../../packages/core/src/archive/list");
+        const tmp = join(tmpdir(), "av-nested-tree-" + process.pid + "-" + Date.now() + "-" + baseName(nestedPath).replace(/[^\w.\-]+/g, "_"));
+        try {
+          writeFileSync(tmp, await readArchiveEntry(a.path, nestedPath, 2 * 1024 * 1024 * 1024));
+          const listing = await listArchive(tmp, { maxEntries: 20000 });
+          return { container: "nested" as const, path: nestedPath, entries: listing.entries, truncated: listing.truncated, passwordProtected: listing.passwordProtected, cached: false };
+        } finally { try { unlinkSync(tmp); } catch { /* ignore */ } }
+      }
       let entries = repo.getArchiveEntries(id);
       if (entries.length === 0 && a.container !== "unitypackage") {
         const { listArchive } = await import("../../../../packages/core/src/archive/list");
@@ -280,21 +297,49 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return { container: a.container, path: a.path, entries, cached: true };
     } catch (e) { return fail(reply, e); }
   });
+  /**
+   * unitypackage 里的资产清单。
+   * 压缩包（zip/7z/rar）里的 unitypackage 也算 —— 发现逻辑与"导入 Unity"完全同一套
+   * （含 per-avatar zip、zip 套 zip），否则"包里明明有 1.6MB 的 .unitypackage，这一栏却是 0"。
+   */
   app.get("/api/assets/:id/unitypackage", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      let assets = repo.getUnityPackageAssets(id);
-      if (assets.length === 0) {
-        const a = repo.getAsset(id);
-        if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
-        const { listUnityPackage } = await import("../../../../packages/core/src/unitypackage");
-        const listing = await listUnityPackage(a.path, { maxAssets: 20000 });
-        repo.replaceUnityPackageAssets(id, listing.assets);
+      const a = repo.getAsset(id);
+      if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
+      let assets: any[] = [];
+      const packages: { label: string; source: string; size: number; assets: number; note?: string }[] = [];
+
+      if (a.container === "unitypackage") {
         assets = repo.getUnityPackageAssets(id);
+        if (!assets.length) {
+          const listing = await listUnityPackage(a.path, { maxAssets: 20000 });
+          repo.replaceUnityPackageAssets(id, listing.assets);
+          assets = repo.getUnityPackageAssets(id);
+        }
+        packages.push({ label: baseName(a.path), source: a.path, size: a.size, assets: assets.length });
+      } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
+        const found = (await listUnityPackageCandidates(repo, a.item_id)).packages.filter((c) => c.assetId === id).slice(0, 6);
+        if (found.length) {
+          const tmpDir = mkdtempSync(join(tmpdir(), "av-upkg-"));
+          try {
+            for (const c of found) {
+              const src = c.innerEntryPath ? c.entryPath + " › " + c.innerEntryPath : (c.entryPath ?? a.path);
+              try {
+                const staged = await stageUnityPackage(c, tmpDir);
+                const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
+                packages.push({ label: c.label, source: src, size: c.size, assets: listing.assets.length, note: c.note });
+                for (const x of listing.assets) assets.push({ ...x, package: c.label });
+              } catch { packages.push({ label: c.label, source: src, size: c.size, assets: 0 }); }
+            }
+          } finally { try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } }
+          if (assets.length > 20000) assets = assets.slice(0, 20000);
+        }
       }
+
       const byType: Record<string, number> = {};
-      for (const a of assets) { const t = (a.type as string) || "other"; byType[t] = (byType[t] ?? 0) + 1; }
-      return { assets, total: assets.length, byType };
+      for (const x of assets) { const t = (x.type as string) || "other"; byType[t] = (byType[t] ?? 0) + 1; }
+      return { assets, total: assets.length, byType, packages, container: a.container };
     } catch (e) { return fail(reply, e); }
   });
   app.get("/api/assets/:id/entry", async (req, reply) => {

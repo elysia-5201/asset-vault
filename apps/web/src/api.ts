@@ -339,8 +339,9 @@ export async function getAsset(id: number): Promise<AssetDetailResponse> {
   const raw = await request<AssetDetailResponse>("GET", "/assets/" + id);
   return { ...(raw as AssetDetailResponse), avatars: arr(raw?.avatars) };
 }
-export async function getAssetTree(id: number): Promise<AssetTreeResponse> {
-  const raw = await request<AssetTreeResponse>("GET", "/assets/" + id + "/tree");
+export async function getAssetTree(id: number, opts: { nested?: string } = {}): Promise<AssetTreeResponse> {
+  const q = opts.nested ? "?nested=" + encodeURIComponent(opts.nested) : "";
+  const raw = await request<AssetTreeResponse>("GET", "/assets/" + id + "/tree" + q);
   return { ...(raw as AssetTreeResponse), entries: arr<ArchiveEntry>(raw?.entries) };
 }
 export async function getUnityPackage(id: number): Promise<UnityPackageResponse> {
@@ -350,7 +351,12 @@ export async function getUnityPackage(id: number): Promise<UnityPackageResponse>
   const byType = byTypeRaw && typeof byTypeRaw === "object" && !Array.isArray(byTypeRaw)
     ? (byTypeRaw as Record<string, number>)
     : undefined;
-  return { ...(raw as UnityPackageResponse), assets, total: numOr(rec(raw).total, assets.length), byType };
+  const pkgs = rec(raw).packages;
+  return {
+    ...(raw as UnityPackageResponse), assets, total: numOr(rec(raw).total, assets.length), byType,
+    packages: Array.isArray(pkgs) ? (pkgs as UnityPackageResponse["packages"]) : undefined,
+    container: typeof rec(raw).container === "string" ? String(rec(raw).container) : undefined,
+  };
 }
 export async function reindexAsset(id: number): Promise<JobIdResponse> {
   return jobIdResponse(await request<unknown>("POST", "/assets/" + id + "/reindex"));
