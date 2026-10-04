@@ -154,7 +154,15 @@ async function request<T>(method: string, path: string, body?: unknown, opts: { 
   } catch (e) {
     if (e instanceof ApiError) throw e;
     if (e instanceof MockHttpError) throw new ApiError(e.code, e.message, e.status);
-    // 网络层失败（服务未起/被中断）→ 回退 mock，UI 会订阅到模式变化并重载
+    // 网络层失败 —— 但先确认后端是不是真的死了。
+    // 反例（实测踩过）：某个请求自己超时（大压缩包列目录、BOOTH 抓取、Unity 桥探测都可能是慢的），
+    // 旧逻辑会当场把整个界面切成内置 mock 数据（"10 条目 / 9 资产"），而且再也切不回来 —— 看起来就是"卡住了"。
+    if (await probeHealth(1500)) {
+      const aborted = (e as Error)?.name === "AbortError";
+      throw new ApiError("UPSTREAM_ERROR", aborted
+        ? "这次请求超时了（后端还在，只是太慢；可重试或先缩小范围）"
+        : "请求失败：" + String((e as Error)?.message ?? e), 504);
+    }
     setMode("mock");
     return fromMock<T>(method, path, body);
   } finally {
