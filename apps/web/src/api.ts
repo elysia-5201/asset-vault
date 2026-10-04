@@ -240,7 +240,14 @@ export function setCover(id: number, imageId: number): Promise<unknown> { return
 export function addAsset(id: number, path: string): Promise<AssetRow> { return request("POST", "/items/" + id + "/assets", { path }); }
 /** 套装/合集 */
 export function getCollections(): Promise<{ collections: { id: number; name: string; itemCount: number }[] }> { return request("GET", "/collections"); }
+export interface CollectionMember { id: number; title: string; status: ItemStatus; sourceSite: SourceSite }
+/** 套装成员（用于"把套装里的其他条目合并到本条"）。 */
+export function getCollection(id: number): Promise<{ id: number; itemIds: number[]; items: CollectionMember[] }> {
+  return request("GET", "/collections/" + id);
+}
 export function createCollection(name: string, itemIds?: number[]): Promise<{ id: number; name: string; itemCount: number }> { return request("POST", "/collections", { name, itemIds }); }
+/** 删掉整个套装（只删分组，不动条目本身）。 */
+export function deleteCollection(id: number): Promise<unknown> { return request("DELETE", "/collections/" + id); }
 export function addToCollection(id: number, itemIds: number[]): Promise<unknown> { return request("POST", "/collections/" + id + "/items", { itemIds }); }
 export function removeFromCollection(id: number, itemId: number): Promise<unknown> { return request("DELETE", "/collections/" + id + "/items/" + itemId); }
 /** 合并条目：把 source 的压缩包/图片/模型/标签/历史并到 target，source 进回收站 */

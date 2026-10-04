@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
-  getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
+  deleteCollection, getCollection, getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
+  type CollectionMember,
   unityImport, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
@@ -55,6 +56,8 @@ export function ItemDetail(props: {
   const [unityNote, setUnityNote] = useState("");
   const [unityPickNote, setUnityPickNote] = useState("");
   const [unityErrors, setUnityErrors] = useState<string[]>([]);
+  /** 套装 id → 成员条目（用来一键"并到本条"） */
+  const [collMembers, setCollMembers] = useState<Record<number, CollectionMember[]>>({});
 
   const load = useCallback(() => {
     setLoading(true); setErr("");
@@ -183,6 +186,21 @@ export function ItemDetail(props: {
 
   useEffect(() => { void loadUnity(); }, [loadUnity]);
 
+  /** 套装成员（用于"把套装里的其他条目并到本条"）；套装 id 变了才重拉。 */
+  const collIds = (detail?.collections ?? []).map((c) => c.id).join(",");
+  useEffect(() => {
+    const ids = (detail?.collections ?? []).map((c) => c.id);
+    if (!ids.length) { setCollMembers({}); return; }
+    let alive = true;
+    Promise.all(ids.map((id) => getCollection(id).catch(() => null))).then((rs) => {
+      if (!alive) return;
+      const next: Record<number, CollectionMember[]> = {};
+      rs.forEach((r, i) => { const id = ids[i]; if (r && id !== undefined) next[id] = r.items; });
+      setCollMembers(next);
+    });
+    return () => { alive = false; };
+  }, [collIds]);
+
   const doUnityImport = () => {
     if (!unityPicked.size || unityBusy) return;
     setUnityBusy(true); setUnityNote(""); setUnityErrors([]);
@@ -283,10 +301,30 @@ export function ItemDetail(props: {
                 {(detail.collections ?? []).map((c) => (
                   <span key={c.id} className="row" style={{ gap: "2px", alignItems: "center" }}>
                     <Badge tone="violet">{c.name}</Badge>
-                    <button className="btn tiny" title="移出套装" onClick={() => guard(removeFromCollection(c.id, itemId), "已移出套装")}>×</button>
+                    <button className="btn tiny" title="把本条移出这个套装" onClick={() => guard(removeFromCollection(c.id, itemId), "已移出套装")}>×</button>
+                    <button className="btn tiny danger" title="删除整个套装（只删分组，不动条目本身）" onClick={() => { if (window.confirm("删除套装「" + c.name + "」？\n只删这个分组，条目本身不受影响。")) guard(deleteCollection(c.id), "已删除套装「" + c.name + "」"); }}>🗑</button>
                   </span>
                 ))}
               </div>
+              {/* 套装只是归组：成员仍是各自独立的条目。这里直接把同套装的其它条目并进来（可恢复）。 */}
+              {(detail.collections ?? []).map((c) => {
+                const others = (collMembers[c.id] ?? []).filter((m) => m.id !== itemId && m.status !== "trashed");
+                if (!others.length) return null;
+                return (
+                  <div key={"m" + c.id} className="row wrap" style={{ gap: "4px", alignItems: "center", marginTop: "4px" }}>
+                    <span className="hint">{c.name} 里还有：</span>
+                    {others.map((m) => (
+                      <button
+                        key={m.id}
+                        className="btn tiny"
+                        disabled={busy}
+                        title={"把 #" + m.id + "「" + m.title + "」合并到本条（它的压缩包/图片/标签并过来，它进回收站、可恢复）"}
+                        onClick={() => { if (window.confirm("把 #" + m.id + "「" + m.title + "」并进本条？\n它的压缩包/图片/标签/模型会归到本条，#" + m.id + " 进回收站（可恢复）。")) guard(mergeItems(m.id, itemId), "已把 #" + m.id + " 并入本条"); }}
+                      >#{m.id} {m.title.slice(0, 20)} ⤵并入</button>
+                    ))}
+                  </div>
+                );
+              })}
               <div className="row" style={{ marginTop: "6px" }}>
                 <input placeholder="套装名（如 Danzai Bunny）" value={collName} onChange={(e) => setCollName(e.target.value)} style={{ flex: 1 }} />
                 <button className="btn tiny" disabled={!collName.trim() || busy} onClick={() => guard(createCollection(collName.trim(), [itemId]), "已加入套装「" + collName.trim() + "」")}>加入套装</button>
