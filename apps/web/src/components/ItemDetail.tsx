@@ -3,7 +3,8 @@ import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
   getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
-  type EntryPreview,
+  unityImport, unityPackages, unityStatus,
+  type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
 import type { AvatarCard, ItemDetailWeb } from "../types";
 import { formatBytes, formatDate, formatYen } from "../util";
@@ -47,6 +48,12 @@ export function ItemDetail(props: {
   const [compatMatch, setCompatMatch] = useState<AvatarMatch>("any");
   const [busy, setBusy] = useState(false);
   const boothInputRef = useRef<HTMLInputElement | null>(null);
+  const [unity, setUnity] = useState<UnityStatusWeb | null>(null);
+  const [unityPkgs, setUnityPkgs] = useState<UnityPackageWeb[]>([]);
+  const [unityPicked, setUnityPicked] = useState<Set<string>>(new Set());
+  const [unityBusy, setUnityBusy] = useState(false);
+  const [unityNote, setUnityNote] = useState("");
+  const [unityErrors, setUnityErrors] = useState<string[]>([]);
 
   const load = useCallback(() => {
     setLoading(true); setErr("");
@@ -138,6 +145,40 @@ export function ItemDetail(props: {
       .then((res: any) => { props.onToast("ok", okText(res)); setBoothUrl(""); load(); props.onChanged(); })
       .catch((e) => props.onToast("bad", describeError(e)))
       .finally(() => setBoothBusy(false));
+  };
+
+  /** 探测当前打开的 Unity（MCP for Unity）+ 这个条目里的 .unitypackage 清单。 */
+  const loadUnity = useCallback(() => {
+    setUnityBusy(true); setUnityNote(""); setUnityErrors([]);
+    Promise.allSettled([unityStatus(), unityPackages(itemId)])
+      .then(([st, pk]) => {
+        const s = st.status === "fulfilled" ? st.value : null;
+        setUnity(s ?? { ok: false, endpoint: "", error: st.status === "rejected" ? describeError(st.reason) : "MCP 未响应", candidates: [] });
+        const list = pk.status === "fulfilled" ? pk.value.packages : [];
+        setUnityPkgs(list);
+        setUnityPicked(new Set(list.map((p) => p.key)));
+      })
+      .finally(() => setUnityBusy(false));
+  }, [itemId]);
+
+  useEffect(() => { loadUnity(); }, [loadUnity]);
+
+  const doUnityImport = () => {
+    if (!unityPicked.size || unityBusy) return;
+    setUnityBusy(true); setUnityNote(""); setUnityErrors([]);
+    unityImport(itemId, [...unityPicked])
+      .then((r) => {
+        const name = r.project?.name ?? "Unity";
+        setUnityNote("已把 " + r.queued.length + " 个包交给 " + name + "（" + (r.project?.unityVersion ?? "") + "）导入"
+          + (r.failed.length ? "；失败 " + r.failed.length + " 个：" + r.failed.join(" / ") : "")
+          + (r.imported.length ? "；落地：" + r.imported.map((x) => x.label + " " + formatBytes(x.bytes)).join(", ") : ""));
+        setUnityErrors(r.consoleErrors ?? []);
+        props.onToast("ok", "已导入到 " + name + (r.consoleErrors?.length ? "（控制台有 " + r.consoleErrors.length + " 条报错）" : "（控制台无报错）"));
+        props.onChanged();
+        load();
+      })
+      .catch((e) => { setUnityNote("导入失败：" + describeError(e)); props.onToast("bad", describeError(e)); })
+      .finally(() => setUnityBusy(false));
   };
 
   /** 没有可用商品链接时：把「关联 BOOTH 商品」输入框滚进视野并聚焦。 */
@@ -333,14 +374,70 @@ export function ItemDetail(props: {
               </table>
             </Section>
 
-            <Section title="导入到 Unity 工程">
+            <Section
+              title="导入到 Unity 工程"
+              right={<button className="btn tiny" disabled={unityBusy} onClick={loadUnity}>{unityBusy ? "检测中…" : "重新检测"}</button>}
+            >
+              {unity?.ok && unity.editor ? (
+                <>
+                  <div className="row wrap" style={{ alignItems: "center", gap: "6px" }}>
+                    <Badge tone="ok">已连接</Badge>
+                    <span className="hint">{unity.editor.projectName} · Unity {unity.editor.unityVersion}{unity.editor.isPlaying ? " · 播放中" : ""}{unity.editor.isCompiling ? " · 编译中" : ""}</span>
+                  </div>
+                  <div className="hint mono" style={{ wordBreak: "break-all", fontSize: "10px" }}>{unity.editor.projectPath} ← {unity.endpoint}</div>
+                  {!unityPkgs.length && (
+                    <div className="hint" style={{ marginTop: "6px" }}>
+                      这个条目里没找到 .unitypackage{detail.assets.length ? "（压缩包还没索引的话，先在下面「资产」里重建索引）" : "（这个条目还没有资产）"}。
+                    </div>
+                  )}
+                  {unityPkgs.length > 0 && (
+                    <>
+                      <div className="hint" style={{ marginTop: "6px" }}>
+                        找到 {unityPkgs.length} 个包。导入前会清空 Unity 控制台，导入后回读报错。
+                      </div>
+                      <div className="unity-pkgs">
+                        {unityPkgs.map((p) => (
+                          <label className="unity-pkg" key={p.key} title={p.entryPath ? p.sourcePath + " › " + p.entryPath : p.sourcePath}>
+                            <input
+                              type="checkbox"
+                              checked={unityPicked.has(p.key)}
+                              onChange={(e) => setUnityPicked((prev) => { const n = new Set(prev); if (e.target.checked) n.add(p.key); else n.delete(p.key); return n; })}
+                            />
+                            <span className="unity-pkg-name">{p.label}</span>
+                            <span className="hint">{formatBytes(p.size)}{p.note ? " · " + p.note : ""}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="row wrap" style={{ marginTop: "6px", gap: "6px" }}>
+                        <button className="btn" disabled={unityBusy || !unityPicked.size} onClick={doUnityImport}>
+                          {unityBusy ? "导入中…" : "导入到 " + unity.editor.projectName + "（" + unityPicked.size + "）"}
+                        </button>
+                        <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.map((p) => p.key)))}>全选</button>
+                        <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set())}>全不选</button>
+                      </div>
+                    </>
+                  )}
+                  {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}
+                  {unityErrors.length > 0 && (
+                    <div className="notice bad" style={{ marginTop: "6px" }}>
+                      Unity 控制台报错 {unityErrors.length} 条：{unityErrors.slice(0, 3).join(" ｜ ")}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="hint">
+                  没连上 Unity（{unity?.error ?? "检测中…"}）。在 Unity 里装好并打开 MCP for Unity，然后点右上「重新检测」。
+                  {unity?.candidates?.length ? <> 本机探测：<span className="mono">{unity.candidates.join(" / ")}</span></> : null}
+                </div>
+              )}
+              <div className="hr" />
               <div className="row wrap">
                 {props.projects.map((p) => (
-                  <button key={p.id} className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>标记已导入 → {p.name}</button>
+                  <button key={p.id} className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>仅登记：已导入 → {p.name}</button>
                 ))}
-                {!props.projects.length && <span className="hint">无已登记工程（POST /projects）</span>}
+                {!props.projects.length && <span className="hint">无已登记工程</span>}
               </div>
-              <div className="hint" style={{ marginTop: "4px" }}>走 POST /projects/:id/imports；「已导入」过滤基于本地登记。</div>
+              <div className="hint" style={{ marginTop: "4px" }}>上面是"真的导进 Unity"；下面这排只写本地登记（POST /projects/:id/imports），不动 Unity。</div>
             </Section>
           </div>
 

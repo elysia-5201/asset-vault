@@ -103,9 +103,9 @@ function fromMock<T>(method: string, path: string, body?: unknown): T {
   return out.body as T;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number } = {}): Promise<T> {
   if (mode === "mock") return fromMock<T>(method, path, body);
-  const t = timeoutSignal(20000);
+  const t = timeoutSignal(opts.timeoutMs ?? 20000);
   try {
     const res = await fetch(API_BASE + path, {
       method,
@@ -213,6 +213,34 @@ export function removeFromCollection(id: number, itemId: number): Promise<unknow
 /** 合并条目：把 source 的压缩包/图片/模型/标签/历史并到 target，source 进回收站 */
 export function mergeItems(sourceId: number, targetId: number): Promise<unknown> { return request("POST", "/items/merge", { sourceId, targetId }); }
 /** 把已有（扫库建出来的）本地条目关联到 BOOTH 商品：补元数据 + 抓图集。merge=true 时合并到已存在的同商品条目。 */
+// ---------- Unity 编辑器桥（把素材真正导入当前打开的工程）----------
+export interface UnityEditorInfoWeb {
+  endpoint: string; serverName: string; dataPath: string; projectPath: string; projectName: string;
+  unityVersion: string; isPlaying: boolean; isCompiling: boolean; scenePath: string;
+}
+export interface UnityStatusWeb {
+  ok: boolean; endpoint: string; serverName?: string; error?: string; editor?: UnityEditorInfoWeb;
+  projectId?: number | null; registered?: boolean; candidates: string[];
+}
+export interface UnityPackageWeb {
+  key: string; label: string; assetId: number; container: string; sourcePath: string;
+  entryPath: string | null; innerEntryPath: string | null; size: number; note?: string;
+}
+export interface UnityImportWeb {
+  ok: boolean; endpoint: string; project: { id: number; name: string; path: string; unityVersion: string };
+  imported: { key: string; label: string; stagedPath: string; bytes: number }[];
+  queued: string[]; failed: string[]; consoleErrors: string[]; consoleCleared?: boolean; raw: string;
+}
+/** 探测当前打开的 Unity 编辑器（MCP for Unity）。Unity 没开时返回 {ok:false}，不抛错。 */
+export function unityStatus(): Promise<UnityStatusWeb> { return request("GET", "/unity/status", undefined, { timeoutMs: 12000 }); }
+/** 这个条目里能导入 Unity 的 .unitypackage（压缩包内的也列出来）。 */
+export function unityPackages(itemId: number): Promise<{ itemId: number; packages: UnityPackageWeb[] }> {
+  return request("GET", "/unity/packages" + queryString({ itemId }), undefined, { timeoutMs: 60000 });
+}
+/** 真正导入到当前打开的 Unity 工程；keys 省略 = 全部导入。 */
+export function unityImport(itemId: number, keys?: string[]): Promise<UnityImportWeb> {
+  return request("POST", "/unity/import", { itemId, keys }, { timeoutMs: 180000 });
+}
 export function linkBooth(id: number, url: string, merge = false): Promise<unknown> {
   return request("POST", "/items/" + id + "/link-booth", { url, merge });
 }

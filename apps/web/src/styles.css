@@ -83,6 +83,12 @@ input[type=checkbox] { accent-color: var(--accent); }
 .mono { font-family: var(--mono); }
 .err { color: #ffb9ae; background: rgba(232,98,79,.12); border: 1px solid rgba(232,98,79,.4); border-radius: 8px; padding: 7px 9px; font-size: 12px; }
 .notice { color: var(--fg-dim); background: var(--accent-soft); border: 1px solid rgba(77,163,255,.35); border-radius: 8px; padding: 6px 9px; font-size: 12px; }
+.notice.bad { color: #ffd9d9; background: rgba(255,86,86,.10); border-color: rgba(255,86,86,.45); }
+.unity-pkgs { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; max-height: 168px; overflow: auto; }
+.unity-pkg { display: flex; align-items: center; gap: 6px; font-size: 11.5px; padding: 2px 4px; border-radius: 6px; cursor: pointer; }
+.unity-pkg:hover { background: var(--bg-hi); }
+.unity-pkg input { flex: 0 0 auto; }
+.unity-pkg-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .seg button { border: 0; background: transparent; color: var(--fg-dim); padding: 3px 9px; font-size: 12px; }
 .seg button.on { background: var(--accent-soft); color: #fff; box-shadow: inset 0 0 0 1px var(--accent); }

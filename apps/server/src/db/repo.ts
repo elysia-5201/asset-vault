@@ -527,6 +527,10 @@ export class Repo {
     if (ex) return ex.id;
     return Number(this.db.prepare("INSERT INTO projects(name, path, path_norm, created_at) VALUES (?,?,?,?)").run(name, path, pn, now()).lastInsertRowid);
   }
+  /** 记下工程用的 Unity 版本（导入时由编辑器自己报，比人填可靠）。 */
+  setProjectUnityVersion(projectId: number, version: string | null): void {
+    this.db.prepare("UPDATE projects SET unity_version=?, last_scan_at=? WHERE id=?").run(version, now(), projectId);
+  }
   addProjectImport(projectId: number, itemId: number, assetId: number | null, note: string | null): void {
     this.db.prepare("INSERT OR REPLACE INTO project_imports(project_id, item_id, asset_id, imported_at, note) VALUES (?,?,?,?,?)").run(projectId, itemId, assetId, now(), note);
   }

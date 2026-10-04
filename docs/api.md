@@ -68,6 +68,26 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | GET | `/media/:imageId?w=` | 缩略图/原图字节（sharp 生成缓存） |
 | GET | `/stats` | `{items, assets, bytes, avatars, byCategory[], byAvatar[]}` |
 | GET | `/export/items.json` | 全量导出 |
+| GET | `/unity/status` | Unity 桥探测（连不上也是 200） |
+| GET | `/unity/packages?itemId=` | 可导入的 .unitypackage 清单 |
+| POST | `/unity/import` `{itemId, keys?}` | **真导入**到当前打开的 Unity 工程 |
+
+## Unity 编辑器（把素材**真的**导进当前打开的工程）
+
+服务端自己当 MCP 客户端，连本机 `mcp-for-unity`（Streamable HTTP，默认 `http://127.0.0.1:8080/mcp`，其次 `14523`；可用 `PUT /settings {unityMcpUrl}` 覆盖），
+用它的 `execute_code` 在编辑器主线程调 `AssetDatabase.ImportPackage(path, false)`——不是"登记一下"，是真的导入。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/unity/status` | 探测当前编辑器。**连不上也返回 200**：`{ok:false, error, candidates[]}`；成功时带 `editor:{projectPath, projectName, unityVersion, isPlaying, isCompiling, scenePath}` |
+| GET | `/unity/packages?itemId=` | 这个条目里可导入的 `.unitypackage`（压缩包内的、含一层 zip 套 zip 的也列）：`{itemId, packages:[{key, label, assetId, container, sourcePath, entryPath, innerEntryPath, size, note?}]}` |
+| POST | `/unity/import` `{itemId, keys?}` | `keys` 省略=全部（上限 20）。返回 `{ok, endpoint, project:{id,name,path,unityVersion}, imported[], queued[], failed[], consoleErrors[], consoleCleared}` |
+
+行为要点：
+- 导入前**清空 Unity 控制台**，导入后隔 1.8s 回读 `read_console` 的 error —— 所以 `consoleErrors` 一定是这次导入产生的。
+- 压缩包内的包会先"落地"到 `<dataDir>/unity-staging/<assetId>/`，再交给 Unity（`AssetDatabase.ImportPackage` 只吃磁盘上的文件）。
+- 当前工程会自动登记进 `projects`（`unity_version` 由编辑器上报）并写 `project_imports`。
+- WSL 里跑服务也能用：路径会自动翻译成 `/mnt/c/...`→`C:\...`、其余→`\\wsl.localhost\<distro>\...`。
 
 ## 响应包裹形状（实测固定，前端请按此解析）
 

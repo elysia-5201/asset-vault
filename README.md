@@ -46,6 +46,7 @@ nohup node --import tsx apps/server/src/main.ts > logs/server.out 2>&1 &
 | 作业与恢复 | 13 状态状态机 + CAS 转移；`kill -9` 后重启自动回收在飞作业（`recovered` 事件可查） |
 | 回收站 | 软删可恢复；磁盘文件缺失只标 `missing`，记录与收藏不丢 |
 | 收件箱监听 | 把 IDM/浏览器下载目录设为收件箱，新落盘的 zip/7z/rar/unitypackage **自动建档入库**（chokidar 轮询 + awaitWriteFinish，3 秒静默后触发） |
+| **真导入 Unity** | 抽屉里「导入到 Unity 工程」：探测**当前打开的编辑器**（mcp-for-unity，本机 8080/14523），列出条目里所有 `.unitypackage`（压缩包内的、zip 套 zip 的也算）→ 勾选 → `AssetDatabase.ImportPackage(path,false)` 真导入；导入前清控制台、导入后回读 error，并自动登记工程与"已导入" |
 
 ## 架构
 

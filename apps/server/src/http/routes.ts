@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
 import { importBoothUrl } from "../services/booth";
+import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, sleep } from "../services/unity";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -40,6 +41,19 @@ let deps_log: (m: string) => void = () => {};
 export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
   const { repo, media, booth } = deps;
+
+  /** Unity 桥端点：settings.unity_mcp_url 优先，否则探测本机两个已知端口。 */
+  const unityUrls = (): string[] => {
+    const saved = (repo.getSetting("unity_mcp_url") ?? "").trim();
+    return saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
+  };
+  let unityCache: { key: string; client: UnityMcp } | null = null;
+  const unity = (): UnityMcp => {
+    const urls = unityUrls();
+    const key = urls.join(",");
+    if (!unityCache || unityCache.key !== key) unityCache = { key, client: new UnityMcp(urls) };
+    return unityCache.client;
+  };
 
   // ---------- health ----------
   app.get("/api/health", async () => ({
@@ -474,6 +488,77 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     } catch (e) { return fail(reply, e); }
   });
 
+  // ---------- Unity 编辑器（mcp-for-unity）：把素材真正导入"当前打开的那个工程" ----------
+  app.get("/api/unity/status", async () => {
+    // 状态探测用短超时的独立客户端：Unity 没开时不能把请求吊住。
+    const u = new UnityMcp(unityUrls(), 8000);
+    const candidates = unityUrls();
+    try {
+      const editor = await unityEditorInfo(u);
+      const proj = (repo.listProjects() as any[]).find((p) => p.path_norm === normalizePath(editor.projectPath));
+      return { ok: true, endpoint: u.endpoint, serverName: u.serverName, editor, projectId: proj?.id ?? null, registered: !!proj, candidates };
+    } catch (e) {
+      return { ok: false, endpoint: u.endpoint, serverName: "", error: String((e as Error)?.message ?? e), candidates };
+    }
+  });
+
+  /** 列出这个条目里所有可导入的 .unitypackage（压缩包内的也列，附大小）。 */
+  app.get("/api/unity/packages", async (req, reply) => {
+    try {
+      const itemId = toInt((req.query as any).itemId, 0);
+      if (!itemId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 必填" } });
+      const packages = await listUnityPackageCandidates(repo, itemId);
+      return { itemId, packages };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 真正导入：解出包 → AssetDatabase.ImportPackage(path,false) → 登记 project_imports。 */
+  app.post("/api/unity/import", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const itemId = toInt(b.itemId, 0);
+      if (!itemId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 必填" } });
+      if (!repo.getItem(itemId)) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+
+      const u = unity();
+      const editor = await unityEditorInfo(u);
+      const all = await listUnityPackageCandidates(repo, itemId);
+      const keys: string[] = Array.isArray(b.keys) ? b.keys.map((k: any) => String(k)) : [];
+      const picked = (keys.length ? all.filter((c) => keys.includes(c.key)) : all).slice(0, 20);
+      if (!picked.length) {
+        return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "这个条目里没有可导入的 .unitypackage（压缩包还没索引的话，先在资产上重建索引）" } });
+      }
+
+      // 先清控制台：导入后读到的 error 才是这次导入产生的（否则会把编辑器里的历史报错算成导入报错）。
+      const consoleCleared = await clearUnityConsole(u);
+      const stagingDir = join(deps.dataDir, "unity-staging");
+      const staged: { key: string; label: string; assetId: number; stagedPath: string; bytes: number }[] = [];
+      for (const c of picked) {
+        const s = await stageUnityPackage(c, stagingDir);
+        staged.push({ key: c.key, label: c.label, assetId: c.assetId, stagedPath: s.path, bytes: s.bytes });
+      }
+
+      const r = await importPackagesIntoUnity(u, staged.map((s) => s.stagedPath));
+      const projectId = repo.ensureProject(editor.projectName || basename(editor.projectPath), editor.projectPath);
+      repo.setProjectUnityVersion(projectId, editor.unityVersion || null);
+      for (const s of staged) {
+        repo.addProjectImport(projectId, itemId, s.assetId, "unity:" + s.label + " (" + Math.round(s.bytes / 1048576) + "MB)");
+      }
+
+      // Unity 的导入是异步的：等一拍再读控制台里的 error，方便前端直接显示"导完有没有报错"。
+      let consoleErrors: string[] = [];
+      if (r.queued.length) { await sleep(1800); consoleErrors = await readUnityConsole(u, ["error"], 20); }
+      deps.log("unity import: item " + itemId + " -> " + editor.projectName + " queued=" + r.queued.length + " failed=" + r.failed.length + " errors=" + consoleErrors.length);
+
+      return {
+        ok: r.failed.length === 0, endpoint: u.endpoint,
+        project: { id: projectId, name: editor.projectName, path: editor.projectPath, unityVersion: editor.unityVersion },
+        imported: staged.map((s) => ({ key: s.key, label: s.label, stagedPath: s.stagedPath, bytes: s.bytes })),
+        consoleCleared, queued: r.queued, failed: r.failed, consoleErrors, raw: r.raw,
+      };
+    } catch (e) { return fail(reply, e); }
+  });
+
   // ---------- 套装 / 合集（collection）与条目合并 ----------
   app.get("/api/collections", async () => ({ collections: repo.listCollections() }));
   app.post("/api/collections", async (req, reply) => {
@@ -529,6 +614,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     dataDir: deps.dataDir,
     dbPath: deps.dbPath,
     watchPaths: listWatches(repo),
+    unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
+    unityMcpCandidates: UNITY_MCP_URLS,
   }));
   app.put("/api/settings", async (req, reply) => {
     try {
@@ -537,7 +624,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         mkdirSync(b.downloadRoot.trim(), { recursive: true });
         repo.setSetting("download_root", b.downloadRoot.trim());
       }
-      return { downloadRoot: downloadRootOf(repo, deps.dataDir) };
+      if (typeof b.unityMcpUrl === "string") repo.setSetting("unity_mcp_url", b.unityMcpUrl.trim());
+      return { downloadRoot: downloadRootOf(repo, deps.dataDir), unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim() };
     } catch (e) { return fail(reply, e); }
   });
 
