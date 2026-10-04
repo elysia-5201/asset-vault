@@ -187,6 +187,9 @@ table.kv td.k { color: var(--fg-mute); width: 88px; white-space: nowrap; }
 .evidence { font-size: 11px; color: var(--fg-dim); background: #101720; border: 1px dashed var(--line); border-radius: 7px; padding: 4px 7px; font-family: var(--mono); word-break: break-all; }
 .tag-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--bg-hi); border: 1px solid var(--line); }
 .tag-chip button { border: 0; background: transparent; color: var(--fg-mute); cursor: pointer; padding: 0; }
+button.tag-chip { cursor: pointer; color: var(--fg-mute); }
+button.tag-chip:hover { color: var(--fg); border-color: var(--line-soft); }
+button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-color: rgba(77,163,255,.5); }
 .tag-chip button:hover { color: var(--bad); }
 
 /* ---------- jobs ---------- */

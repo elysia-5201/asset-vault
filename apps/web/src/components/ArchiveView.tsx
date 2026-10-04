@@ -62,6 +62,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [needle, setNeedle] = useState("");
+  const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [nested, setNested] = useState<Record<string, ArchiveEntry[]>>({});
   const [nestedOpen, setNestedOpen] = useState<Set<string>>(new Set());
@@ -73,7 +74,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
   useEffect(() => {
     let alive = true;
     setErr(""); setPreview(null); setEntries([]);
-    setNested({}); setNestedOpen(new Set()); setNeedle("");
+    setNested({}); setNestedOpen(new Set()); setNeedle(""); setTypeFilter(null);
     setTab(isUp ? "unitypackage" : "tree");
     getAsset(asset.id).then((d) => { if (alive) setAssetAvatars(d.avatars ?? []); }).catch(() => { /* 证据可缺省 */ });
     if (!isUp) {
@@ -128,11 +129,12 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
     for (const a of upAssets) m.set(a.type ?? "(未知)", (m.get(a.type ?? "(未知)") ?? 0) + 1);
     return [...m].sort((a, b) => b[1] - a[1]);
   }, [upAssets, upByType]);
-  const maxType = typeStats.length ? typeStats[0][1] : 1;
-  const upFiltered = useMemo(
-    () => (needle ? upAssets.filter((a) => a.assetPath.toLowerCase().includes(needle.toLowerCase())) : upAssets),
-    [upAssets, needle],
-  );
+  /** 一行的类型标签：服务端 byType 用 "other" 兜底，前端自算时用 "(未知)"。 */
+  const typeOf = useCallback((a: UpAssetRow) => a.type ?? (upByType ? "other" : "(未知)"), [upByType]);
+  const upFiltered = useMemo(() => {
+    const n = needle.trim().toLowerCase();
+    return upAssets.filter((a) => (!typeFilter || typeOf(a) === typeFilter) && (!n || a.assetPath.toLowerCase().includes(n)));
+  }, [upAssets, needle, typeFilter, typeOf]);
   const multiPkg = upPackages.length > 1;
 
   const toggle = (p: string) => setExpanded((s) => { const n = new Set(s); if (n.has(p)) n.delete(p); else n.add(p); return n; });
@@ -223,16 +225,20 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
               ))}
             </div>
           )}
-          <div className="hint" style={{ marginBottom: "4px" }}>类型统计来源：{upByType ? "服务端 byType" : "前端按 assets[].type 统计"}</div>
-          <div className="stat-bars" style={{ marginBottom: "7px" }}>
-            {typeStats.map(([t, n]) => (
-              <div className="stat-bar" key={t}>
-                <span title={t}>{t}</span>
-                <span className="track"><span className="fill" style={{ width: (n / maxType) * 100 + "%" }} /></span>
-                <span>{n}</span>
-              </div>
-            ))}
-          </div>
+          {typeStats.length > 0 && (
+            <div className="row wrap" style={{ gap: "4px", marginBottom: "6px" }}>
+              <button className={"tag-chip" + (typeFilter === null ? " on" : "")} onClick={() => setTypeFilter(null)} title="显示全部类型">全部 {upAssets.length}</button>
+              {typeStats.map(([t, n]) => (
+                <button
+                  key={t}
+                  className={"tag-chip" + (typeFilter === t ? " on" : "")}
+                  title={"只看 " + t + "（" + n + " 项）"}
+                  onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+                >{t} {n}</button>
+              ))}
+              <span className="hint" style={{ alignSelf: "center" }}>点类型筛选</span>
+            </div>
+          )}
           <div className="tree">
             {upFiltered.map((a) => (
               <div
@@ -245,7 +251,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
                 <span className="sz">{multiPkg && a.package ? a.package + " · " : ""}{a.type ?? "?"} · {formatBytes(a.size)} · {a.guid.slice(0, 8)}</span>
               </div>
             ))}
-            {!upFiltered.length && <div className="hint">{upAssets.length ? "过滤后无匹配" : "这个资产里没有解析出 .unitypackage 资产"}</div>}
+            {!upFiltered.length && <div className="hint">{upAssets.length ? "过滤后无匹配（当前 " + (typeFilter ? "类型=" + typeFilter + " " : "") + (needle ? "路径含「" + needle + "」" : "") + "）" : "这个资产里没有解析出 .unitypackage 资产"}</div>}
           </div>
         </>
       )}
