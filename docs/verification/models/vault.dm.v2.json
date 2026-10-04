@@ -1,0 +1,967 @@
+{
+  "schemaVersion": 1,
+  "entities": [
+    {
+      "name": "items",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "source_site",
+          "source_item_id"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "uid",
+          "type": "uuid",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "source_site",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "booth",
+            "local",
+            "other"
+          ]
+        },
+        {
+          "name": "source_item_id",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "status",
+          "type": "enum",
+          "required": true,
+          "default": "inbox",
+          "enum": [
+            "inbox",
+            "active",
+            "archived",
+            "trashed"
+          ]
+        },
+        {
+          "name": "cover_image_id",
+          "type": "integer",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "compat_declared_count",
+          "type": "integer",
+          "required": false,
+          "nullable": true,
+          "min": 0,
+          "max": 500
+        },
+        {
+          "name": "id_confidence",
+          "type": "number",
+          "required": false,
+          "nullable": true,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "name": "created_at",
+          "type": "datetime",
+          "required": true
+        },
+        {
+          "name": "updated_at",
+          "type": "datetime",
+          "required": true,
+          "monotonic": "inc"
+        }
+      ]
+    },
+    {
+      "name": "item_images",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "item_id",
+          "sha256"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "role",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "cover",
+            "gallery",
+            "package_preview",
+            "archive_frame",
+            "user"
+          ]
+        },
+        {
+          "name": "sha256",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "assets",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "path_norm"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "container",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "zip",
+            "7z",
+            "rar",
+            "unitypackage",
+            "dir",
+            "file"
+          ]
+        },
+        {
+          "name": "path_norm",
+          "type": "string",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "root_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "size",
+          "type": "integer",
+          "required": true,
+          "min": 0
+        },
+        {
+          "name": "status",
+          "type": "enum",
+          "required": true,
+          "default": "present",
+          "enum": [
+            "present",
+            "missing",
+            "trashed"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "avatars",
+      "primaryKey": [
+        "id"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "name_norm",
+          "type": "string",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "kind",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "avatar",
+            "base",
+            "part",
+            "unknown"
+          ]
+        },
+        {
+          "name": "booth_item_id",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "cover_path",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "owned",
+          "type": "boolean",
+          "required": true,
+          "default": false
+        },
+        {
+          "name": "sort",
+          "type": "integer",
+          "required": true,
+          "default": 0
+        },
+        {
+          "name": "created_at",
+          "type": "datetime",
+          "required": true
+        },
+        {
+          "name": "updated_at",
+          "type": "datetime",
+          "required": true,
+          "monotonic": "inc"
+        }
+      ]
+    },
+    {
+      "name": "avatar_aliases",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "alias_norm"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "avatar_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "alias",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "alias_norm",
+          "type": "string",
+          "required": true,
+          "unique": true
+        },
+        {
+          "name": "lang",
+          "type": "enum",
+          "required": false,
+          "nullable": true,
+          "enum": [
+            "ja",
+            "zh",
+            "en",
+            "other"
+          ]
+        },
+        {
+          "name": "source",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "booth_tag",
+            "filename",
+            "user",
+            "seed"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "item_avatars",
+      "primaryKey": [
+        "item_id",
+        "avatar_id"
+      ],
+      "fields": [
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "avatar_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "match",
+          "type": "enum",
+          "required": true,
+          "default": "any",
+          "enum": [
+            "any",
+            "all",
+            "exclude"
+          ]
+        },
+        {
+          "name": "confidence",
+          "type": "number",
+          "required": true,
+          "default": 0,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "name": "evidence",
+          "type": "json",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "source",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "auto",
+            "manual",
+            "confirmed"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "asset_avatars",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "asset_id",
+          "avatar_id",
+          "entry_prefix"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "asset_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "avatar_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "entry_prefix",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "confidence",
+          "type": "number",
+          "required": true,
+          "default": 0,
+          "min": 0,
+          "max": 1
+        },
+        {
+          "name": "evidence",
+          "type": "json",
+          "required": false,
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "archive_entries",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "asset_id",
+          "entry_path"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "asset_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "entry_path",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "is_dir",
+          "type": "boolean",
+          "required": true,
+          "default": false
+        }
+      ]
+    },
+    {
+      "name": "unitypackage_assets",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "asset_id",
+          "guid"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "asset_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "guid",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "asset_path",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "jobs",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "item_id",
+          "kind"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "kind",
+          "type": "enum",
+          "required": true,
+          "enum": [
+            "import_url",
+            "import_file",
+            "scan",
+            "reindex",
+            "check_update",
+            "download",
+            "match_avatars"
+          ]
+        },
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": false,
+          "nullable": true
+        },
+        {
+          "name": "state",
+          "type": "enum",
+          "required": true,
+          "default": "queued",
+          "enum": [
+            "queued",
+            "resolving",
+            "fetching",
+            "materializing",
+            "indexing",
+            "matching",
+            "releasing",
+            "releasing_done",
+            "paused",
+            "done",
+            "failed",
+            "cancelled",
+            "abandoned"
+          ]
+        },
+        {
+          "name": "attempts",
+          "type": "integer",
+          "required": true,
+          "default": 0,
+          "min": 0,
+          "max": 5,
+          "monotonic": "inc"
+        }
+      ]
+    },
+    {
+      "name": "job_events",
+      "primaryKey": [
+        "id"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "job_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "at",
+          "type": "datetime",
+          "required": true
+        },
+        {
+          "name": "event",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "tags",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "namespace",
+          "name"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "namespace",
+          "type": "string",
+          "required": false,
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "item_tags",
+      "primaryKey": [
+        "item_id",
+        "tag_id"
+      ],
+      "fields": [
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "tag_id",
+          "type": "integer",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "projects",
+      "primaryKey": [
+        "id"
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "path_norm",
+          "type": "string",
+          "required": true,
+          "unique": true
+        }
+      ]
+    },
+    {
+      "name": "project_imports",
+      "primaryKey": [
+        "id"
+      ],
+      "uniqueKeys": [
+        [
+          "project_id",
+          "item_id",
+          "asset_id"
+        ]
+      ],
+      "fields": [
+        {
+          "name": "id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "project_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "item_id",
+          "type": "integer",
+          "required": true
+        },
+        {
+          "name": "asset_id",
+          "type": "integer",
+          "required": false,
+          "nullable": true
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "fromEntity": "item_images",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "assets",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "archive_entries",
+      "fromField": "asset_id",
+      "toEntity": "assets",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "unitypackage_assets",
+      "fromField": "asset_id",
+      "toEntity": "assets",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "item_avatars",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "item_avatars",
+      "fromField": "avatar_id",
+      "toEntity": "avatars",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "asset_avatars",
+      "fromField": "asset_id",
+      "toEntity": "assets",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "asset_avatars",
+      "fromField": "avatar_id",
+      "toEntity": "avatars",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "avatar_aliases",
+      "fromField": "avatar_id",
+      "toEntity": "avatars",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "items",
+      "fromField": "cover_image_id",
+      "toEntity": "item_images",
+      "toField": "id",
+      "onDelete": "restrict"
+    },
+    {
+      "fromEntity": "jobs",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "job_events",
+      "fromField": "job_id",
+      "toEntity": "jobs",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "item_tags",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "item_tags",
+      "fromField": "tag_id",
+      "toEntity": "tags",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "project_imports",
+      "fromField": "item_id",
+      "toEntity": "items",
+      "toField": "id",
+      "onDelete": "cascade"
+    },
+    {
+      "fromEntity": "project_imports",
+      "fromField": "asset_id",
+      "toEntity": "assets",
+      "toField": "id",
+      "onDelete": "restrict"
+    },
+    {
+      "fromEntity": "project_imports",
+      "fromField": "project_id",
+      "toEntity": "projects",
+      "toField": "id",
+      "onDelete": "cascade"
+    }
+  ],
+  "invariants": [
+    {
+      "id": "item-avatar-unique",
+      "description": "同一条目同一 avatar 只有一条关联",
+      "entity": "item_avatars",
+      "fields": [
+        "item_id",
+        "avatar_id"
+      ],
+      "kind": "unique"
+    },
+    {
+      "id": "asset-avatar-unique",
+      "description": "同一资产同一 avatar 同一内部前缀只有一条关联",
+      "entity": "asset_avatars",
+      "fields": [
+        "asset_id",
+        "avatar_id",
+        "entry_prefix"
+      ],
+      "kind": "unique"
+    },
+    {
+      "id": "alias-unique",
+      "description": "别名全局唯一",
+      "entity": "avatar_aliases",
+      "fields": [
+        "alias_norm"
+      ],
+      "kind": "unique"
+    },
+    {
+      "id": "avatar-name-unique",
+      "description": "模型规范名唯一",
+      "entity": "avatars",
+      "fields": [
+        "name_norm"
+      ],
+      "kind": "unique"
+    },
+    {
+      "id": "item-avatars-no-orphan",
+      "description": "条目-模型关联无孤儿",
+      "entity": "item_avatars",
+      "field": "item_id",
+      "refEntity": "items",
+      "kind": "no-orphan"
+    },
+    {
+      "id": "item-avatars-avatar-no-orphan",
+      "description": "关联的 avatar 必须存在",
+      "entity": "item_avatars",
+      "field": "avatar_id",
+      "refEntity": "avatars",
+      "kind": "no-orphan"
+    },
+    {
+      "id": "asset-avatars-no-orphan",
+      "description": "资产-模型关联无孤儿",
+      "entity": "asset_avatars",
+      "field": "asset_id",
+      "refEntity": "assets",
+      "kind": "no-orphan"
+    },
+    {
+      "id": "aliases-no-orphan",
+      "description": "别名必须挂在模型上",
+      "entity": "avatar_aliases",
+      "field": "avatar_id",
+      "refEntity": "avatars",
+      "kind": "no-orphan"
+    },
+    {
+      "id": "cover-image-exists",
+      "description": "封面图必须是已存在的图片行",
+      "entity": "items",
+      "field": "cover_image_id",
+      "refEntity": "item_images",
+      "refField": "id",
+      "kind": "referential-integrity"
+    },
+    {
+      "id": "avatar-name-required",
+      "description": "模型名必填",
+      "entity": "avatars",
+      "field": "name",
+      "kind": "field-required"
+    },
+    {
+      "id": "alias-required",
+      "description": "别名必填",
+      "entity": "avatar_aliases",
+      "field": "alias",
+      "kind": "field-required"
+    },
+    {
+      "id": "title-required",
+      "description": "标题必填",
+      "entity": "items",
+      "field": "title",
+      "kind": "field-required"
+    },
+    {
+      "id": "confidence-range",
+      "description": "关联置信度 0..1",
+      "entity": "item_avatars",
+      "field": "confidence",
+      "min": 0,
+      "max": 1,
+      "kind": "range"
+    },
+    {
+      "id": "declared-count-range",
+      "description": "声明的适配数量 0..500",
+      "entity": "items",
+      "field": "compat_declared_count",
+      "min": 0,
+      "max": 500,
+      "kind": "range"
+    }
+  ],
+  "boundaryChecks": [
+    {
+      "entity": "item_avatars",
+      "field": "confidence",
+      "values": [
+        -0.1,
+        0,
+        1,
+        1.1
+      ]
+    },
+    {
+      "entity": "items",
+      "field": "compat_declared_count",
+      "values": [
+        -1,
+        0,
+        500,
+        501
+      ]
+    }
+  ]
+}

@@ -1,0 +1,185 @@
+{
+  "note": "头像别名种子（可编辑）。name 为规范名，aliases 用于匹配 BOOTH 标签/标题/包内路径。",
+  "avatars": [
+    {
+      "name": "Manuka",
+      "aliases": [
+        "マヌカ",
+        "まぬか",
+        "まぬかちゃん",
+        "MANUKA",
+        "マヌカちゃん"
+      ],
+      "kind": "avatar",
+      "owned": true
+    },
+    {
+      "name": "Milfy",
+      "aliases": [
+        "ミルフィ",
+        "みるふぃ",
+        "みるふぃちゃん",
+        "MILFY",
+        "ミルフィちゃん"
+      ],
+      "kind": "avatar",
+      "owned": true
+    },
+    {
+      "name": "Shinano",
+      "aliases": [
+        "しなの",
+        "シナノ",
+        "信濃",
+        "SHINANO",
+        "しなのちゃん"
+      ],
+      "kind": "avatar",
+      "owned": true
+    },
+    {
+      "name": "Selestia",
+      "aliases": [
+        "セレスティア",
+        "せれすてぃあ"
+      ]
+    },
+    {
+      "name": "Moe",
+      "aliases": [
+        "萌",
+        "もえ",
+        "MOE"
+      ]
+    },
+    {
+      "name": "Lime",
+      "aliases": [
+        "ライム",
+        "らいむ"
+      ]
+    },
+    {
+      "name": "Kikyo",
+      "aliases": [
+        "キキョウ",
+        "ききょう",
+        "桔梗"
+      ]
+    },
+    {
+      "name": "Mizuki",
+      "aliases": [
+        "ミズキ",
+        "みずき",
+        "瑞希"
+      ]
+    },
+    {
+      "name": "Ruri",
+      "aliases": [
+        "ルリ",
+        "るり",
+        "琉璃"
+      ]
+    },
+    {
+      "name": "Karin",
+      "aliases": [
+        "カリン",
+        "かりん",
+        "花梨"
+      ]
+    },
+    {
+      "name": "Maya",
+      "aliases": [
+        "マヤ",
+        "まや"
+      ]
+    },
+    {
+      "name": "Shinra",
+      "aliases": [
+        "シンラ",
+        "しんら"
+      ]
+    },
+    {
+      "name": "Airi",
+      "aliases": [
+        "愛莉",
+        "あいり",
+        "アイリ"
+      ]
+    },
+    {
+      "name": "Kanata",
+      "aliases": [
+        "彼方",
+        "かなた",
+        "カナタ"
+      ]
+    },
+    {
+      "name": "Chocolat",
+      "aliases": [
+        "ショコラ",
+        "しょこら",
+        "Chocolate"
+      ]
+    },
+    {
+      "name": "Mamehinata",
+      "aliases": [
+        "まめひなた",
+        "マメヒナタ",
+        "豆日向"
+      ]
+    },
+    {
+      "name": "Kipfel",
+      "aliases": [
+        "きっぷふぇる",
+        "キップフェル"
+      ]
+    },
+    {
+      "name": "Grus",
+      "aliases": [
+        "グルス",
+        "ぐるす"
+      ]
+    },
+    {
+      "name": "Mochiyama",
+      "aliases": [
+        "もちやま",
+        "MOCHIYAMA",
+        "もち山"
+      ],
+      "kind": "base"
+    },
+    {
+      "name": "Rusk",
+      "aliases": [
+        "ラスク",
+        "らすく"
+      ]
+    },
+    {
+      "name": "Sio",
+      "aliases": [
+        "しお",
+        "シオ"
+      ]
+    },
+    {
+      "name": "Usasaki",
+      "aliases": [
+        "うささき",
+        "ウササキ"
+      ]
+    }
+  ]
+}

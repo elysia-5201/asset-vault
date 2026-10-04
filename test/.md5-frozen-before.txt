@@ -1,0 +1,3 @@
+3b46a0ddc3561890492b0d339aea2dc0  packages/core/src/contracts.ts
+8ff3c96d260b8f79b0e93adaf7994191  apps/server/src/db/schema.sql
+18e549c0caa5171c4e0782fa488453ae  scripts/test.mjs

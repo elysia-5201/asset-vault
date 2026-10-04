@@ -1,0 +1,253 @@
+{
+  "schemaVersion": 1,
+  "init": "QUEUED",
+  "states": [
+    {
+      "id": "QUEUED"
+    },
+    {
+      "id": "RESOLVING",
+      "onEntry": [
+        "acquire_item_lock"
+      ]
+    },
+    {
+      "id": "FETCHING"
+    },
+    {
+      "id": "MATERIALIZING"
+    },
+    {
+      "id": "INDEXING"
+    },
+    {
+      "id": "MATCHING"
+    },
+    {
+      "id": "RELEASING",
+      "onEntry": [
+        "release_item_lock"
+      ]
+    },
+    {
+      "id": "RELEASING_DONE",
+      "onEntry": [
+        "release_item_lock"
+      ]
+    },
+    {
+      "id": "PAUSED"
+    },
+    {
+      "id": "FAILED"
+    },
+    {
+      "id": "DONE",
+      "terminal": true
+    },
+    {
+      "id": "CANCELLED",
+      "terminal": true
+    },
+    {
+      "id": "ABANDONED",
+      "terminal": true
+    }
+  ],
+  "transitions": [
+    {
+      "from": "QUEUED",
+      "event": "start",
+      "to": "RESOLVING"
+    },
+    {
+      "from": "QUEUED",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "RESOLVING",
+      "event": "resolve_ok",
+      "to": "FETCHING"
+    },
+    {
+      "from": "RESOLVING",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "FETCHING",
+      "event": "fetch_ok",
+      "to": "MATERIALIZING"
+    },
+    {
+      "from": "FETCHING",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "MATERIALIZING",
+      "event": "commit",
+      "to": "INDEXING"
+    },
+    {
+      "from": "MATERIALIZING",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "INDEXING",
+      "event": "index_ok",
+      "to": "MATCHING"
+    },
+    {
+      "from": "INDEXING",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "MATCHING",
+      "event": "match_ok",
+      "to": "RELEASING_DONE"
+    },
+    {
+      "from": "MATCHING",
+      "event": "stop",
+      "to": "RELEASING"
+    },
+    {
+      "from": "RELEASING",
+      "event": "fail",
+      "to": "FAILED"
+    },
+    {
+      "from": "RELEASING",
+      "event": "hold",
+      "to": "PAUSED"
+    },
+    {
+      "from": "RELEASING",
+      "event": "cancel_apply",
+      "to": "CANCELLED"
+    },
+    {
+      "from": "RELEASING",
+      "event": "give_up",
+      "to": "ABANDONED"
+    },
+    {
+      "from": "RELEASING_DONE",
+      "event": "succeed",
+      "to": "DONE"
+    },
+    {
+      "from": "PAUSED",
+      "event": "resume",
+      "to": "QUEUED"
+    },
+    {
+      "from": "FAILED",
+      "event": "retry",
+      "to": "QUEUED",
+      "guard": {
+        "variable": "attempts",
+        "op": "<",
+        "value": 5
+      },
+      "updates": [
+        {
+          "variable": "attempts",
+          "op": "inc",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "from": "FAILED",
+      "event": "retry",
+      "to": "ABANDONED"
+    },
+    {
+      "from": "FAILED",
+      "event": "abandon",
+      "to": "ABANDONED"
+    }
+  ],
+  "variables": [
+    {
+      "name": "attempts",
+      "kind": "integer",
+      "init": 0,
+      "min": 0,
+      "max": 5,
+      "monotonic": "inc"
+    }
+  ],
+  "invariants": [
+    {
+      "id": "commit-before-done",
+      "description": "进入 DONE 前必须先 commit（文件已原子落位）",
+      "kind": "event-before-state",
+      "event": "commit",
+      "state": "DONE"
+    },
+    {
+      "id": "index-before-done",
+      "description": "进入 DONE 前必须完成索引 index_ok",
+      "kind": "event-before-state",
+      "event": "index_ok",
+      "state": "DONE"
+    },
+    {
+      "id": "match-before-done",
+      "description": "进入 DONE 前必须完成头像匹配 match_ok",
+      "kind": "event-before-state",
+      "event": "match_ok",
+      "state": "DONE"
+    },
+    {
+      "id": "stop-before-failed",
+      "description": "进入 FAILED 前必须先 stop（释放条目锁）",
+      "kind": "event-before-state",
+      "event": "stop",
+      "state": "FAILED"
+    },
+    {
+      "id": "stop-before-cancelled",
+      "description": "进入 CANCELLED 前必须先 stop（释放条目锁）",
+      "kind": "event-before-state",
+      "event": "stop",
+      "state": "CANCELLED"
+    },
+    {
+      "id": "stop-before-paused",
+      "description": "进入 PAUSED 前必须先 stop（释放条目锁）",
+      "kind": "event-before-state",
+      "event": "stop",
+      "state": "PAUSED"
+    },
+    {
+      "id": "attempts-bounded",
+      "description": "重试次数始终 0..5",
+      "kind": "var-in-range",
+      "variable": "attempts",
+      "min": 0,
+      "max": 5
+    }
+  ],
+  "concurrentPairs": [
+    [
+      "stop",
+      "commit"
+    ],
+    [
+      "stop",
+      "match_ok"
+    ],
+    [
+      "stop",
+      "index_ok"
+    ]
+  ],
+  "idempotentEvents": []
+}

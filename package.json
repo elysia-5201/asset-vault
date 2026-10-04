@@ -1,0 +1,74 @@
+{
+  "name": "asset-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx scripts/start.mjs",
+    "dev:server": "tsx watch apps/server/src/main.ts",
+    "dev:web": "vite --config apps/web/vite.config.ts",
+    "build:web": "vite build --config apps/web/vite.config.ts",
+    "test": "node scripts/test.mjs",
+    "typecheck": "tsc --noEmit",
+    "desktop:bundle": "node apps/desktop/build.mjs",
+    "desktop:dev": "node apps/desktop/build.mjs && electron .",
+    "desktop:dist": "node apps/desktop/build.mjs && electron-builder --win dir"
+  },
+  "dependencies": {
+    "7zip-bin": "^5.2.0",
+    "@fastify/static": "^10.1.5",
+    "better-sqlite3": "^13.0.3",
+    "chokidar": "^5.0.0",
+    "fastify": "^5.12.5",
+    "node-stream-zip": "^1.16.0",
+    "node-unrar-js": "^2.0.2",
+    "sharp": "^0.35.5",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "tsx": "^4.23.15",
+    "vite": "^8.3.2",
+    "@vitejs/plugin-react": "^6.1.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "@types/node": "^22",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "electron": "^38.0.0",
+    "electron-builder": "^26.0.0",
+    "esbuild": "^0.28.2"
+  },
+  "main": "apps/desktop/main.mjs",
+  "build": {
+    "appId": "dev.assetvault.desktop",
+    "productName": "AssetVault",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "apps/desktop/main.mjs",
+      "apps/desktop/build/**",
+      "apps/server/src/**",
+      "apps/web/dist/**",
+      "packages/core/src/**",
+      "config/**",
+      "package.json",
+      "!**/*.map"
+    ],
+    "asarUnpack": [
+      "**/node_modules/better-sqlite3/**",
+      "**/node_modules/sharp/**",
+      "**/node_modules/@img/**",
+      "**/node_modules/7zip-bin/**",
+      "**/node_modules/node-unrar-js/**"
+    ],
+    "win": {
+      "target": [
+        "dir"
+      ]
+    },
+    "asar": false
+  }
+}
