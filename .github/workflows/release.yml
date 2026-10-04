@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # npm 11 默认不执行依赖的 install 脚本，Electron 二进制要手动拉一次
+      - name: Fetch Electron binary
+        run: node node_modules/electron/install.js
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit tests (sample-based cases skip without AV_SAMPLES_DIR)
+        run: node scripts/test.mjs
+
+      - name: Build web bundle + server bundle
+        run: |
+          npx vite build --config apps/web/vite.config.ts
+          node apps/desktop/build.mjs
+
+      - name: Package portable app
+        run: npx electron-builder --win dir
+
+      - name: Strip local-only dirs (never ship logs/data)
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force dist-desktop/win-unpacked/logs -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force dist-desktop/win-unpacked/data -ErrorAction SilentlyContinue
+
+      - name: Zip portable app
+        shell: pwsh
+        run: Compress-Archive -Path dist-desktop/win-unpacked/* -DestinationPath "AssetVault-${{ github.ref_name }}-win-x64-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AssetVault-win-x64-portable
+          path: AssetVault-*-win-x64-portable.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AssetVault-*-win-x64-portable.zip
+          generate_release_notes: true
