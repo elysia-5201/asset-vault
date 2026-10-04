@@ -301,6 +301,10 @@ export function addItemAvatars(id: number, avatarIds: number[], match: AvatarMat
   return request("POST", "/items/" + id + "/avatars", { avatarIds, match });
 }
 export function removeItemAvatar(id: number, avatarId: number): Promise<unknown> { return request("DELETE", "/items/" + id + "/avatars/" + avatarId); }
+/** 按素材内容校正：只保留有包内证据（archive_path/unitypackage_path/filename）的适配模型。 */
+export function pruneItemAvatars(id: number): Promise<{ ok: boolean; removed: { id: number; name: string; sources: string[] }[]; kept: string[]; note?: string }> {
+  return request("POST", "/items/" + id + "/avatars/prune", {});
+}
 
 function jobIdResponse(raw: unknown): JobIdResponse {
   const r = rec(raw);

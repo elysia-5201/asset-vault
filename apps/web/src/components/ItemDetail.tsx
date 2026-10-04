@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
-  deleteCollection, getCollection, getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
+  deleteCollection, getCollection, getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
   unityImport, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
@@ -49,6 +49,17 @@ export function ItemDetail(props: {
   const [compatMatch, setCompatMatch] = useState<AvatarMatch>("any");
   const [busy, setBusy] = useState(false);
   const boothInputRef = useRef<HTMLInputElement | null>(null);
+  /** 只在商品页标题/标签/描述里出现过、素材内容里毫无痕迹的适配模型（可用「按包内证据校正」一键去掉）。 */
+  const weakAvatars = useMemo(() => {
+    const FILE_SOURCES = ["archive_path", "unitypackage_path", "filename"];
+    return (detail?.avatars ?? []).filter((a) => {
+      try {
+        const j = JSON.parse(String(a.evidence ?? "")) as { sources?: unknown };
+        const s = Array.isArray(j.sources) ? j.sources.map(String) : [];
+        return s.length > 0 && !s.some((x) => FILE_SOURCES.includes(x));
+      } catch { return false; }
+    });
+  }, [detail]);
   const [unity, setUnity] = useState<UnityStatusWeb | null>(null);
   const [unityPkgs, setUnityPkgs] = useState<UnityPackageWeb[]>([]);
   const [unityPicked, setUnityPicked] = useState<Set<string>>(new Set());
@@ -112,6 +123,22 @@ export function ItemDetail(props: {
         try { localStorage.setItem(orderKey(itemId), JSON.stringify(next)); } catch { /* 存储满则仅会话内生效 */ }
         props.onToast("bad", "重排未落库，顺序仅本机生效：" + describeError(e));
       })
+      .finally(() => setBusy(false));
+  };
+
+  /** 一键校正：去掉"只有商品页证据"的适配模型（保留有包内路径/文件名证据的）。 */
+  const doPruneAvatars = () => {
+    if (!weakAvatars.length) { props.onToast("info", "这个条目没有「只有商品页证据」的适配模型"); return; }
+    const names = weakAvatars.map((a) => "@" + a.name).join("、");
+    if (!window.confirm("只保留素材内容里真的有痕迹的适配模型？\n\n将移除：" + names + "\n（它们只在商品页的标题/标签/描述里出现过，压缩包/包内路径里没有任何对应文件）")) return;
+    setBusy(true);
+    pruneItemAvatars(itemId)
+      .then((r) => {
+        props.onToast("ok", r.removed.length ? "已移除 " + r.removed.length + " 个仅声明的适配模型：" + r.removed.map((x) => "@" + x.name).join("、") + "（保留 " + r.kept.join("、") + "）" : (r.note ?? "没有可校正的"));
+        load();
+        props.onChanged();
+      })
+      .catch((e) => props.onToast("bad", describeError(e)))
       .finally(() => setBusy(false));
   };
 
@@ -505,7 +532,17 @@ export function ItemDetail(props: {
           </div>
 
           <div className="right">
-            <Section title={<>适配模型 {detail.avatars.length}</>}>
+            <Section
+              title={<>适配模型 {detail.avatars.length}</>}
+              right={weakAvatars.length > 0 ? (
+                <button
+                  className="btn tiny"
+                  disabled={busy}
+                  title={"移除只在商品页标题/标签/描述里出现过的适配模型：" + weakAvatars.map((a) => "@" + a.name).join("、") + "\n注意：若是「全アバター対応 / N アバター対応」的工具类素材，这些标签本身是有意义的，别删。"}
+                  onClick={doPruneAvatars}
+                >按包内证据校正（去 {weakAvatars.length} 个）</button>
+              ) : undefined}
+            >
               <div className="row wrap" style={{ marginBottom: "6px" }}>
                 {detail.avatars.map((a) => (
                   <span className="tag-chip" key={a.id} title={a.evidence ?? "无证据字段"}>
@@ -521,6 +558,13 @@ export function ItemDetail(props: {
                 ))}
                 {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
               </div>
+              {weakAvatars.length > 0 && (
+                <div className="notice" style={{ marginTop: "6px" }}>
+                  {weakAvatars.length} 个适配模型（{weakAvatars.map((a) => "@" + a.name).join("、")}）只有商品页证据 —— 标题/标签/描述里有，
+                  但压缩包和包内路径里没有任何对应文件。多 avatar 商品里你只下了某一个变体时，这就是假适配，可点右上「按包内证据校正」删掉；
+                  <b>但「全アバター対応 / N アバター対応」的工具类素材（插件、姿势、着色器）本来就该匹配一大堆</b>，那种别删。
+                </div>
+              )}
               <div className="row" style={{ marginTop: "7px" }}>
                 <select value={compatPick} onChange={(e) => setCompatPick(e.target.value ? Number(e.target.value) : "")}>
                   <option value="">选择头像…</option>

@@ -237,6 +237,37 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return repo.listItemAvatars(itemId);
     } catch (e) { return fail(reply, e); }
   });
+  /**
+   * 按素材内容校正适配模型：只保留有**包内证据**（archive_path / unitypackage_path / filename）的，
+   * 去掉只在商品页标题/标签/描述里出现过的。
+   * 起因：BOOTH 卖家会把「本商品支持的全部 bases」都打上 tag（实测一个只有 Shinano 变体的纹身素材，
+   * tags 里有 セレスティア/しなの/萌/愛莉/シフォン/マヌカ/Sio…），于是匹配出一堆 0.93 的假适配。
+   */
+  app.post("/api/items/:id/avatars/prune", async (req, reply) => {
+    try {
+      const itemId = toInt((req.params as any).id, 0);
+      if (!repo.getItem(itemId)) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      const FILE_SOURCES = ["archive_path", "unitypackage_path", "filename"];
+      const rows = repo.listItemAvatars(itemId) as any[];
+      const parsed = rows.map((a) => {
+        let sources: string[] = [];
+        try { const j = JSON.parse(String(a.evidence ?? "")); if (Array.isArray(j.sources)) sources = j.sources.map((s: any) => String(s)); } catch { /* 证据不是 JSON 就没有 sources */ }
+        return { id: Number(a.avatar_id), name: String(a.name ?? ""), sources, fileEvidence: sources.some((s) => FILE_SOURCES.includes(s)) };
+      });
+      if (!parsed.some((p) => p.fileEvidence)) {
+        return { ok: true, removed: [], kept: parsed.map((p) => p.name), note: "没有任何适配模型有包内证据，无从校正（先跑一次重跑头像匹配）" };
+      }
+      const drop = parsed.filter((p) => !p.fileEvidence);
+      for (const d of drop) repo.removeItemAvatar(itemId, d.id);
+      deps.log("prune avatars: item " + itemId + " removed=" + drop.map((d) => d.name).join(",") + " kept=" + parsed.filter((p) => p.fileEvidence).map((p) => p.name).join(","));
+      return {
+        ok: true,
+        removed: drop.map((d) => ({ id: d.id, name: d.name, sources: d.sources })),
+        kept: parsed.filter((p) => p.fileEvidence).map((p) => p.name),
+      };
+    } catch (e) { return fail(reply, e); }
+  });
+
   app.delete("/api/items/:id/avatars/:avatarId", async (req, reply) => {
     try { repo.removeItemAvatar(toInt((req.params as any).id, 0), toInt((req.params as any).avatarId, 0)); return { ok: true }; }
     catch (e) { return fail(reply, e); }
