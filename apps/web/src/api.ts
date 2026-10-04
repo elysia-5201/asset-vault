@@ -25,6 +25,8 @@ export class ApiError extends Error {
 }
 
 let mode: ViewMode = "live";
+let forcedMock = false;                       // ?mock=1：用户自己要 mock，别去自愈
+let retryTimer: ReturnType<typeof setInterval> | null = null;
 const listeners = new Set<(m: ViewMode) => void>();
 
 export function apiMode(): ViewMode { return mode; }
@@ -33,9 +35,40 @@ export function onModeChange(cb: (m: ViewMode) => void): () => void {
   return () => { listeners.delete(cb); };
 }
 function setMode(m: ViewMode): void {
+  // mock 只在启动探测失败 / 网络层报错时进入；进去不等于判死刑 —— 起一个自愈循环往回连。
+  if (m === "mock") startRetryLoop(); else stopRetryLoop();
   if (mode === m) return;
   mode = m;
   for (const cb of listeners) cb(m);
+}
+
+/** 探一次后端是否活着（不抛错）。 */
+async function probeHealth(timeoutMs = 2500): Promise<boolean> {
+  const t = timeoutSignal(timeoutMs);
+  try { const res = await fetch(API_BASE + "/health", { signal: t.signal }); return res.ok; }
+  catch { return false; }
+  finally { t.cancel(); }
+}
+
+/**
+ * mock 模式自愈：每 4 秒 + 窗口重新获得焦点/可见时探一次 /health，后端一回来立刻切回 live。
+ * 没有这个的话，只要有一次请求失败（比如后端正在重启、或某个长请求超时），
+ * 整个界面就**永久**停在内置 mock 数据上，只能手动刷新页面 —— 实测踩过（"卡住了"）。
+ */
+function startRetryLoop(): void {
+  if (retryTimer !== null || forcedMock || typeof window === "undefined") return;
+  const tick = (): void => { void (async () => { if (mode === "mock" && await probeHealth()) setMode("live"); })(); };
+  retryTimer = setInterval(tick, 4000);
+  window.addEventListener("focus", tick);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+}
+function stopRetryLoop(): void {
+  if (retryTimer !== null) { clearInterval(retryTimer); retryTimer = null; }
+}
+/** 手动「重试连接」按钮用。 */
+export async function retryConnect(): Promise<ViewMode> {
+  if (await probeHealth()) setMode("live");
+  return mode;
 }
 
 function queryString(params: Record<string, unknown>): string {
@@ -76,16 +109,8 @@ function timeoutSignal(ms: number): { signal: AbortSignal; cancel: () => void } 
 /** 探测后端；不可达 → mock 模式（也可用 ?mock=1 强制）。 */
 export async function initApi(): Promise<ViewMode> {
   const forced = typeof location !== "undefined" ? new URLSearchParams(location.search).get("mock") : null;
-  if (forced === "1") { setMode("mock"); return mode; }
-  const t = timeoutSignal(2500);
-  try {
-    const res = await fetch(API_BASE + "/health", { signal: t.signal });
-    setMode(res.ok ? "live" : "mock");
-  } catch {
-    setMode("mock");
-  } finally {
-    t.cancel();
-  }
+  if (forced === "1") { forcedMock = true; setMode("mock"); return mode; }
+  setMode((await probeHealth(2500)) ? "live" : "mock");
   return mode;
 }
 

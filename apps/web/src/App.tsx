@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch, JobRow, LibraryRootRow, TagRow } from "@core/contracts";
 import {
   apiMode, describeError, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
-  onModeChange, patchItem, recordImport, jobAction as apiJobAction,
+  onModeChange, patchItem, recordImport, retryConnect, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
 import type { AvatarCard, HealthResponse, ItemCardWeb, ViewMode } from "./types";
@@ -53,7 +53,7 @@ export default function App() {
 
   useEffect(() => {
     try { const raw = localStorage.getItem(IMPORTED_KEY); if (raw) setImportedIds(JSON.parse(raw) as number[]); } catch { /* 忽略 */ }
-    return onModeChange((m) => { setMode(m); toast("info", m === "mock" ? "API 不可达，已切换到内置 mock 数据" : "已连接后端 API"); });
+    return onModeChange((m) => { setMode(m); toast("info", m === "mock" ? "API 不可达，已切到内置 mock 数据（每 4 秒自动重连）" : "已连回后端，数据已刷新"); });
   }, [toast]);
 
   const persistImported = useCallback((ids: number[]) => {
@@ -177,11 +177,14 @@ export default function App() {
           <span style={{ minWidth: 0 }}>
             <div className="t">AssetVault</div>
             <div className="s">
-              {mode === "live" ? "后端 127.0.0.1:7317" : "内置 mock 数据"}
+              {mode === "live" ? "后端 " + (typeof location !== "undefined" ? location.host : "") : "内置 mock 数据 · 正在重连"}
               {counts && typeof counts.items === "number" ? " · " + counts.items + " 条目 / " + counts.assets + " 资产" : ""}
             </div>
           </span>
           <span className="spacer" />
+          {mode === "mock" && (
+            <button className="btn tiny" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
+          )}
           <span className={"mode-pill " + mode}>{mode === "live" ? "LIVE" : "MOCK"}</span>
         </div>
         <AvatarRail
@@ -202,7 +205,7 @@ export default function App() {
           {!itemsErr && !itemsLoading && !shownItems.length && (
             <div className="empty">
               没有匹配的条目
-              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前为内置 mock 数据；启动后端 (npx tsx apps/server/src/main.ts) 后刷新即切换。" : "试着放宽过滤器或清空 @头像。"}</div>
+              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前是内置 mock 数据（后端不可达）：左上角点「重连」，或等它每 4 秒自动重连。" : "试着放宽过滤器或清空 @头像。"}</div>
             </div>
           )}
           {itemsLoading && !shownItems.length && <div className="empty"><Spinner /> 载入条目…</div>}
