@@ -235,7 +235,12 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
           </div>
           <div className="tree">
             {upFiltered.map((a) => (
-              <div className="tree-node file" key={(a.package ?? "") + a.guid} title={a.guid}>
+              <div
+                className="tree-node file" key={(a.package ?? "") + a.guid}
+                title={a.guid + " · 点一下看能否预览（Unity 的 .asset/.mat/.prefab/.anim 都是文本，很多能直接读）"}
+                style={{ cursor: "pointer" }}
+                onClick={() => openFile(a.assetPath)}
+              >
                 <span className="nm">{a.hasPreview ? "🖼" : "📄"} {a.assetPath}</span>
                 <span className="sz">{multiPkg && a.package ? a.package + " · " : ""}{a.type ?? "?"} · {formatBytes(a.size)} · {a.guid.slice(0, 8)}</span>
               </div>
@@ -255,8 +260,10 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
           </div>
           {preview.data.url
             ? <img src={preview.data.url} alt="" style={{ maxWidth: "100%", maxHeight: "300px", borderRadius: "8px", marginTop: "5px" }} />
-            : <div className="pre" style={{ marginTop: "5px" }}>{preview.data.text ?? "（空）"}</div>}
-          {preview.data.text && !isTextish(extOf(preview.path)) && !isImageish(extOf(preview.path)) && (
+            : preview.data.contentType === "application/octet-stream"
+              ? <div className="hint" style={{ marginTop: "5px" }}>二进制文件（{formatBytes(preview.data.bytes ?? 0)}），不预览。</div>
+              : <div className="pre" style={{ marginTop: "5px" }}>{preview.data.text ?? "（空）"}</div>}
+          {preview.data.url == null && preview.data.contentType !== "application/octet-stream" && preview.data.text && !isTextish(extOf(preview.path)) && !isImageish(extOf(preview.path)) && (
             <div className="hint">非文本/图片扩展名，按文本前 64KB 预览</div>
           )}
         </div>

@@ -323,6 +323,33 @@ export async function readUnityPackagePreview(file: string, guid: string): Promi
   return found;
 }
 
+/**
+ * readUnityPackageAsset：流式找 <guid>/asset（包内文件本体）并返回其字节；不存在返回 null。
+ * 只读该条目，其他一律 skip —— 用来预览「包里的某个文件」（ReadMe.txt / .mat / .asset …）。
+ */
+export async function readUnityPackageAsset(file: string, guid: string, maxBytes = 64 * 1024 * 1024): Promise<Buffer | null> {
+  if (typeof guid !== "string" || !/^[0-9a-fA-F]{16,64}$/.test(guid)) {
+    throw new AppError("INVALID_INPUT", "readUnityPackageAsset: bad guid " + guid, 400);
+  }
+  const cap = Math.max(1024, Math.min(maxBytes, 512 * 1024 * 1024));
+  const opened = openUnityPackage(file);
+  const wanted = guid + "/asset";
+  let found: Buffer | null = null;
+  try {
+    await driveTar(
+      opened.cursor,
+      Number.MAX_SAFE_INTEGER,
+      (name, size) => (name === wanted && size <= cap ? { mode: "buffer" } : { mode: "skip" }),
+      (name, _size, _type, data) => { if (name === wanted && data) { found = data; } },
+    );
+  } catch (err) {
+    throw translateStreamError(err, file);
+  } finally {
+    opened.cleanup();
+  }
+  return found;
+}
+
 /** 低层导出（测试/诊断）：只数 tar 条目与 GUID，不建结果集。 */
 export async function countUnityPackageTarEntries(file: string): Promise<{ tarEntries: number; guidCount: number }> {
   const r = await parseUnityPackage(file);

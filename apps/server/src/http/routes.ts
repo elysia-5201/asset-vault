@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { createReadStream, readFileSync, statSync, existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { listArchive } from "../../../../packages/core/src/archive/list";
-import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
+import { listUnityPackage, readUnityPackageAsset } from "../../../../packages/core/src/unitypackage";
 import { basename, extname } from "node:path";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { BoothClient, parseBoothUrl } from "../../../../packages/core/src/source/booth";
@@ -31,6 +31,19 @@ function downloadRootOf(repo: Repo, dataDir: string): string {
 }
 
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]);
+
+/** Unity 的 .asset/.mat/.prefab/.anim … 其实都是 YAML 文本，按文本预览才有意义。 */
+const UNITY_TEXT_EXT = /\.(txt|md|json|meta|yaml|yml|xml|html?|csv|log|cs|shader|cginc|hlib|hlsl|compute|uss|uxml|asmdef|asmref|inputactions|asset|mat|prefab|anim|controller|unity|preset|physicmaterial|guiskin|mixer|playable|signal|overridecontroller)$/i;
+function contentTypeFor(p: string): string {
+  const ext = extname(p).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".bmp") return "image/bmp";
+  if (UNITY_TEXT_EXT.test(p)) return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
 
 function fail(reply: FastifyReply, e: unknown): FastifyReply {
   const err = e as any;
@@ -321,19 +334,22 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
         const found = (await listUnityPackageCandidates(repo, a.item_id)).packages.filter((c) => c.assetId === id).slice(0, 6);
         if (found.length) {
-          const tmpDir = mkdtempSync(join(tmpdir(), "av-upkg-"));
-          try {
-            for (const c of found) {
-              const src = c.innerEntryPath ? c.entryPath + " › " + c.innerEntryPath : (c.entryPath ?? a.path);
-              try {
-                const staged = await stageUnityPackage(c, tmpDir);
-                const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
-                packages.push({ label: c.label, source: src, size: c.size, assets: listing.assets.length, note: c.note });
-                for (const x of listing.assets) assets.push({ ...x, package: c.label });
-              } catch { packages.push({ label: c.label, source: src, size: c.size, assets: 0 }); }
-            }
-          } finally { try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } }
+          const stagingDir = join(deps.dataDir, "unity-staging");
+          const idx = new Map<string, { pkgFile: string; guid: string }>();
+          for (const c of found) {
+            const src = c.innerEntryPath ? c.entryPath + " › " + c.innerEntryPath : (c.entryPath ?? a.path);
+            try {
+              const staged = await stageUnityPackage(c, stagingDir);
+              const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
+              packages.push({ label: c.label, source: src, size: c.size, assets: listing.assets.length, note: c.note });
+              for (const x of listing.assets) {
+                assets.push({ ...x, package: c.label });
+                idx.set(String(x.assetPath), { pkgFile: staged.path, guid: String(x.guid) });
+              }
+            } catch { packages.push({ label: c.label, source: src, size: c.size, assets: 0 }); }
+          }
           if (assets.length > 20000) assets = assets.slice(0, 20000);
+          if (idx.size) { upkgIndex.set(id, idx); }   // 预览直接复用，不用再解一次
         }
       }
 
@@ -349,10 +365,19 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const a = repo.getAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       if (!p) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "path 必填" } });
+      const ct = contentTypeFor(p);
+      // unitypackage 里是 <guid>/asset 的 tar 结构：先按 pathname 反查 guid 再读（本体与压缩包里的都支持）
+      if (a.container === "unitypackage" || a.container === "zip" || a.container === "7z" || a.container === "rar") {
+        const idx = await upkgIndexFor(id, a.item_id);
+        const hit = idx.get(p);
+        if (hit) {
+          const buf = await readUnityPackageAsset(hit.pkgFile, hit.guid, 64 * 1024 * 1024);
+          if (buf) return reply.header("content-type", ct).send(buf);
+          return reply.status(404).send({ error: { code: "NOT_FOUND", message: "包里没有这个文件（guid " + hit.guid.slice(0, 8) + " 缺少 asset 条目）" } });
+        }
+      }
       const { readArchiveEntry } = await import("../../../../packages/core/src/archive/list");
       const buf = await readArchiveEntry(a.path, p, 16 * 1024 * 1024);
-      const ext = extname(p).toLowerCase();
-      const ct = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : /jpe?g/.test(ext) ? "image/jpeg" : /json|txt|md|meta|yaml|yml/.test(ext) ? "text/plain; charset=utf-8" : "application/octet-stream";
       return reply.header("content-type", ct).send(buf);
     } catch (e) { return fail(reply, e); }
   });
@@ -538,6 +563,47 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return { ok: true };
     } catch (e) { return fail(reply, e); }
   });
+
+  /**
+   * unitypackage 里的资产路径 → {已落地的包文件, guid}。
+   * 预览"包里的某个文件"时要按 pathname 反查 guid，压缩包还得先解出内层包 —— 所以缓存一份。
+   */
+  const upkgIndex = new Map<number, Map<string, { pkgFile: string; guid: string }>>();
+  const UPKG_INDEX_MAX = 32;
+
+  async function upkgIndexFor(assetId: number, itemId: number): Promise<Map<string, { pkgFile: string; guid: string }>> {
+    const cached = upkgIndex.get(assetId);
+    if (cached) return cached;
+    const map = new Map<string, { pkgFile: string; guid: string }>();
+    const a = repo.getAsset(assetId);
+    if (a) {
+      if (a.container === "unitypackage") {
+        let rows = repo.getUnityPackageAssets(assetId) as any[];
+        if (!rows.length) {
+          const listing = await listUnityPackage(a.path, { maxAssets: 20000 });
+          repo.replaceUnityPackageAssets(assetId, listing.assets);
+          rows = repo.getUnityPackageAssets(assetId) as any[];
+        }
+        for (const r of rows) map.set(String(r.assetPath), { pkgFile: a.path, guid: String(r.guid) });
+      } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
+        const stagingDir = join(deps.dataDir, "unity-staging");
+        const cands = (await listUnityPackageCandidates(repo, itemId)).packages.filter((c) => c.assetId === assetId).slice(0, 6);
+        for (const c of cands) {
+          try {
+            const staged = await stageUnityPackage(c, stagingDir);
+            const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
+            for (const x of listing.assets) map.set(String(x.assetPath), { pkgFile: staged.path, guid: String(x.guid) });
+          } catch { /* 单个包失败不影响其他的 */ }
+        }
+      }
+    }
+    // 空结果不缓存：偶发读失败（网络盘/杀软占用）不该让这个资产"永远解析不出文件"
+    if (map.size > 0) {
+      upkgIndex.set(assetId, map);
+      if (upkgIndex.size > UPKG_INDEX_MAX) { const oldest = upkgIndex.keys().next().value; if (oldest !== undefined) upkgIndex.delete(oldest); }
+    }
+    return map;
+  }
 
   // ---------- Unity 编辑器（mcp-for-unity）：把素材真正导入"当前打开的那个工程" ----------
   app.get("/api/unity/status", async () => {

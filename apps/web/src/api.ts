@@ -362,7 +362,7 @@ export async function reindexAsset(id: number): Promise<JobIdResponse> {
   return jobIdResponse(await request<unknown>("POST", "/assets/" + id + "/reindex"));
 }
 
-export interface EntryPreview { contentType: string; url: string | null; text: string | null }
+export interface EntryPreview { contentType: string; url: string | null; text: string | null; bytes?: number }
 
 /** 从压缩包内直读单文件（图片 → objectURL；文本 → 前 64KB 文本）。 */
 export async function readEntry(assetId: number, path: string): Promise<EntryPreview> {
@@ -386,11 +386,11 @@ export async function readEntry(assetId: number, path: string): Promise<EntryPre
     const ct = res.headers.get("content-type") ?? "application/octet-stream";
     if (ct.startsWith("image/")) {
       const blob = await res.blob();
-      return { contentType: ct, url: URL.createObjectURL(blob), text: null };
+      return { contentType: ct, url: URL.createObjectURL(blob), text: null, bytes: blob.size };
     }
     const buf = await res.arrayBuffer();
     const text = new TextDecoder("utf-8", { fatal: false }).decode(buf.slice(0, 65536));
-    return { contentType: ct, url: null, text };
+    return { contentType: ct, url: null, text, bytes: buf.byteLength };
   } catch (e) {
     if (e instanceof ApiError) throw e;
     const r = mockEntry(assetId, path);
