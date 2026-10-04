@@ -19,14 +19,20 @@ test("sha256File: 已知内容 → 已知哈希（正例）", async () => {
   } finally { cleanup(dir); }
 });
 
-test("sha256File: 与 sha256sum(1) 交叉一致（独立仪器）", async () => {
+/** sha256sum(1) 是否存在（CI 的 Windows runner 上没有 coreutils 时要跳过而不是误判）。 */
+const hasSha256sum = ((): boolean => {
+  try { execFileSync("sha256sum", ["--version"], { stdio: "ignore" }); return true; } catch { return false; }
+})();
+
+test("sha256File: 与 sha256sum(1) 交叉一致（独立仪器）", { skip: !hasSha256sum && "sha256sum(1) not available on this platform" }, async () => {
   const dir = tmpDir("hash-x");
   try {
     const f = join(dir, "data.bin");
     const buf = Buffer.alloc(3 * 1024 * 1024 + 7, 0x5a); // 跨多个 1 MiB 读块
     writeFileSync(f, buf);
     const mine = await sha256File(f);
-    const theirs = execFileSync("sha256sum", [f], { encoding: "utf8" }).split(/\s+/)[0];
+    // GNU coreutils 在文件名含反斜杠（Windows 路径）时会给整行加前导 "\" 转义；剥掉再比
+    const theirs = execFileSync("sha256sum", [f], { encoding: "utf8" }).trim().replace(/^\\/, "").split(/\s+/)[0];
     assert.equal(mine, theirs);
     assert.equal(mine, sha256Buffer(buf)); // 流式与一次性口径一致
     const withSize = await sha256FileWithSize(f);

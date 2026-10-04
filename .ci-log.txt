@@ -1,0 +1,1459 @@
+﻿2026-10-04T09:34:11.9528249Z Current runner version: '2.337.0'
+2026-10-04T09:34:11.9550439Z ##[group]Runner Image Provisioner
+2026-10-04T09:34:11.9551106Z Hosted Compute Agent
+2026-10-04T09:34:11.9551538Z Version: 20260901.588
+2026-10-04T09:34:11.9552039Z Commit: f88ec8081b781fac6c440065ac7ff9e710ce3d0b
+2026-10-04T09:34:11.9552997Z Build Date: 2026-09-01T19:56:44Z
+2026-10-04T09:34:11.9553588Z Worker ID: {783db7bc-c221-45b6-9b7c-abf62057c349}
+2026-10-04T09:34:11.9554123Z Azure Region: westus
+2026-10-04T09:34:11.9554561Z ##[endgroup]
+2026-10-04T09:34:11.9555812Z ##[group]Operating System
+2026-10-04T09:34:11.9556290Z Microsoft Windows Server 2025
+2026-10-04T09:34:11.9556794Z 10.0.26100
+2026-10-04T09:34:11.9557267Z Datacenter
+2026-10-04T09:34:11.9557702Z ##[endgroup]
+2026-10-04T09:34:11.9558139Z ##[group]Runner Image
+2026-10-04T09:34:11.9558641Z Image: windows-2025-vs2026
+2026-10-04T09:34:11.9559082Z Version: 20260925.250.1
+2026-10-04T09:34:11.9560231Z Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20260925.250/images/windows/Windows2025-VS2026-Readme.md
+2026-10-04T09:34:11.9561485Z Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20260925.250
+2026-10-04T09:34:11.9562250Z ##[endgroup]
+2026-10-04T09:34:11.9563072Z ##[group]GITHUB_TOKEN Permissions
+2026-10-04T09:34:11.9564904Z Contents: write
+2026-10-04T09:34:11.9565356Z Metadata: read
+2026-10-04T09:34:11.9565818Z ##[endgroup]
+2026-10-04T09:34:11.9567474Z Secret source: Actions
+2026-10-04T09:34:11.9568245Z Cache mode: write
+2026-10-04T09:34:11.9568809Z Prepare workflow directory
+2026-10-04T09:34:11.9839627Z Prepare all required actions
+2026-10-04T09:34:11.9879348Z Getting action download info
+2026-10-04T09:34:12.3373853Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-10-04T09:34:12.4379609Z Download action repository 'actions/setup-node@v4' (SHA:49933ea5288caeca8642d1e84afbd3f7d6820020)
+2026-10-04T09:34:12.6225483Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+2026-10-04T09:34:12.9100593Z Download action repository 'softprops/action-gh-release@v2' (SHA:3bb12739c298aeb8a4eeaf626c5b8d85266b0e65)
+2026-10-04T09:34:13.3732935Z Complete job name: windows-portable
+2026-10-04T09:34:13.6182496Z ##[group]Run actions/checkout@v4
+2026-10-04T09:34:13.6183607Z with:
+2026-10-04T09:34:13.6184212Z   repository: elysia-5201/asset-vault
+2026-10-04T09:34:13.6190620Z   token: ***
+2026-10-04T09:34:13.6191203Z   ssh-strict: true
+2026-10-04T09:34:13.6191789Z   ssh-user: git
+2026-10-04T09:34:13.6192379Z   persist-credentials: true
+2026-10-04T09:34:13.6193033Z   clean: true
+2026-10-04T09:34:13.6193625Z   sparse-checkout-cone-mode: true
+2026-10-04T09:34:13.6194329Z   fetch-depth: 1
+2026-10-04T09:34:13.6194915Z   fetch-tags: false
+2026-10-04T09:34:13.6195514Z   show-progress: true
+2026-10-04T09:34:13.6196123Z   lfs: false
+2026-10-04T09:34:13.6196671Z   submodules: false
+2026-10-04T09:34:13.6197267Z   set-safe-directory: true
+2026-10-04T09:34:13.6197975Z   allow-unsafe-pr-checkout: false
+2026-10-04T09:34:13.6198946Z ##[endgroup]
+2026-10-04T09:34:13.7359110Z Syncing repository: elysia-5201/asset-vault
+2026-10-04T09:34:13.7361136Z ##[group]Getting Git version info
+2026-10-04T09:34:13.7362065Z Working directory is 'D:\a\asset-vault\asset-vault'
+2026-10-04T09:34:13.8031181Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-10-04T09:34:14.1192103Z git version 2.55.0.windows.5
+2026-10-04T09:34:14.1234072Z ##[endgroup]
+2026-10-04T09:34:14.1251149Z Temporarily overriding HOME='D:\a\_temp\cf09d94b-7a02-495f-a123-d4d05e15c803' before making global git config changes
+2026-10-04T09:34:14.1252852Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-04T09:34:14.1259989Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\asset-vault\asset-vault
+2026-10-04T09:34:14.1848479Z Deleting the contents of 'D:\a\asset-vault\asset-vault'
+2026-10-04T09:34:14.1853165Z ##[group]Initializing the repository
+2026-10-04T09:34:14.1863257Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\asset-vault\asset-vault
+2026-10-04T09:34:14.2563052Z Initialized empty Git repository in D:/a/asset-vault/asset-vault/.git/
+2026-10-04T09:34:14.2609712Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/elysia-5201/asset-vault
+2026-10-04T09:34:14.3279098Z ##[endgroup]
+2026-10-04T09:34:14.3280652Z ##[group]Disabling automatic garbage collection
+2026-10-04T09:34:14.3286511Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+2026-10-04T09:34:14.3581140Z ##[endgroup]
+2026-10-04T09:34:14.3582173Z ##[group]Setting up auth
+2026-10-04T09:34:14.3591535Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-10-04T09:34:14.3830142Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-10-04T09:34:15.6183842Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-04T09:34:15.6480819Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-10-04T09:34:16.0760866Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-04T09:34:16.1006583Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-10-04T09:34:16.5220729Z [command]"C:\Program Files\Git\bin\git.exe" config --local http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+2026-10-04T09:34:16.5483193Z ##[endgroup]
+2026-10-04T09:34:16.5483866Z ##[group]Fetching the repository
+2026-10-04T09:34:16.5501247Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +72f4d9ad95e007dcf11c69b7fe2a877beda1f18f:refs/remotes/origin/main
+2026-10-04T09:34:17.7740499Z From https://github.com/elysia-5201/asset-vault
+2026-10-04T09:34:17.7743052Z  * [new ref]         72f4d9ad95e007dcf11c69b7fe2a877beda1f18f -> origin/main
+2026-10-04T09:34:17.7789253Z ##[endgroup]
+2026-10-04T09:34:17.7789749Z ##[group]Determining the checkout info
+2026-10-04T09:34:17.7791725Z ##[endgroup]
+2026-10-04T09:34:17.7800098Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+2026-10-04T09:34:17.8269424Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+2026-10-04T09:34:17.8541832Z ##[group]Checking out the ref
+2026-10-04T09:34:17.8549811Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force -B main refs/remotes/origin/main
+2026-10-04T09:34:17.9302605Z Switched to a new branch 'main'
+2026-10-04T09:34:17.9367124Z branch 'main' set up to track 'origin/main'.
+2026-10-04T09:34:17.9408936Z ##[endgroup]
+2026-10-04T09:34:17.9750221Z [command]"C:\Program Files\Git\bin\git.exe" log -1 --format=%H
+2026-10-04T09:34:17.9962289Z 72f4d9ad95e007dcf11c69b7fe2a877beda1f18f
+2026-10-04T09:34:18.0356378Z ##[group]Run actions/setup-node@v4
+2026-10-04T09:34:18.0356706Z with:
+2026-10-04T09:34:18.0356878Z   node-version: 22
+2026-10-04T09:34:18.0357048Z   cache: npm
+2026-10-04T09:34:18.0357196Z   always-auth: false
+2026-10-04T09:34:18.0357354Z   check-latest: false
+2026-10-04T09:34:18.0359569Z   token: ***
+2026-10-04T09:34:18.0359744Z ##[endgroup]
+2026-10-04T09:34:18.1793124Z Found in cache @ C:\hostedtoolcache\windows\node\22.23.3\x64
+2026-10-04T09:34:18.1800215Z (node:4672) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-10-04T09:34:18.1801341Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-10-04T09:34:18.1803096Z ##[group]Environment details
+2026-10-04T09:34:23.4237506Z node: v22.23.3
+2026-10-04T09:34:23.4237735Z npm: 10.9.9
+2026-10-04T09:34:23.4237874Z yarn: 1.22.22
+2026-10-04T09:34:23.4238325Z ##[endgroup]
+2026-10-04T09:34:23.4738069Z [command]C:\Windows\system32\cmd.exe /D /S /C "C:\hostedtoolcache\windows\node\22.23.3\x64\npm.cmd config get cache"
+2026-10-04T09:34:24.2547314Z C:\npm\cache
+2026-10-04T09:34:24.8803247Z npm cache is not found
+2026-10-04T09:34:24.9062243Z ##[group]Run npm ci
+2026-10-04T09:34:24.9062581Z [36;1mnpm ci[0m
+2026-10-04T09:34:24.9496640Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-10-04T09:34:24.9496943Z ##[endgroup]
+2026-10-04T09:34:31.5996921Z npm warn deprecated rimraf@2.6.3: Rimraf versions prior to v4 are no longer supported
+2026-10-04T09:34:33.0894624Z npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory. Do not use it. Check out lru-cache if you want a good and tested way to coalesce async requests by a key value, which is much more comprehensive and powerful.
+2026-10-04T09:34:35.1483562Z npm warn deprecated boolean@3.2.0: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.
+2026-10-04T09:34:38.6460059Z npm warn deprecated glob@7.2.3: Glob versions prior to v9 are no longer supported
+2026-10-04T09:34:38.9145382Z npm warn deprecated glob@7.2.3: Glob versions prior to v9 are no longer supported
+2026-10-04T09:36:09.5041786Z 
+2026-10-04T09:36:09.5042982Z added 411 packages, and audited 412 packages in 2m
+2026-10-04T09:36:09.5043338Z 
+2026-10-04T09:36:09.5043526Z 83 packages are looking for funding
+2026-10-04T09:36:09.5043914Z   run `npm fund` for details
+2026-10-04T09:36:09.5395411Z 
+2026-10-04T09:36:09.5396160Z 2 high severity vulnerabilities
+2026-10-04T09:36:09.5396413Z 
+2026-10-04T09:36:09.5396602Z To address all issues (including breaking changes), run:
+2026-10-04T09:36:09.5396932Z   npm audit fix --force
+2026-10-04T09:36:09.5397050Z 
+2026-10-04T09:36:09.5397153Z Run `npm audit` for details.
+2026-10-04T09:36:12.6936076Z ##[group]Run node node_modules/electron/install.js
+2026-10-04T09:36:12.6936491Z [36;1mnode node_modules/electron/install.js[0m
+2026-10-04T09:36:12.7001409Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-10-04T09:36:12.7001699Z ##[endgroup]
+2026-10-04T09:36:13.1191416Z ##[group]Run npx tsc --noEmit
+2026-10-04T09:36:13.1191691Z [36;1mnpx tsc --noEmit[0m
+2026-10-04T09:36:13.1249210Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-10-04T09:36:13.1249491Z ##[endgroup]
+2026-10-04T09:36:17.7113445Z ##[group]Run node scripts/test.mjs
+2026-10-04T09:36:17.7132762Z [36;1mnode scripts/test.mjs[0m
+2026-10-04T09:36:17.7198641Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-10-04T09:36:17.7198922Z ##[endgroup]
+2026-10-04T09:36:18.0720102Z TAP version 13
+2026-10-04T09:36:18.3758570Z # Subtest: parseProtocolUrl: 解析 BLM 协议 URL（真实形状）
+2026-10-04T09:36:18.3765545Z ok 1 - parseProtocolUrl: 解析 BLM 协议 URL（真实形状）
+2026-10-04T09:36:18.3769267Z   ---
+2026-10-04T09:36:18.3803945Z   duration_ms: 3.342
+2026-10-04T09:36:18.3828771Z   type: 'test'
+2026-10-04T09:36:18.3859736Z   ...
+2026-10-04T09:36:18.3915163Z # Subtest: parseProtocolUrl: 非协议/缺 dlurl 一律 null（负例）
+2026-10-04T09:36:18.3938042Z ok 2 - parseProtocolUrl: 非协议/缺 dlurl 一律 null（负例）
+2026-10-04T09:36:18.3946957Z   ---
+2026-10-04T09:36:18.3972978Z   duration_ms: 0.2987
+2026-10-04T09:36:18.4002655Z   type: 'test'
+2026-10-04T09:36:18.4006975Z   ...
+2026-10-04T09:36:18.4019559Z # Subtest: isAllowedBoothUrl: 只有 https 的 *.booth.pm 通过（正/负例）
+2026-10-04T09:36:18.4043464Z ok 3 - isAllowedBoothUrl: 只有 https 的 *.booth.pm 通过（正/负例）
+2026-10-04T09:36:18.4044376Z   ---
+2026-10-04T09:36:18.4044865Z   duration_ms: 0.3985
+2026-10-04T09:36:18.4045231Z   type: 'test'
+2026-10-04T09:36:18.4045681Z   ...
+2026-10-04T09:36:18.4046376Z # Subtest: sanitizeFileName: 去掉路径与非法字符、防 Windows 保留名
+2026-10-04T09:36:18.4047510Z ok 4 - sanitizeFileName: 去掉路径与非法字符、防 Windows 保留名
+2026-10-04T09:36:18.4048020Z   ---
+2026-10-04T09:36:18.4048388Z   duration_ms: 0.456
+2026-10-04T09:36:18.4048759Z   type: 'test'
+2026-10-04T09:36:18.4049118Z   ...
+2026-10-04T09:36:18.4286867Z # Subtest: 真实 8183383（✦ ミルフィ :: Milfy 対応 ✦）：标题+标签+描述三证据
+2026-10-04T09:36:18.4289371Z ok 5 - 真实 8183383（✦ ミルフィ :: Milfy 対応 ✦）：标题+标签+描述三证据
+2026-10-04T09:36:18.4336124Z   ---
+2026-10-04T09:36:18.4338505Z   duration_ms: 7.0629
+2026-10-04T09:36:18.4341596Z   type: 'test'
+2026-10-04T09:36:18.4343675Z   ...
+2026-10-04T09:36:18.4346485Z # Subtest: 真实 6115428（しなの専用 ロリ化Prefab）：标题的 CJK 包含 + 标签 + 描述支持句
+2026-10-04T09:36:18.4350608Z ok 6 - 真实 6115428（しなの専用 ロリ化Prefab）：标题的 CJK 包含 + 标签 + 描述支持句
+2026-10-04T09:36:18.4351265Z   ---
+2026-10-04T09:36:18.4351718Z   duration_ms: 2.6946
+2026-10-04T09:36:18.4353082Z   type: 'test'
+2026-10-04T09:36:18.4353377Z   ...
+2026-10-04T09:36:18.4356696Z # Subtest: 真实 6494376（【6Avatars】Cat's Round Eye）：6 个命中 + 声明数互证 + planned 不算支持
+2026-10-04T09:36:18.4358677Z ok 7 - 真实 6494376（【6Avatars】Cat's Round Eye）：6 个命中 + 声明数互证 + planned 不算支持
+2026-10-04T09:36:18.4359184Z   ---
+2026-10-04T09:36:18.4359414Z   duration_ms: 8.4314
+2026-10-04T09:36:18.4359663Z   type: 'test'
+2026-10-04T09:36:18.4359887Z   ...
+2026-10-04T09:36:18.4360401Z # Subtest: planned：不认识的规划名保留原文；已支持的同一名字不再进 planned（反例对照）
+2026-10-04T09:36:18.4361791Z ok 8 - planned：不认识的规划名保留原文；已支持的同一名字不再进 planned（反例对照）
+2026-10-04T09:36:18.4362165Z   ---
+2026-10-04T09:36:18.4364034Z   duration_ms: 1.6398
+2026-10-04T09:36:18.4365317Z   type: 'test'
+2026-10-04T09:36:18.4365571Z   ...
+2026-10-04T09:36:18.4366119Z # Subtest: 反退化对照：声明数 6 但只有 1 条证据时，不加 declared_count、不硬凑命中
+2026-10-04T09:36:18.4366657Z ok 9 - 反退化对照：声明数 6 但只有 1 条证据时，不加 declared_count、不硬凑命中
+2026-10-04T09:36:18.4366985Z   ---
+2026-10-04T09:36:18.4367203Z   duration_ms: 0.3604
+2026-10-04T09:36:18.4367464Z   type: 'test'
+2026-10-04T09:36:18.4367677Z   ...
+2026-10-04T09:36:18.4368241Z # Subtest: 反例（真实语料）：Milky-Way.zip / 品牌词 MilkyWay 不该命中 Milfy
+2026-10-04T09:36:18.4368800Z ok 10 - 反例（真实语料）：Milky-Way.zip / 品牌词 MilkyWay 不该命中 Milfy
+2026-10-04T09:36:18.4369307Z   ---
+2026-10-04T09:36:18.4371380Z   duration_ms: 1.086
+2026-10-04T09:36:18.4371855Z   type: 'test'
+2026-10-04T09:36:18.4372088Z   ...
+2026-10-04T09:36:18.4373433Z # Subtest: 反例（真实语料）：[19 Avatars] 只有声明数没有模型名 → 0 命中；数量≠命中数时不给互证
+2026-10-04T09:36:18.4374178Z ok 11 - 反例（真实语料）：[19 Avatars] 只有声明数没有模型名 → 0 命中；数量≠命中数时不给互证
+2026-10-04T09:36:18.4374540Z   ---
+2026-10-04T09:36:18.4374766Z   duration_ms: 0.4843
+2026-10-04T09:36:18.4375020Z   type: 'test'
+2026-10-04T09:36:18.4375249Z   ...
+2026-10-04T09:36:18.4377761Z # Subtest: 反例：短别名不能落在别的词里（Sio 不该命中 passion / Sion）
+2026-10-04T09:36:18.4378460Z ok 12 - 反例：短别名不能落在别的词里（Sio 不该命中 passion / Sion）
+2026-10-04T09:36:18.4378793Z   ---
+2026-10-04T09:36:18.4379015Z   duration_ms: 0.6116
+2026-10-04T09:36:18.4380216Z   type: 'test'
+2026-10-04T09:36:18.4380455Z   ...
+2026-10-04T09:36:18.4380967Z # Subtest: BOOTH 标签：〜対応 / 〜用 / 〜専用 后缀去掉后匹配；大小写与全半角无关
+2026-10-04T09:36:18.4381478Z ok 13 - BOOTH 标签：〜対応 / 〜用 / 〜専用 后缀去掉后匹配；大小写与全半角无关
+2026-10-04T09:36:18.4381802Z   ---
+2026-10-04T09:36:18.4382022Z   duration_ms: 0.6064
+2026-10-04T09:36:18.4382261Z   type: 'test'
+2026-10-04T09:36:18.4382472Z   ...
+2026-10-04T09:36:18.4382814Z # Subtest: 描述：▼今後対応予定▼ 区不算支持，区外的支持句算
+2026-10-04T09:36:18.4383216Z ok 14 - 描述：▼今後対応予定▼ 区不算支持，区外的支持句算
+2026-10-04T09:36:18.4383483Z   ---
+2026-10-04T09:36:18.4383695Z   duration_ms: 0.5736
+2026-10-04T09:36:18.4383944Z   type: 'test'
+2026-10-04T09:36:18.4384150Z   ...
+2026-10-04T09:36:18.4384523Z # Subtest: 压缩包路径（真实 zip 清单）：顶层目录名整段相等 0.8
+2026-10-04T09:36:18.4384972Z ok 15 - 压缩包路径（真实 zip 清单）：顶层目录名整段相等 0.8
+2026-10-04T09:36:18.4385257Z   ---
+2026-10-04T09:36:18.4385458Z   duration_ms: 0.678
+2026-10-04T09:36:18.4385690Z   type: 'test'
+2026-10-04T09:36:18.4385894Z   ...
+2026-10-04T09:36:18.4386536Z # Subtest: 压缩包路径：段内出现（Outfit_Shinano/…）给 0.6
+2026-10-04T09:36:18.4386985Z ok 16 - 压缩包路径：段内出现（Outfit_Shinano/…）给 0.6
+2026-10-04T09:36:18.4388117Z   ---
+2026-10-04T09:36:18.4388339Z   duration_ms: 0.6185
+2026-10-04T09:36:18.4388589Z   type: 'test'
+2026-10-04T09:36:18.4388798Z   ...
+2026-10-04T09:36:18.4389324Z # Subtest: unitypackage 路径（真实 Assets/… pathname）：整段相等 0.9
+2026-10-04T09:36:18.4389907Z ok 17 - unitypackage 路径（真实 Assets/… pathname）：整段相等 0.9
+2026-10-04T09:36:18.4390261Z   ---
+2026-10-04T09:36:18.4390471Z   duration_ms: 1.2559
+2026-10-04T09:36:18.4390713Z   type: 'test'
+2026-10-04T09:36:18.4390922Z   ...
+2026-10-04T09:36:18.4391384Z # Subtest: unitypackage 路径：文件名里出现（Daisy 真实样本）给 0.75，可同时命中多个模型
+2026-10-04T09:36:18.4392002Z ok 18 - unitypackage 路径：文件名里出现（Daisy 真实样本）给 0.75，可同时命中多个模型
+2026-10-04T09:36:18.4392356Z   ---
+2026-10-04T09:36:18.4392566Z   duration_ms: 1.0206
+2026-10-04T09:36:18.4392805Z   type: 'test'
+2026-10-04T09:36:18.4393009Z   ...
+2026-10-04T09:36:18.4393453Z # Subtest: 证据合成：unitypackage_path(0.9) + filename(0.6) = 0.96
+2026-10-04T09:36:18.4394053Z ok 19 - 证据合成：unitypackage_path(0.9) + filename(0.6) = 0.96
+2026-10-04T09:36:18.4394406Z   ---
+2026-10-04T09:36:18.4394617Z   duration_ms: 0.435
+2026-10-04T09:36:18.4394851Z   type: 'test'
+2026-10-04T09:36:18.4395057Z   ...
+2026-10-04T09:36:18.4395367Z # Subtest: 文件名证据：整名等于别名 0.7 / 名内含 0.6
+2026-10-04T09:36:18.4395760Z ok 20 - 文件名证据：整名等于别名 0.7 / 名内含 0.6
+2026-10-04T09:36:18.4396017Z   ---
+2026-10-04T09:36:18.4396217Z   duration_ms: 0.3452
+2026-10-04T09:36:18.4396478Z   type: 'test'
+2026-10-04T09:36:18.4396686Z   ...
+2026-10-04T09:36:18.4397025Z # Subtest: declaredCount：标题优先；标题没有才看描述
+2026-10-04T09:36:18.4397471Z ok 21 - declaredCount：标题优先；标题没有才看描述
+2026-10-04T09:36:18.4398378Z   ---
+2026-10-04T09:36:18.4398608Z   duration_ms: 0.4796
+2026-10-04T09:36:18.4398849Z   type: 'test'
+2026-10-04T09:36:18.4399056Z   ...
+2026-10-04T09:36:18.4399502Z # Subtest: avatarNamesFromPaths：整段相等优先 + entry_prefix 到命中段
+2026-10-04T09:36:18.4400101Z ok 22 - avatarNamesFromPaths：整段相等优先 + entry_prefix 到命中段
+2026-10-04T09:36:18.4400490Z   ---
+2026-10-04T09:36:18.4400699Z   duration_ms: 1.2194
+2026-10-04T09:36:18.4400948Z   type: 'test'
+2026-10-04T09:36:18.4401163Z   ...
+2026-10-04T09:36:18.4401554Z # Subtest: avatarNamesFromPaths：整段相等压过同路径里的文件名命中（反例对照）
+2026-10-04T09:36:18.4402086Z ok 23 - avatarNamesFromPaths：整段相等压过同路径里的文件名命中（反例对照）
+2026-10-04T09:36:18.4402417Z   ---
+2026-10-04T09:36:18.4402622Z   duration_ms: 0.4246
+2026-10-04T09:36:18.4402869Z   type: 'test'
+2026-10-04T09:36:18.4403088Z   ...
+2026-10-04T09:36:18.4403563Z # Subtest: avatarNamesFromPaths：同 (name,prefix) 去重；无关路径不产生标注
+2026-10-04T09:36:18.4404194Z ok 24 - avatarNamesFromPaths：同 (name,prefix) 去重；无关路径不产生标注
+2026-10-04T09:36:18.4404898Z   ---
+2026-10-04T09:36:18.4405124Z   duration_ms: 0.4401
+2026-10-04T09:36:18.4405373Z   type: 'test'
+2026-10-04T09:36:18.4405590Z   ...
+2026-10-04T09:36:18.4406139Z # Subtest: 真实综合：8183383 的 unitypackage（MilkyWay For Milfy）+ 本地文件名 → 高置信命中
+2026-10-04T09:36:18.4406855Z ok 25 - 真实综合：8183383 的 unitypackage（MilkyWay For Milfy）+ 本地文件名 → 高置信命中
+2026-10-04T09:36:18.4408041Z   ---
+2026-10-04T09:36:18.4408260Z   duration_ms: 0.6311
+2026-10-04T09:36:18.4408507Z   type: 'test'
+2026-10-04T09:36:18.4408733Z   ...
+2026-10-04T09:36:18.4626879Z # Subtest: normAlias：去空白/标点、大小写、全半角
+2026-10-04T09:36:18.4680682Z ok 26 - normAlias：去空白/标点、大小写、全半角
+2026-10-04T09:36:18.4684912Z   ---
+2026-10-04T09:36:18.4685934Z   duration_ms: 1.5236
+2026-10-04T09:36:18.4686606Z   type: 'test'
+2026-10-04T09:36:18.4686997Z   ...
+2026-10-04T09:36:18.4687599Z # Subtest: normAlias：日文假名归一（片假名/半角片假名 → 平假名）
+2026-10-04T09:36:18.4688210Z ok 27 - normAlias：日文假名归一（片假名/半角片假名 → 平假名）
+2026-10-04T09:36:18.4688642Z   ---
+2026-10-04T09:36:18.4689021Z   duration_ms: 0.1823
+2026-10-04T09:36:18.4689397Z   type: 'test'
+2026-10-04T09:36:18.4689722Z   ...
+2026-10-04T09:36:18.4690267Z # Subtest: normAlias：假名↔罗马字不互转（反例：别名表必须两种都列）
+2026-10-04T09:36:18.4690855Z ok 28 - normAlias：假名↔罗马字不互转（反例：别名表必须两种都列）
+2026-10-04T09:36:18.4691295Z   ---
+2026-10-04T09:36:18.4691633Z   duration_ms: 0.272
+2026-10-04T09:36:18.4692022Z   type: 'test'
+2026-10-04T09:36:18.4692331Z   ...
+2026-10-04T09:36:18.4692929Z # Subtest: 不变量：normKey(normAlias(x)) === normAlias(x)（幂等，5 次迭代）
+2026-10-04T09:36:18.4693868Z ok 29 - 不变量：normKey(normAlias(x)) === normAlias(x)（幂等，5 次迭代）
+2026-10-04T09:36:18.4694366Z   ---
+2026-10-04T09:36:18.4694697Z   duration_ms: 0.3696
+2026-10-04T09:36:18.4695060Z   type: 'test'
+2026-10-04T09:36:18.4695384Z   ...
+2026-10-04T09:36:18.4696043Z # Subtest: buildAliasIndex：normAlias 与 normKey 两个键都能查到（服务端不分叉）
+2026-10-04T09:36:18.4696868Z ok 30 - buildAliasIndex：normAlias 与 normKey 两个键都能查到（服务端不分叉）
+2026-10-04T09:36:18.4697404Z   ---
+2026-10-04T09:36:18.4698464Z   duration_ms: 1.2092
+2026-10-04T09:36:18.4698932Z   type: 'test'
+2026-10-04T09:36:18.4699278Z   ...
+2026-10-04T09:36:18.4699869Z # Subtest: buildAliasIndex：冲突先登记者胜（不静默合并）+ 空输入安全
+2026-10-04T09:36:18.4700791Z ok 31 - buildAliasIndex：冲突先登记者胜（不静默合并）+ 空输入安全
+2026-10-04T09:36:18.4701322Z   ---
+2026-10-04T09:36:18.4701661Z   duration_ms: 0.312
+2026-10-04T09:36:18.4702049Z   type: 'test'
+2026-10-04T09:36:18.4702414Z   ...
+2026-10-04T09:36:18.4702903Z # Subtest: parseDeclaredCount：契约要求的全部写法
+2026-10-04T09:36:18.4703418Z ok 32 - parseDeclaredCount：契约要求的全部写法
+2026-10-04T09:36:18.4703824Z   ---
+2026-10-04T09:36:18.4704158Z   duration_ms: 1.0313
+2026-10-04T09:36:18.4704541Z   type: 'test'
+2026-10-04T09:36:18.4704873Z   ...
+2026-10-04T09:36:18.4705434Z # Subtest: parseDeclaredCount：反例（表情数/版本号/无数量都不算）
+2026-10-04T09:36:18.4706106Z ok 33 - parseDeclaredCount：反例（表情数/版本号/无数量都不算）
+2026-10-04T09:36:18.4706549Z   ---
+2026-10-04T09:36:18.4706870Z   duration_ms: 0.1491
+2026-10-04T09:36:18.4707249Z   type: 'test'
+2026-10-04T09:36:18.4707574Z   ...
+2026-10-04T09:36:18.4708051Z # Subtest: parseDeclaredCount：多个命中取位置最靠前者
+2026-10-04T09:36:18.4708633Z ok 34 - parseDeclaredCount：多个命中取位置最靠前者
+2026-10-04T09:36:18.4709062Z   ---
+2026-10-04T09:36:18.4709354Z   duration_ms: 0.427
+2026-10-04T09:36:18.4709681Z   type: 'test'
+2026-10-04T09:36:18.4710271Z   ...
+2026-10-04T09:36:18.7667475Z # Subtest: detectContainer: 魔数优先于扩展名（正例/反例对照）
+2026-10-04T09:36:18.7668544Z ok 35 - detectContainer: 魔数优先于扩展名（正例/反例对照）
+2026-10-04T09:36:18.7803050Z   ---
+2026-10-04T09:36:18.7891082Z   duration_ms: 5.4516
+2026-10-04T09:36:18.7893083Z   type: 'test'
+2026-10-04T09:36:18.7944231Z   ...
+2026-10-04T09:36:18.7953294Z # Subtest: zip: 真实样本列目录（10 条目，含 readme.txt）
+2026-10-04T09:36:18.7990911Z ok 36 - zip: 真实样本列目录（10 条目，含 readme.txt） # SKIP sample zip missing
+2026-10-04T09:36:18.8007922Z   ---
+2026-10-04T09:36:18.8008246Z   duration_ms: 0.3041
+2026-10-04T09:36:18.8008522Z   type: 'test'
+2026-10-04T09:36:18.8008741Z   ...
+2026-10-04T09:36:18.8028885Z # Subtest: zip: 与 7za 独立解析器交叉一致（两套仪器，路径集合完全相等）
+2026-10-04T09:36:18.8042415Z ok 37 - zip: 与 7za 独立解析器交叉一致（两套仪器，路径集合完全相等） # SKIP sample zip missing
+2026-10-04T09:36:18.8060389Z   ---
+2026-10-04T09:36:18.8068412Z   duration_ms: 0.1972
+2026-10-04T09:36:18.8091895Z   type: 'test'
+2026-10-04T09:36:18.8105104Z   ...
+2026-10-04T09:36:18.8121201Z # Subtest: zip: 单条目读取 = 7za 读取 = 声明 CRC（三方一致）
+2026-10-04T09:36:18.8138072Z ok 38 - zip: 单条目读取 = 7za 读取 = 声明 CRC（三方一致） # SKIP sample zip missing
+2026-10-04T09:36:18.8142874Z   ---
+2026-10-04T09:36:18.8150093Z   duration_ms: 0.2119
+2026-10-04T09:36:18.8151039Z   type: 'test'
+2026-10-04T09:36:18.8151380Z   ...
+2026-10-04T09:36:18.8158152Z # Subtest: zip: maxEntries 截断 → truncated=true 且条目数受限
+2026-10-04T09:36:18.8160367Z ok 39 - zip: maxEntries 截断 → truncated=true 且条目数受限 # SKIP sample zip missing
+2026-10-04T09:36:18.8162239Z   ---
+2026-10-04T09:36:18.8163493Z   duration_ms: 0.1962
+2026-10-04T09:36:18.8165159Z   type: 'test'
+2026-10-04T09:36:18.8166858Z   ...
+2026-10-04T09:36:18.8243804Z # Subtest: zip: 加密标志位 → passwordProtected=true；读条目 → ARCHIVE_PASSWORD
+2026-10-04T09:36:18.8246959Z ok 40 - zip: 加密标志位 → passwordProtected=true；读条目 → ARCHIVE_PASSWORD
+2026-10-04T09:36:18.8248966Z   ---
+2026-10-04T09:36:18.8255071Z   duration_ms: 88.0452
+2026-10-04T09:36:18.8256902Z   type: 'test'
+2026-10-04T09:36:18.8258711Z   ...
+2026-10-04T09:36:18.8438228Z # Subtest: zip: 旧编码文件名（无 UTF-8 标志位）→ 正确解码为 Shift-JIS，并在 note 标注
+2026-10-04T09:36:18.8438930Z ok 41 - zip: 旧编码文件名（无 UTF-8 标志位）→ 正确解码为 Shift-JIS，并在 note 标注
+2026-10-04T09:36:18.8439288Z   ---
+2026-10-04T09:36:18.8439519Z   duration_ms: 23.4834
+2026-10-04T09:36:18.8439753Z   type: 'test'
+2026-10-04T09:36:18.8439964Z   ...
+2026-10-04T09:36:18.8479837Z # Subtest: zip: GBK 文件名 → 解成中文（不误判为 Shift-JIS）
+2026-10-04T09:36:18.8482017Z ok 42 - zip: GBK 文件名 → 解成中文（不误判为 Shift-JIS）
+2026-10-04T09:36:18.8482375Z   ---
+2026-10-04T09:36:18.8482779Z   duration_ms: 4.3886
+2026-10-04T09:36:18.8483238Z   type: 'test'
+2026-10-04T09:36:18.8483791Z   ...
+2026-10-04T09:36:18.8550592Z # Subtest: zip: UTF-8 标志位正常时不做多余探测（反例对照：note 为空）
+2026-10-04T09:36:18.8551187Z ok 43 - zip: UTF-8 标志位正常时不做多余探测（反例对照：note 为空）
+2026-10-04T09:36:18.8567786Z   ---
+2026-10-04T09:36:18.8578031Z   duration_ms: 3.4683
+2026-10-04T09:36:18.8579269Z   type: 'test'
+2026-10-04T09:36:18.8581050Z   ...
+2026-10-04T09:36:18.8584343Z # Subtest: 7z: 真实样本列目录（29 条目）
+2026-10-04T09:36:18.8588383Z ok 44 - 7z: 真实样本列目录（29 条目） # SKIP sample 7z missing
+2026-10-04T09:36:18.8594061Z   ---
+2026-10-04T09:36:18.8596306Z   duration_ms: 0.9563
+2026-10-04T09:36:18.8597238Z   type: 'test'
+2026-10-04T09:36:18.8597676Z   ...
+2026-10-04T09:36:18.8598788Z # Subtest: 7z: 解出的字节 CRC == 声明的 CRC（字节级正确性，独立 crc32 实现）
+2026-10-04T09:36:18.8599685Z ok 45 - 7z: 解出的字节 CRC == 声明的 CRC（字节级正确性，独立 crc32 实现） # SKIP sample 7z missing
+2026-10-04T09:36:18.8600257Z   ---
+2026-10-04T09:36:18.8601305Z   duration_ms: 0.1928
+2026-10-04T09:36:18.8601960Z   type: 'test'
+2026-10-04T09:36:18.8602219Z   ...
+2026-10-04T09:36:18.8602687Z # Subtest: 7z: maxEntries 截断 + 不存在的条目 → NOT_FOUND
+2026-10-04T09:36:18.8603310Z ok 46 - 7z: maxEntries 截断 + 不存在的条目 → NOT_FOUND # SKIP sample 7z missing
+2026-10-04T09:36:18.8603712Z   ---
+2026-10-04T09:36:18.8603913Z   duration_ms: 0.14
+2026-10-04T09:36:18.8604140Z   type: 'test'
+2026-10-04T09:36:18.8604694Z   ...
+2026-10-04T09:36:18.8605499Z # Subtest: rar: 有 node-unrar-js 时列出并直读；未安装时抛可判别的 NOT_AN_ARCHIVE
+2026-10-04T09:36:18.8606893Z ok 47 - rar: 有 node-unrar-js 时列出并直读；未安装时抛可判别的 NOT_AN_ARCHIVE # SKIP sample rar missing
+2026-10-04T09:36:18.8607356Z   ---
+2026-10-04T09:36:18.8607624Z   duration_ms: 0.1601
+2026-10-04T09:36:18.8607880Z   type: 'test'
+2026-10-04T09:36:18.8608085Z   ...
+2026-10-04T09:36:18.8608708Z # Subtest: rar: 7za(16.02) 对合法 RAR 报 NOT_AN_ARCHIVE —— 这就是必须换 node-unrar-js 的证据
+2026-10-04T09:36:18.8609576Z ok 48 - rar: 7za(16.02) 对合法 RAR 报 NOT_AN_ARCHIVE —— 这就是必须换 node-unrar-js 的证据 # SKIP sample rar missing
+2026-10-04T09:36:18.8610073Z   ---
+2026-10-04T09:36:18.8610315Z   duration_ms: 0.1207
+2026-10-04T09:36:18.8610583Z   type: 'test'
+2026-10-04T09:36:18.8611136Z   ...
+2026-10-04T09:36:18.8663271Z # Subtest: 损坏包/非包/目录/空文件 → 全部可判别错误，不抛裸异常
+2026-10-04T09:36:18.8664172Z ok 49 - 损坏包/非包/目录/空文件 → 全部可判别错误，不抛裸异常
+2026-10-04T09:36:18.8664815Z   ---
+2026-10-04T09:36:18.8669090Z   duration_ms: 10.8538
+2026-10-04T09:36:18.8669586Z   type: 'test'
+2026-10-04T09:36:18.8669880Z   ...
+2026-10-04T09:36:18.8772673Z # Subtest: zip: 含反斜杠/绝对路径/盘符/.. 的包 → 归一化 + 只跳危险项，其余仍可列可读
+2026-10-04T09:36:18.8787936Z ok 50 - zip: 含反斜杠/绝对路径/盘符/.. 的包 → 归一化 + 只跳危险项，其余仍可列可读
+2026-10-04T09:36:18.8788530Z   ---
+2026-10-04T09:36:18.8788837Z   duration_ms: 12.437
+2026-10-04T09:36:18.8789149Z   type: 'test'
+2026-10-04T09:36:18.8789432Z   ...
+2026-10-04T09:36:18.8790006Z # Subtest: zip: 真实 Windows 备份包（901 条全反斜杠名）→ 不再整包失败，可列可读
+2026-10-04T09:36:18.8790703Z ok 51 - zip: 真实 Windows 备份包（901 条全反斜杠名）→ 不再整包失败，可列可读 # SKIP backslash zip sample missing
+2026-10-04T09:36:18.8794568Z   ---
+2026-10-04T09:36:18.8799802Z   duration_ms: 0.3578
+2026-10-04T09:36:18.8813620Z   type: 'test'
+2026-10-04T09:36:18.8820783Z   ...
+2026-10-04T09:36:18.8821678Z # Subtest: readArchiveEntry: 参数校验（空路径/超大上限）
+2026-10-04T09:36:18.8822383Z ok 52 - readArchiveEntry: 参数校验（空路径/超大上限） # SKIP sample zip missing
+2026-10-04T09:36:18.8822873Z   ---
+2026-10-04T09:36:18.8823173Z   duration_ms: 0.2112
+2026-10-04T09:36:18.8823461Z   type: 'test'
+2026-10-04T09:36:18.8823723Z   ...
+2026-10-04T09:36:18.8961568Z # Subtest: sha256File: 已知内容 → 已知哈希（正例）
+2026-10-04T09:36:18.9080330Z ok 53 - sha256File: 已知内容 → 已知哈希（正例）
+2026-10-04T09:36:18.9098298Z   ---
+2026-10-04T09:36:18.9106394Z   duration_ms: 16.6451
+2026-10-04T09:36:18.9112929Z   type: 'test'
+2026-10-04T09:36:18.9210302Z   ...
+2026-10-04T09:36:18.9229134Z # Subtest: sha256File: 与 sha256sum(1) 交叉一致（独立仪器）
+2026-10-04T09:36:18.9233398Z not ok 54 - sha256File: 与 sha256sum(1) 交叉一致（独立仪器）
+2026-10-04T09:36:18.9234156Z   ---
+2026-10-04T09:36:18.9234820Z   duration_ms: 62.1676
+2026-10-04T09:36:18.9235172Z   type: 'test'
+2026-10-04T09:36:18.9252944Z   location: 'D:\\a\\asset-vault\\asset-vault\\packages\\core\\test\\content\\hash.test.ts:1:694'
+2026-10-04T09:36:18.9254126Z   failureType: 'testCodeFailure'
+2026-10-04T09:36:18.9254752Z   error: |-
+2026-10-04T09:36:18.9257387Z     Expected values to be strictly equal:
+2026-10-04T09:36:18.9258837Z     + actual - expected
+2026-10-04T09:36:18.9259270Z     
+2026-10-04T09:36:18.9260290Z     + 'd29afeabeb24cf69b1880a16797aeb5e8b2d44d4bbd5d2e3fab6680415591d44'
+2026-10-04T09:36:18.9261365Z     - '\\d29afeabeb24cf69b1880a16797aeb5e8b2d44d4bbd5d2e3fab6680415591d44'
+2026-10-04T09:36:18.9261956Z     
+2026-10-04T09:36:18.9262441Z   code: 'ERR_ASSERTION'
+2026-10-04T09:36:18.9263654Z   name: 'AssertionError'
+2026-10-04T09:36:18.9264263Z   expected: '\\d29afeabeb24cf69b1880a16797aeb5e8b2d44d4bbd5d2e3fab6680415591d44'
+2026-10-04T09:36:18.9265043Z   actual: 'd29afeabeb24cf69b1880a16797aeb5e8b2d44d4bbd5d2e3fab6680415591d44'
+2026-10-04T09:36:18.9265608Z   operator: 'strictEqual'
+2026-10-04T09:36:18.9265929Z   stack: |-
+2026-10-04T09:36:18.9266528Z     TestContext.<anonymous> (D:\a\asset-vault\asset-vault\packages\core\test\content\hash.test.ts:30:12)
+2026-10-04T09:36:18.9267368Z     process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-10-04T09:36:18.9268006Z     async Test.run (node:internal/test_runner/test:1054:7)
+2026-10-04T09:36:18.9268581Z     async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+2026-10-04T09:36:18.9269071Z   ...
+2026-10-04T09:36:18.9272928Z # Subtest: sha256File: 内容不同 → 哈希不同（反例对照，防退化度量）
+2026-10-04T09:36:18.9273573Z ok 55 - sha256File: 内容不同 → 哈希不同（反例对照，防退化度量）
+2026-10-04T09:36:18.9273962Z   ---
+2026-10-04T09:36:18.9274235Z   duration_ms: 6.1631
+2026-10-04T09:36:18.9275904Z   type: 'test'
+2026-10-04T09:36:18.9282538Z   ...
+2026-10-04T09:36:18.9283690Z # Subtest: sha256File: 不存在 → AppError NOT_FOUND（可判别，不抛裸 ENOENT）
+2026-10-04T09:36:18.9284363Z ok 56 - sha256File: 不存在 → AppError NOT_FOUND（可判别，不抛裸 ENOENT）
+2026-10-04T09:36:18.9285041Z   ---
+2026-10-04T09:36:18.9289306Z   duration_ms: 1.8179
+2026-10-04T09:36:18.9289660Z   type: 'test'
+2026-10-04T09:36:18.9289880Z   ...
+2026-10-04T09:36:18.9290340Z # Subtest: probeImage: 已知尺寸的 PNG → 精确宽高与格式（正例）
+2026-10-04T09:36:18.9290839Z ok 57 - probeImage: 已知尺寸的 PNG → 精确宽高与格式（正例）
+2026-10-04T09:36:18.9291197Z   ---
+2026-10-04T09:36:18.9292023Z   duration_ms: 30.7996
+2026-10-04T09:36:18.9292283Z   type: 'test'
+2026-10-04T09:36:18.9293099Z   ...
+2026-10-04T09:36:18.9318720Z # Subtest: probeImage: JPEG 与 WebP 也识别（跨格式对照）
+2026-10-04T09:36:18.9319463Z ok 58 - probeImage: JPEG 与 WebP 也识别（跨格式对照）
+2026-10-04T09:36:18.9319856Z   ---
+2026-10-04T09:36:18.9320113Z   duration_ms: 10.941
+2026-10-04T09:36:18.9320420Z   type: 'test'
+2026-10-04T09:36:18.9320706Z   ...
+2026-10-04T09:36:18.9341558Z # Subtest: probeImage: 非图片字节 → AppError INVALID_INPUT（反例）
+2026-10-04T09:36:18.9342382Z ok 59 - probeImage: 非图片字节 → AppError INVALID_INPUT（反例）
+2026-10-04T09:36:18.9343208Z   ---
+2026-10-04T09:36:18.9343545Z   duration_ms: 2.1392
+2026-10-04T09:36:18.9343875Z   type: 'test'
+2026-10-04T09:36:18.9344157Z   ...
+2026-10-04T09:36:18.9391454Z # Subtest: makeThumbnail: 200x100 → 缩略 64（webp 默认），宽高为输出尺寸
+2026-10-04T09:36:18.9392274Z ok 60 - makeThumbnail: 200x100 → 缩略 64（webp 默认），宽高为输出尺寸
+2026-10-04T09:36:18.9394451Z   ---
+2026-10-04T09:36:18.9395362Z   duration_ms: 5.0723
+2026-10-04T09:36:18.9395714Z   type: 'test'
+2026-10-04T09:36:18.9396002Z   ...
+2026-10-04T09:36:18.9439673Z # Subtest: makeThumbnail: 不放大小图（withoutEnlargement）
+2026-10-04T09:36:18.9440831Z ok 61 - makeThumbnail: 不放大小图（withoutEnlargement）
+2026-10-04T09:36:18.9441290Z   ---
+2026-10-04T09:36:18.9441824Z   duration_ms: 2.5495
+2026-10-04T09:36:18.9443859Z   type: 'test'
+2026-10-04T09:36:18.9444145Z   ...
+2026-10-04T09:36:18.9483706Z # Subtest: makeThumbnail: format=jpeg → mozjpeg 输出，魔数 FFD8
+2026-10-04T09:36:18.9486011Z ok 62 - makeThumbnail: format=jpeg → mozjpeg 输出，魔数 FFD8
+2026-10-04T09:36:18.9486622Z   ---
+2026-10-04T09:36:18.9486922Z   duration_ms: 6.4022
+2026-10-04T09:36:18.9487238Z   type: 'test'
+2026-10-04T09:36:18.9487519Z   ...
+2026-10-04T09:36:18.9497983Z # Subtest: makeThumbnail: 1x1 PNG 也能出图（边界）
+2026-10-04T09:36:18.9504804Z ok 63 - makeThumbnail: 1x1 PNG 也能出图（边界）
+2026-10-04T09:36:18.9505633Z   ---
+2026-10-04T09:36:18.9505967Z   duration_ms: 2.0041
+2026-10-04T09:36:18.9506289Z   type: 'test'
+2026-10-04T09:36:18.9506575Z   ...
+2026-10-04T09:36:18.9557208Z # Subtest: makeThumbnail: maxSize<=0 与非图片 → AppError INVALID_INPUT（反例）
+2026-10-04T09:36:18.9562637Z ok 64 - makeThumbnail: maxSize<=0 与非图片 → AppError INVALID_INPUT（反例）
+2026-10-04T09:36:18.9566389Z   ---
+2026-10-04T09:36:18.9569665Z   duration_ms: 2.5896
+2026-10-04T09:36:18.9579600Z   type: 'test'
+2026-10-04T09:36:18.9605460Z   ...
+2026-10-04T09:36:19.2376126Z # Subtest: MANUKA.unitypackage: 165 GUID / 678 tar 条目（与 CONTRACT §5 已知事实一致）
+2026-10-04T09:36:19.2444395Z ok 65 - MANUKA.unitypackage: 165 GUID / 678 tar 条目（与 CONTRACT §5 已知事实一致） # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2460919Z   ---
+2026-10-04T09:36:19.2469993Z   duration_ms: 1.2852
+2026-10-04T09:36:19.2476441Z   type: 'test'
+2026-10-04T09:36:19.2492643Z   ...
+2026-10-04T09:36:19.2495854Z # Subtest: MANUKA.unitypackage: 与 GNU tar 独立仪器交叉一致（678 行）
+2026-10-04T09:36:19.2497147Z ok 66 - MANUKA.unitypackage: 与 GNU tar 独立仪器交叉一致（678 行） # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2497784Z   ---
+2026-10-04T09:36:19.2499645Z   duration_ms: 0.2159
+2026-10-04T09:36:19.2499983Z   type: 'test'
+2026-10-04T09:36:19.2511489Z   ...
+2026-10-04T09:36:19.2512207Z # Subtest: MANUKA.unitypackage: preview 计数 47 与 tar 目录中的 preview.png 数量一致
+2026-10-04T09:36:19.2513181Z ok 67 - MANUKA.unitypackage: preview 计数 47 与 tar 目录中的 preview.png 数量一致 # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2513759Z   ---
+2026-10-04T09:36:19.2513991Z   duration_ms: 0.2484
+2026-10-04T09:36:19.2514573Z   type: 'test'
+2026-10-04T09:36:19.2515006Z   ...
+2026-10-04T09:36:19.2516176Z # Subtest: MANUKA.unitypackage: 字段完整性（guid/path/type/size 全部自洽）
+2026-10-04T09:36:19.2517179Z ok 68 - MANUKA.unitypackage: 字段完整性（guid/path/type/size 全部自洽） # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2517856Z   ---
+2026-10-04T09:36:19.2518350Z   duration_ms: 0.2631
+2026-10-04T09:36:19.2518687Z   type: 'test'
+2026-10-04T09:36:19.2518975Z   ...
+2026-10-04T09:36:19.2519509Z # Subtest: readUnityPackagePreview: 取出的是可解码 PNG，且与资产扩展名相符
+2026-10-04T09:36:19.2520500Z ok 69 - readUnityPackagePreview: 取出的是可解码 PNG，且与资产扩展名相符 # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2521126Z   ---
+2026-10-04T09:36:19.2521400Z   duration_ms: 0.2476
+2026-10-04T09:36:19.2521695Z   type: 'test'
+2026-10-04T09:36:19.2521995Z   ...
+2026-10-04T09:36:19.2523130Z # Subtest: unityTypeFromPath: 扩展名 → Unity 类型（含未知扩展名反例）
+2026-10-04T09:36:19.2523975Z ok 70 - unityTypeFromPath: 扩展名 → Unity 类型（含未知扩展名反例）
+2026-10-04T09:36:19.2524372Z   ---
+2026-10-04T09:36:19.2524630Z   duration_ms: 0.2266
+2026-10-04T09:36:19.2524945Z   type: 'test'
+2026-10-04T09:36:19.2525186Z   ...
+2026-10-04T09:36:19.2621225Z # Subtest: 合成包: 顺序/目录资产/缺 pathname/非 GUID 条目 全部按预期处理
+2026-10-04T09:36:19.2630278Z ok 71 - 合成包: 顺序/目录资产/缺 pathname/非 GUID 条目 全部按预期处理
+2026-10-04T09:36:19.2631303Z   ---
+2026-10-04T09:36:19.2632768Z   duration_ms: 31.1039
+2026-10-04T09:36:19.2633614Z   type: 'test'
+2026-10-04T09:36:19.2633836Z   ...
+2026-10-04T09:36:19.2634255Z # Subtest: listUnityPackage: 冻结接口形态 + maxAssets 截断
+2026-10-04T09:36:19.2634937Z ok 72 - listUnityPackage: 冻结接口形态 + maxAssets 截断 # SKIP unitypackage sample missing
+2026-10-04T09:36:19.2635587Z   ---
+2026-10-04T09:36:19.2636681Z   duration_ms: 0.4048
+2026-10-04T09:36:19.2642209Z   type: 'test'
+2026-10-04T09:36:19.2642938Z   ...
+2026-10-04T09:36:19.2677146Z # Subtest: unitypackage: 损坏/非 gzip/不存在/坏 guid → 可判别 AppError
+2026-10-04T09:36:19.2678675Z ok 73 - unitypackage: 损坏/非 gzip/不存在/坏 guid → 可判别 AppError
+2026-10-04T09:36:19.2680339Z   ---
+2026-10-04T09:36:19.2680590Z   duration_ms: 5.6251
+2026-10-04T09:36:19.2684084Z   type: 'test'
+2026-10-04T09:36:19.2719787Z   ...
+2026-10-04T09:36:19.3392613Z # Subtest: parseBoothUrl：支持的各形态 + canonicalUrl 一律 ja
+2026-10-04T09:36:19.3393706Z ok 74 - parseBoothUrl：支持的各形态 + canonicalUrl 一律 ja
+2026-10-04T09:36:19.3394236Z   ---
+2026-10-04T09:36:19.3394594Z   duration_ms: 2.6251
+2026-10-04T09:36:19.3395012Z   type: 'test'
+2026-10-04T09:36:19.3395353Z   ...
+2026-10-04T09:36:19.3396035Z # Subtest: parseBoothUrl：反例（downloadables / 非 booth / 非店铺子域 / 位数不对）
+2026-10-04T09:36:19.3396870Z ok 75 - parseBoothUrl：反例（downloadables / 非 booth / 非店铺子域 / 位数不对）
+2026-10-04T09:36:19.3397390Z   ---
+2026-10-04T09:36:19.3397715Z   duration_ms: 0.507
+2026-10-04T09:36:19.3398885Z   type: 'test'
+2026-10-04T09:36:19.3399269Z   ...
+2026-10-04T09:36:19.3400580Z # Subtest: isHtmlLoginPage：真实登录页 true / 真实商品页 false / 二进制 false
+2026-10-04T09:36:19.3401444Z ok 76 - isHtmlLoginPage：真实登录页 true / 真实商品页 false / 二进制 false
+2026-10-04T09:36:19.3401946Z   ---
+2026-10-04T09:36:19.3402315Z   duration_ms: 2.5621
+2026-10-04T09:36:19.3402673Z   type: 'test'
+2026-10-04T09:36:19.3402998Z   ...
+2026-10-04T09:36:19.3740816Z # Subtest: fetchItem：真实 8183383 JSON → BoothItemMeta 字段映射
+2026-10-04T09:36:19.3742399Z ok 77 - fetchItem：真实 8183383 JSON → BoothItemMeta 字段映射
+2026-10-04T09:36:19.3793462Z   ---
+2026-10-04T09:36:19.3798262Z   duration_ms: 43.4627
+2026-10-04T09:36:19.3806766Z   type: 'test'
+2026-10-04T09:36:19.3809748Z   ...
+2026-10-04T09:36:19.3941496Z # Subtest: fetchItem：真实免费商品 3087170 的 downloadable（no_musics）字段映射
+2026-10-04T09:36:19.3973172Z ok 78 - fetchItem：真实免费商品 3087170 的 downloadable（no_musics）字段映射
+2026-10-04T09:36:19.3974373Z   ---
+2026-10-04T09:36:19.3975093Z   duration_ms: 16.2825
+2026-10-04T09:36:19.3975781Z   type: 'test'
+2026-10-04T09:36:19.3978747Z   ...
+2026-10-04T09:36:19.4164814Z # Subtest: fetchItem：无 content-type 但正文是 JSON → 正常解析
+2026-10-04T09:36:19.4230670Z ok 79 - fetchItem：无 content-type 但正文是 JSON → 正常解析
+2026-10-04T09:36:19.4257847Z   ---
+2026-10-04T09:36:19.4276851Z   duration_ms: 17.8729
+2026-10-04T09:36:19.4369437Z   type: 'test'
+2026-10-04T09:36:19.4391542Z   ...
+2026-10-04T09:36:19.4408551Z # Subtest: fetchItem：404 → NOT_FOUND（真实 404 页内容）
+2026-10-04T09:36:19.4751656Z ok 80 - fetchItem：404 → NOT_FOUND（真实 404 页内容）
+2026-10-04T09:36:19.4808631Z   ---
+2026-10-04T09:36:19.4827277Z   duration_ms: 7.3316
+2026-10-04T09:36:19.4908125Z   type: 'test'
+2026-10-04T09:36:19.4948980Z   ...
+2026-10-04T09:36:19.4950439Z # Subtest: fetchItem：200 但登录页 HTML → LOGIN_REQUIRED（不把登录页当数据）
+2026-10-04T09:36:19.4951197Z ok 81 - fetchItem：200 但登录页 HTML → LOGIN_REQUIRED（不把登录页当数据）
+2026-10-04T09:36:19.4951676Z   ---
+2026-10-04T09:36:19.4952016Z   duration_ms: 10.2503
+2026-10-04T09:36:19.4952366Z   type: 'test'
+2026-10-04T09:36:19.4952694Z   ...
+2026-10-04T09:36:19.4953322Z # Subtest: fetchItem：200 + application/json 但是坏 JSON → UPSTREAM_ERROR
+2026-10-04T09:36:19.4954150Z ok 82 - fetchItem：200 + application/json 但是坏 JSON → UPSTREAM_ERROR
+2026-10-04T09:36:19.4954667Z   ---
+2026-10-04T09:36:19.4955042Z   duration_ms: 24.1644
+2026-10-04T09:36:19.4955418Z   type: 'test'
+2026-10-04T09:36:19.4955766Z   ...
+2026-10-04T09:36:19.4956391Z # Subtest: fetchItem：非法商品号 → INVALID_INPUT（不发请求）
+2026-10-04T09:36:19.4957067Z ok 83 - fetchItem：非法商品号 → INVALID_INPUT（不发请求）
+2026-10-04T09:36:19.4957539Z   ---
+2026-10-04T09:36:19.4958308Z   duration_ms: 3.2728
+2026-10-04T09:36:19.4958673Z   type: 'test'
+2026-10-04T09:36:19.4959022Z   ...
+2026-10-04T09:36:19.4959734Z # Subtest: fetchItem：5xx 指数退避重试后仍失败 → UPSTREAM_ERROR，且请求次数 = maxRetries+1
+2026-10-04T09:36:19.4960649Z ok 84 - fetchItem：5xx 指数退避重试后仍失败 → UPSTREAM_ERROR，且请求次数 = maxRetries+1
+2026-10-04T09:36:19.4961487Z   ---
+2026-10-04T09:36:19.4961857Z   duration_ms: 21.5507
+2026-10-04T09:36:19.4962246Z   type: 'test'
+2026-10-04T09:36:19.4962591Z   ...
+2026-10-04T09:36:19.4963113Z # Subtest: fetchItem：5xx 之后成功 → 成功返回（可恢复）
+2026-10-04T09:36:19.4963683Z ok 85 - fetchItem：5xx 之后成功 → 成功返回（可恢复）
+2026-10-04T09:36:19.4964105Z   ---
+2026-10-04T09:36:19.4964578Z   duration_ms: 17.2986
+2026-10-04T09:36:19.4964942Z   type: 'test'
+2026-10-04T09:36:19.4965252Z   ...
+2026-10-04T09:36:19.6539453Z # Subtest: fetchItem：超时 → UPSTREAM_ERROR（明确带“超时”）
+2026-10-04T09:36:19.6568844Z ok 86 - fetchItem：超时 → UPSTREAM_ERROR（明确带“超时”）
+2026-10-04T09:36:19.6569803Z   ---
+2026-10-04T09:36:19.6595150Z   duration_ms: 162.6332
+2026-10-04T09:36:19.6595826Z   type: 'test'
+2026-10-04T09:36:19.6596183Z   ...
+2026-10-04T09:36:19.6665462Z # Subtest: fetchImage：真实 JPEG / 登录页 / 商品页冒充图片 / 白名单外 / 坏 URL
+2026-10-04T09:36:19.6666527Z ok 87 - fetchImage：真实 JPEG / 登录页 / 商品页冒充图片 / 白名单外 / 坏 URL
+2026-10-04T09:36:19.6667070Z   ---
+2026-10-04T09:36:19.6667433Z   duration_ms: 13.3148
+2026-10-04T09:36:19.6667785Z   type: 'test'
+2026-10-04T09:36:19.6668114Z   ...
+2026-10-04T09:36:19.6870655Z # Subtest: adultCookie：开启时发 cookie，关闭时不发
+2026-10-04T09:36:19.6872114Z ok 88 - adultCookie：开启时发 cookie，关闭时不发
+2026-10-04T09:36:19.6872680Z   ---
+2026-10-04T09:36:19.6873032Z   duration_ms: 6.7225
+2026-10-04T09:36:19.6874607Z   type: 'test'
+2026-10-04T09:36:19.6875132Z   ...
+2026-10-04T09:36:19.6875789Z # Subtest: 限速：同域名串行 + 默认间隔 700ms（虚拟时钟，确定性）
+2026-10-04T09:36:19.6876434Z ok 89 - 限速：同域名串行 + 默认间隔 700ms（虚拟时钟，确定性）
+2026-10-04T09:36:19.6876859Z   ---
+2026-10-04T09:36:19.6877193Z   duration_ms: 10.296
+2026-10-04T09:36:19.6877556Z   type: 'test'
+2026-10-04T09:36:19.6877911Z   ...
+2026-10-04T09:36:19.6878389Z # Subtest: 限速：不同域名各自排队（不互相等待）
+2026-10-04T09:36:19.6878867Z ok 90 - 限速：不同域名各自排队（不互相等待）
+2026-10-04T09:36:19.6879229Z   ---
+2026-10-04T09:36:19.6879527Z   duration_ms: 1.8207
+2026-10-04T09:36:19.6879868Z   type: 'test'
+2026-10-04T09:36:19.6880180Z   ...
+2026-10-04T09:36:20.4063058Z # Subtest: 限速：真实 HTTP 服务上两次请求间隔 >= 600ms（minIntervalMs=600，契约下限）
+2026-10-04T09:36:20.4063794Z ok 91 - 限速：真实 HTTP 服务上两次请求间隔 >= 600ms（minIntervalMs=600，契约下限）
+2026-10-04T09:36:20.4064191Z   ---
+2026-10-04T09:36:20.4064423Z   duration_ms: 615.7128
+2026-10-04T09:36:20.4064669Z   type: 'test'
+2026-10-04T09:36:20.4064924Z   ...
+2026-10-04T09:36:20.4065227Z # Subtest: proxyUrl：undici 不可用时明确报错（不静默直连）
+2026-10-04T09:36:20.4065645Z ok 92 - proxyUrl：undici 不可用时明确报错（不静默直连）
+2026-10-04T09:36:20.4065928Z   ---
+2026-10-04T09:36:20.4066202Z   duration_ms: 106.7957
+2026-10-04T09:36:20.4066464Z   type: 'test'
+2026-10-04T09:36:20.4066786Z   ...
+2026-10-04T09:36:22.3795003Z # Subtest: live：真实抓取 8183383 / 6115428 / 6494376（网络不可用时跳过）
+2026-10-04T09:36:22.3795648Z ok 93 - live：真实抓取 8183383 / 6115428 / 6494376（网络不可用时跳过）
+2026-10-04T09:36:22.3796169Z   ---
+2026-10-04T09:36:22.3796481Z   duration_ms: 1972.8796
+2026-10-04T09:36:22.3796839Z   type: 'test'
+2026-10-04T09:36:22.3797167Z   ...
+2026-10-04T09:36:22.5134253Z # Subtest: live：真实 404（不存在的商品号）→ NOT_FOUND
+2026-10-04T09:36:22.5143812Z ok 94 - live：真实 404（不存在的商品号）→ NOT_FOUND
+2026-10-04T09:36:22.5144119Z   ---
+2026-10-04T09:36:22.5144286Z   duration_ms: 134.1161
+2026-10-04T09:36:22.5144470Z   type: 'test'
+2026-10-04T09:36:22.5144642Z   ...
+2026-10-04T09:36:23.2653925Z # Subtest: live：未登录 downloadables 拿到 200 登录页 → LOGIN_REQUIRED（真实陷阱）
+2026-10-04T09:36:23.2654738Z ok 95 - live：未登录 downloadables 拿到 200 登录页 → LOGIN_REQUIRED（真实陷阱）
+2026-10-04T09:36:23.2655129Z   ---
+2026-10-04T09:36:23.2655352Z   duration_ms: 752.1073
+2026-10-04T09:36:23.2655620Z   type: 'test'
+2026-10-04T09:36:23.2655836Z   ...
+2026-10-04T09:36:23.2811769Z # Subtest: extractItemIds：5..9 位数字，按首次出现去重；长串/短数字不截断
+2026-10-04T09:36:23.2812455Z ok 96 - extractItemIds：5..9 位数字，按首次出现去重；长串/短数字不截断
+2026-10-04T09:36:23.2812782Z   ---
+2026-10-04T09:36:23.2813045Z   duration_ms: 1.9832
+2026-10-04T09:36:23.2813331Z   type: 'test'
+2026-10-04T09:36:23.2813578Z   ...
+2026-10-04T09:36:23.2813955Z # Subtest: identifyFromNames：真实语料正例
+2026-10-04T09:36:23.2814914Z ok 97 - identifyFromNames：真实语料正例
+2026-10-04T09:36:23.2815185Z   ---
+2026-10-04T09:36:23.2815415Z   duration_ms: 1.1312
+2026-10-04T09:36:23.2815674Z   type: 'test'
+2026-10-04T09:36:23.2815922Z   ...
+2026-10-04T09:36:23.2816266Z # Subtest: identifyFromNames：真实语料反例（不能凭文件名硬凑商品号）
+2026-10-04T09:36:23.2816742Z ok 98 - identifyFromNames：真实语料反例（不能凭文件名硬凑商品号）
+2026-10-04T09:36:23.2817069Z   ---
+2026-10-04T09:36:23.2817281Z   duration_ms: 0.1842
+2026-10-04T09:36:23.2817530Z   type: 'test'
+2026-10-04T09:36:23.2817753Z   ...
+2026-10-04T09:36:23.2818137Z # Subtest: identifyFromNames：弱 token（嵌在字母数字里）0.55
+2026-10-04T09:36:23.2818655Z ok 99 - identifyFromNames：弱 token（嵌在字母数字里）0.55
+2026-10-04T09:36:23.2818972Z   ---
+2026-10-04T09:36:23.2819185Z   duration_ms: 0.1657
+2026-10-04T09:36:23.2819416Z   type: 'test'
+2026-10-04T09:36:23.2819639Z   ...
+2026-10-04T09:36:23.2820016Z # Subtest: identifyFromNames：同分按 id 升序（确定性排序）
+2026-10-04T09:36:23.2820484Z ok 100 - identifyFromNames：同分按 id 升序（确定性排序）
+2026-10-04T09:36:23.2820821Z   ---
+2026-10-04T09:36:23.2821314Z   duration_ms: 0.3883
+2026-10-04T09:36:23.2821552Z   type: 'test'
+2026-10-04T09:36:23.2821711Z   ...
+2026-10-04T09:36:23.2822631Z # Subtest: identifyFromNames：BOOTH downloadable 名字加权（0.95）并与文件名互证（+0.04）
+2026-10-04T09:36:23.2823863Z ok 101 - identifyFromNames：BOOTH downloadable 名字加权（0.95）并与文件名互证（+0.04）
+2026-10-04T09:36:23.2824345Z   ---
+2026-10-04T09:36:23.2824599Z   duration_ms: 0.3635
+2026-10-04T09:36:23.2824854Z   type: 'test'
+2026-10-04T09:36:23.2825086Z   ...
+2026-10-04T09:36:23.2825671Z # Subtest: identifyFromUrl：BOOTH 商品 URL / 裸号 = 1.0；downloadable 与其它站点 = null
+2026-10-04T09:36:23.2826736Z ok 102 - identifyFromUrl：BOOTH 商品 URL / 裸号 = 1.0；downloadable 与其它站点 = null
+2026-10-04T09:36:23.2827189Z   ---
+2026-10-04T09:36:23.2827417Z   duration_ms: 0.6552
+2026-10-04T09:36:23.2827664Z   type: 'test'
+2026-10-04T09:36:23.2827896Z   ...
+2026-10-04T09:36:23.2828407Z # Subtest: boothUrl：locale 回落 ja；非法 id 抛 AppError(INVALID_INPUT)
+2026-10-04T09:36:23.2829076Z ok 103 - boothUrl：locale 回落 ja；非法 id 抛 AppError(INVALID_INPUT)
+2026-10-04T09:36:23.2829479Z   ---
+2026-10-04T09:36:23.2829690Z   duration_ms: 0.7053
+2026-10-04T09:36:23.2829937Z   type: 'test'
+2026-10-04T09:36:23.2830162Z   ...
+2026-10-04T09:36:23.2830569Z # Subtest: normalizePath：反斜杠/大小写/尾斜杠/重复斜杠
+2026-10-04T09:36:23.2831029Z ok 104 - normalizePath：反斜杠/大小写/尾斜杠/重复斜杠
+2026-10-04T09:36:23.2831316Z   ---
+2026-10-04T09:36:23.2831503Z   duration_ms: 1.1126
+2026-10-04T09:36:23.2831737Z   type: 'test'
+2026-10-04T09:36:23.2831951Z   ...
+2026-10-04T09:36:23.2832349Z # Subtest: normalizePath：Windows 长路径前缀与 UNC
+2026-10-04T09:36:23.2832858Z ok 105 - normalizePath：Windows 长路径前缀与 UNC
+2026-10-04T09:36:23.2833178Z   ---
+2026-10-04T09:36:23.2833393Z   duration_ms: 0.1257
+2026-10-04T09:36:23.2833636Z   type: 'test'
+2026-10-04T09:36:23.2833845Z   ...
+2026-10-04T09:36:23.2834185Z # Subtest: normalizePath：根路径
+2026-10-04T09:36:23.2834545Z ok 106 - normalizePath：根路径
+2026-10-04T09:36:23.2834808Z   ---
+2026-10-04T09:36:23.2835013Z   duration_ms: 0.1919
+2026-10-04T09:36:23.2835252Z   type: 'test'
+2026-10-04T09:36:23.2835462Z   ...
+2026-10-04T09:36:23.2835859Z # Subtest: normalizePath：NFC 归一（NFD 输入 == NFC 输入）
+2026-10-04T09:36:23.2836411Z ok 107 - normalizePath：NFC 归一（NFD 输入 == NFC 输入）
+2026-10-04T09:36:23.2836741Z   ---
+2026-10-04T09:36:23.2836942Z   duration_ms: 0.2018
+2026-10-04T09:36:23.2837183Z   type: 'test'
+2026-10-04T09:36:23.2837390Z   ...
+2026-10-04T09:36:23.2837805Z # Subtest: toWinLongPath：>=260 才加 \\\\?\\，且对已是长路径幂等
+2026-10-04T09:36:23.2838356Z ok 108 - toWinLongPath：>=260 才加 \\\\?\\，且对已是长路径幂等
+2026-10-04T09:36:23.2838694Z   ---
+2026-10-04T09:36:23.2838905Z   duration_ms: 0.2016
+2026-10-04T09:36:23.2839148Z   type: 'test'
+2026-10-04T09:36:23.2839361Z   ...
+2026-10-04T09:36:23.2839816Z # Subtest: toWinLongPath：UNC 用 \\\\?\\UNC\\，相对路径不动，正斜杠转反斜杠
+2026-10-04T09:36:23.2840412Z ok 109 - toWinLongPath：UNC 用 \\\\?\\UNC\\，相对路径不动，正斜杠转反斜杠
+2026-10-04T09:36:23.2840772Z   ---
+2026-10-04T09:36:23.2840985Z   duration_ms: 0.2062
+2026-10-04T09:36:23.2841233Z   type: 'test'
+2026-10-04T09:36:23.2841656Z   ...
+2026-10-04T09:36:23.2842046Z # Subtest: isSubPath：含相等、大小写与分隔符无关；裸前缀不算
+2026-10-04T09:36:23.2842542Z ok 110 - isSubPath：含相等、大小写与分隔符无关；裸前缀不算
+2026-10-04T09:36:23.2843057Z   ---
+2026-10-04T09:36:23.2843268Z   duration_ms: 0.2118
+2026-10-04T09:36:23.2843538Z   type: 'test'
+2026-10-04T09:36:23.2843753Z   ...
+2026-10-04T09:36:23.2843986Z # Subtest: basename / extOf
+2026-10-04T09:36:23.2844269Z ok 111 - basename / extOf
+2026-10-04T09:36:23.2844512Z   ---
+2026-10-04T09:36:23.2844714Z   duration_ms: 0.2335
+2026-10-04T09:36:23.2844968Z   type: 'test'
+2026-10-04T09:36:23.2845177Z   ...
+2026-10-04T09:36:23.2845783Z #       witness → done: start → resolve_ok → fetch_ok → commit → index_ok → match_ok → succeed
+2026-10-04T09:36:23.2846423Z #       witness → failed: stop → fail
+2026-10-04T09:36:23.2846839Z #       witness → paused: stop → hold
+2026-10-04T09:36:23.2847237Z #       reachable nodes (state|mask|progress): 233
+2026-10-04T09:36:23.2847807Z # Subtest: I1：DONE 前必过 commit / index_ok / match_ok（有序）
+2026-10-04T09:36:23.2848314Z     # Subtest: 穷举可达集：任何到达 done 的路径，掩码必含三个必需事件
+2026-10-04T09:36:23.2848747Z     ok 1 - 穷举可达集：任何到达 done 的路径，掩码必含三个必需事件
+2026-10-04T09:36:23.2849080Z       ---
+2026-10-04T09:36:23.2849293Z       duration_ms: 2.5161
+2026-10-04T09:36:23.2849555Z       type: 'test'
+2026-10-04T09:36:23.2849784Z       ...
+2026-10-04T09:36:23.2850223Z     # Subtest: 有序性：进度自动机 [commit, index_ok, match_ok] 在 done 处必须满进度
+2026-10-04T09:36:23.2850703Z     ok 2 - 有序性：进度自动机 [commit, index_ok, match_ok] 在 done 处必须满进度
+2026-10-04T09:36:23.2851278Z       ---
+2026-10-04T09:36:23.2851491Z       duration_ms: 0.7202
+2026-10-04T09:36:23.2851737Z       type: 'test'
+2026-10-04T09:36:23.2851964Z       ...
+2026-10-04T09:36:23.2852379Z     # Subtest: succeed 是 done 的必要前驱（每个 done 掩码都含 succeed）
+2026-10-04T09:36:23.2852877Z     ok 3 - succeed 是 done 的必要前驱（每个 done 掩码都含 succeed）
+2026-10-04T09:36:23.2853218Z       ---
+2026-10-04T09:36:23.2853433Z       duration_ms: 1.3351
+2026-10-04T09:36:23.2853676Z       type: 'test'
+2026-10-04T09:36:23.2853901Z       ...
+2026-10-04T09:36:23.2854185Z     # Subtest: 见证路径：最短 done 路径的事件序列满足顺序
+2026-10-04T09:36:23.2854556Z     ok 4 - 见证路径：最短 done 路径的事件序列满足顺序
+2026-10-04T09:36:23.2854792Z       ---
+2026-10-04T09:36:23.2854984Z       duration_ms: 0.944
+2026-10-04T09:36:23.2855243Z       type: 'test'
+2026-10-04T09:36:23.2855461Z       ...
+2026-10-04T09:36:23.2855629Z     1..4
+2026-10-04T09:36:23.2855979Z ok 112 - I1：DONE 前必过 commit / index_ok / match_ok（有序）
+2026-10-04T09:36:23.2856305Z   ---
+2026-10-04T09:36:23.2856501Z   duration_ms: 6.7557
+2026-10-04T09:36:23.2856704Z   type: 'suite'
+2026-10-04T09:36:23.2856897Z   ...
+2026-10-04T09:36:23.2857371Z # Subtest: I2：FAILED / CANCELLED / PAUSED / give_up-ABANDONED 前必过 stop
+2026-10-04T09:36:23.2857858Z     # Subtest: 任何到达 failed 的路径都经过 stop
+2026-10-04T09:36:23.2858221Z     ok 1 - 任何到达 failed 的路径都经过 stop
+2026-10-04T09:36:23.2858467Z       ---
+2026-10-04T09:36:23.2858649Z       duration_ms: 0.4436
+2026-10-04T09:36:23.2858865Z       type: 'test'
+2026-10-04T09:36:23.2859080Z       ...
+2026-10-04T09:36:23.2859374Z     # Subtest: 任何到达 cancelled 的路径都经过 stop
+2026-10-04T09:36:23.2859751Z     ok 2 - 任何到达 cancelled 的路径都经过 stop
+2026-10-04T09:36:23.2860017Z       ---
+2026-10-04T09:36:23.2860212Z       duration_ms: 0.3064
+2026-10-04T09:36:23.2860431Z       type: 'test'
+2026-10-04T09:36:23.2860653Z       ...
+2026-10-04T09:36:23.2860854Z     # Subtest: 任何到达 paused 的路径都经过 stop
+2026-10-04T09:36:23.2861154Z     ok 3 - 任何到达 paused 的路径都经过 stop
+2026-10-04T09:36:23.2861612Z       ---
+2026-10-04T09:36:23.2861820Z       duration_ms: 0.3437
+2026-10-04T09:36:23.2862075Z       type: 'test'
+2026-10-04T09:36:23.2862291Z       ...
+2026-10-04T09:36:23.2862575Z     # Subtest: 任何到达 abandoned 的路径都经过 stop
+2026-10-04T09:36:23.2862961Z     ok 4 - 任何到达 abandoned 的路径都经过 stop
+2026-10-04T09:36:23.2863230Z       ---
+2026-10-04T09:36:23.2863436Z       duration_ms: 0.3679
+2026-10-04T09:36:23.2863678Z       type: 'test'
+2026-10-04T09:36:23.2863893Z       ...
+2026-10-04T09:36:23.2864266Z     # Subtest: 见证路径：到 failed / paused 的最短路径含 stop
+2026-10-04T09:36:23.2864721Z     ok 5 - 见证路径：到 failed / paused 的最短路径含 stop
+2026-10-04T09:36:23.2865236Z       ---
+2026-10-04T09:36:23.2877582Z       duration_ms: 0.4928
+2026-10-04T09:36:23.2877884Z       type: 'test'
+2026-10-04T09:36:23.2880909Z       ...
+2026-10-04T09:36:23.2882224Z     # Subtest: 恢复路径：done 可以经过 stop/fail（stop→releasing→fail→failed→retry→…→done）
+2026-10-04T09:36:23.2883626Z     ok 6 - 恢复路径：done 可以经过 stop/fail（stop→releasing→fail→failed→retry→…→done）
+2026-10-04T09:36:23.2885056Z       ---
+2026-10-04T09:36:23.2885296Z       duration_ms: 0.5417
+2026-10-04T09:36:23.2885688Z       type: 'test'
+2026-10-04T09:36:23.2886041Z       ...
+2026-10-04T09:36:23.2886360Z     1..6
+2026-10-04T09:36:23.2887031Z ok 113 - I2：FAILED / CANCELLED / PAUSED / give_up-ABANDONED 前必过 stop
+2026-10-04T09:36:23.2887818Z   ---
+2026-10-04T09:36:23.2888158Z   duration_ms: 2.802
+2026-10-04T09:36:23.2888655Z   type: 'suite'
+2026-10-04T09:36:23.2888995Z   ...
+2026-10-04T09:36:23.2889606Z # Subtest: 反例对照（证明以上检查器不是恒真）
+2026-10-04T09:36:23.2890444Z     # Subtest: 故意为假的命题可被证伪：不是每条到 releasing 的路径都经过 fail
+2026-10-04T09:36:23.2891371Z     ok 1 - 故意为假的命题可被证伪：不是每条到 releasing 的路径都经过 fail
+2026-10-04T09:36:23.2892020Z       ---
+2026-10-04T09:36:23.2892287Z       duration_ms: 0.4789
+2026-10-04T09:36:23.2892577Z       type: 'test'
+2026-10-04T09:36:23.2892829Z       ...
+2026-10-04T09:36:23.2893325Z     # Subtest: 同一检查器给出一真一假：failed 路径必有 fail；而经 stop 的直接路径 was 无 fail
+2026-10-04T09:36:23.2893928Z     ok 2 - 同一检查器给出一真一假：failed 路径必有 fail；而经 stop 的直接路径 was 无 fail
+2026-10-04T09:36:23.2894292Z       ---
+2026-10-04T09:36:23.2894517Z       duration_ms: 0.4652
+2026-10-04T09:36:23.2894774Z       type: 'test'
+2026-10-04T09:36:23.2895000Z       ...
+2026-10-04T09:36:23.2895372Z     # Subtest: 故意为假的命题可被证伪：不是每条到 match_ok 的路径都经过 commit
+2026-10-04T09:36:23.2895866Z     ok 3 - 故意为假的命题可被证伪：不是每条到 match_ok 的路径都经过 commit
+2026-10-04T09:36:23.2896193Z       ---
+2026-10-04T09:36:23.2896402Z       duration_ms: 0.286
+2026-10-04T09:36:23.2896648Z       type: 'test'
+2026-10-04T09:36:23.2896869Z       ...
+2026-10-04T09:36:23.2897251Z     # Subtest: 可达性非退化：13 个状态全部从 queued 可达；伪造状态不可达
+2026-10-04T09:36:23.2897693Z     ok 4 - 可达性非退化：13 个状态全部从 queued 可达；伪造状态不可达
+2026-10-04T09:36:23.2897992Z       ---
+2026-10-04T09:36:23.2898201Z       duration_ms: 0.2756
+2026-10-04T09:36:23.2898460Z       type: 'test'
+2026-10-04T09:36:23.2898677Z       ...
+2026-10-04T09:36:23.2898869Z     1..4
+2026-10-04T09:36:23.2899185Z ok 114 - 反例对照（证明以上检查器不是恒真）
+2026-10-04T09:36:23.2899436Z   ---
+2026-10-04T09:36:23.2899653Z   duration_ms: 1.6601
+2026-10-04T09:36:23.2899892Z   type: 'suite'
+2026-10-04T09:36:23.2900124Z   ...
+2026-10-04T09:36:23.2900397Z # Subtest: 路径搜索本身的自检
+2026-10-04T09:36:23.2900749Z     # Subtest: 出边表与 resolveTransition 双向一致
+2026-10-04T09:36:23.2901171Z     ok 1 - 出边表与 resolveTransition 双向一致
+2026-10-04T09:36:23.2901461Z       ---
+2026-10-04T09:36:23.2901676Z       duration_ms: 1.0305
+2026-10-04T09:36:23.2901935Z       type: 'test'
+2026-10-04T09:36:23.2902146Z       ...
+2026-10-04T09:36:23.2902666Z     # Subtest: BFS 在有限状态空间内终止且规模有界
+2026-10-04T09:36:23.2903293Z     ok 2 - BFS 在有限状态空间内终止且规模有界
+2026-10-04T09:36:23.2903577Z       ---
+2026-10-04T09:36:23.2903792Z       duration_ms: 0.6575
+2026-10-04T09:36:23.2904051Z       type: 'test'
+2026-10-04T09:36:23.2904346Z       ...
+2026-10-04T09:36:23.2904541Z     1..2
+2026-10-04T09:36:23.2904916Z ok 115 - 路径搜索本身的自检
+2026-10-04T09:36:23.2905151Z   ---
+2026-10-04T09:36:23.2905589Z   duration_ms: 1.7932
+2026-10-04T09:36:23.2905865Z   type: 'suite'
+2026-10-04T09:36:23.2906292Z   ...
+2026-10-04T09:36:23.2906702Z # Subtest: 转移表全矩阵（13 状态 × 15 事件 = 195 格）
+2026-10-04T09:36:23.2907118Z     # Subtest: 矩阵规模与已知计数（防退化：不能是空表）
+2026-10-04T09:36:23.2907477Z     ok 1 - 矩阵规模与已知计数（防退化：不能是空表）
+2026-10-04T09:36:23.2907727Z       ---
+2026-10-04T09:36:23.2907943Z       duration_ms: 1.0986
+2026-10-04T09:36:23.2908197Z       type: 'test'
+2026-10-04T09:36:23.2908423Z       ...
+2026-10-04T09:36:23.2908733Z     # Subtest: 逐格：已定义 → 精确目标态；未定义 → null
+2026-10-04T09:36:23.2909095Z     ok 2 - 逐格：已定义 → 精确目标态；未定义 → null
+2026-10-04T09:36:23.2909388Z       ---
+2026-10-04T09:36:23.2909604Z       duration_ms: 1.2879
+2026-10-04T09:36:23.2909834Z       type: 'test'
+2026-10-04T09:36:23.2909995Z       ...
+2026-10-04T09:36:23.2910243Z     # Subtest: 反例对照：合法格子有非 null 返回，未定义格子返回 null（度量非退化）
+2026-10-04T09:36:23.2910545Z     ok 3 - 反例对照：合法格子有非 null 返回，未定义格子返回 null（度量非退化）
+2026-10-04T09:36:23.2910948Z       ---
+2026-10-04T09:36:23.2911095Z       duration_ms: 0.1982
+2026-10-04T09:36:23.2911255Z       type: 'test'
+2026-10-04T09:36:23.2911396Z       ...
+2026-10-04T09:36:23.2911609Z     # Subtest: 每个已定义格子的结果都落在 13 状态集合内
+2026-10-04T09:36:23.2911844Z     ok 4 - 每个已定义格子的结果都落在 13 状态集合内
+2026-10-04T09:36:23.2912014Z       ---
+2026-10-04T09:36:23.2912149Z       duration_ms: 0.5083
+2026-10-04T09:36:23.2912302Z       type: 'test'
+2026-10-04T09:36:23.2912434Z       ...
+2026-10-04T09:36:23.2912664Z     # Subtest: 拒绝语义：未定义格子一律 null（调用方据此回 409），绝不静默忽略
+2026-10-04T09:36:23.2912955Z     ok 5 - 拒绝语义：未定义格子一律 null（调用方据此回 409），绝不静默忽略
+2026-10-04T09:36:23.2913198Z       ---
+2026-10-04T09:36:23.2913335Z       duration_ms: 0.3152
+2026-10-04T09:36:23.2913495Z       type: 'test'
+2026-10-04T09:36:23.2913633Z       ...
+2026-10-04T09:36:23.2913762Z     1..5
+2026-10-04T09:36:23.2913984Z ok 116 - 转移表全矩阵（13 状态 × 15 事件 = 195 格）
+2026-10-04T09:36:23.2914161Z   ---
+2026-10-04T09:36:23.2914309Z   duration_ms: 4.4954
+2026-10-04T09:36:23.2914464Z   type: 'suite'
+2026-10-04T09:36:23.2914597Z   ...
+2026-10-04T09:36:23.2914810Z # Subtest: failed+retry 守卫（attempts 分支）
+2026-10-04T09:36:23.2915150Z     # Subtest: attempts = 0..4 → queued；attempts = 5.. → abandoned
+2026-10-04T09:36:23.2915533Z     ok 1 - attempts = 0..4 → queued；attempts = 5.. → abandoned
+2026-10-04T09:36:23.2915760Z       ---
+2026-10-04T09:36:23.2915901Z       duration_ms: 0.2226
+2026-10-04T09:36:23.2916060Z       type: 'test'
+2026-10-04T09:36:23.2916200Z       ...
+2026-10-04T09:36:23.2916428Z     # Subtest: 边界两侧：attempts=4 与 5 必须不同（这是唯一的分支点）
+2026-10-04T09:36:23.2916816Z     ok 2 - 边界两侧：attempts=4 与 5 必须不同（这是唯一的分支点）
+2026-10-04T09:36:23.2917010Z       ---
+2026-10-04T09:36:23.2917142Z       duration_ms: 0.174
+2026-10-04T09:36:23.2917298Z       type: 'test'
+2026-10-04T09:36:23.2917428Z       ...
+2026-10-04T09:36:23.2917668Z     # Subtest: MAX_ATTEMPTS=5 且守卫用 < 比较（attempts=5 恰好用尽）
+2026-10-04T09:36:23.2917968Z     ok 3 - MAX_ATTEMPTS=5 且守卫用 < 比较（attempts=5 恰好用尽）
+2026-10-04T09:36:23.2918180Z       ---
+2026-10-04T09:36:23.2918316Z       duration_ms: 0.2926
+2026-10-04T09:36:23.2918469Z       type: 'test'
+2026-10-04T09:36:23.2918612Z       ...
+2026-10-04T09:36:23.2918848Z     # Subtest: 守卫只作用于 failed+retry：其它格子的结果与 attempts 无关
+2026-10-04T09:36:23.2919144Z     ok 4 - 守卫只作用于 failed+retry：其它格子的结果与 attempts 无关
+2026-10-04T09:36:23.2919346Z       ---
+2026-10-04T09:36:23.2919478Z       duration_ms: 0.44
+2026-10-04T09:36:23.2919621Z       type: 'test'
+2026-10-04T09:36:23.2919753Z       ...
+2026-10-04T09:36:23.2919951Z     # Subtest: failed+abandon 不受 attempts 影响
+2026-10-04T09:36:23.2920215Z     ok 5 - failed+abandon 不受 attempts 影响
+2026-10-04T09:36:23.2920422Z       ---
+2026-10-04T09:36:23.2920555Z       duration_ms: 0.2525
+2026-10-04T09:36:23.2920714Z       type: 'test'
+2026-10-04T09:36:23.2920858Z       ...
+2026-10-04T09:36:23.2920987Z     1..5
+2026-10-04T09:36:23.2921303Z ok 117 - failed+retry 守卫（attempts 分支）
+2026-10-04T09:36:23.2922752Z   ---
+2026-10-04T09:36:23.2922902Z   duration_ms: 1.718
+2026-10-04T09:36:23.2923057Z   type: 'suite'
+2026-10-04T09:36:23.2923196Z   ...
+2026-10-04T09:36:23.2923417Z # Subtest: 转移表结构不变量（出边/终态/在飞集合）
+2026-10-04T09:36:23.2923681Z     # Subtest: TRANSITIONS 无重复 (from,event,guard) 行
+2026-10-04T09:36:23.2923966Z     ok 1 - TRANSITIONS 无重复 (from,event,guard) 行
+2026-10-04T09:36:23.2924170Z       ---
+2026-10-04T09:36:23.2924311Z       duration_ms: 0.1788
+2026-10-04T09:36:23.2924471Z       type: 'test'
+2026-10-04T09:36:23.2924610Z       ...
+2026-10-04T09:36:23.2924815Z     # Subtest: 每个 (state,event) 最多一个守卫行 + 一个默认行
+2026-10-04T09:36:23.2925084Z     ok 2 - 每个 (state,event) 最多一个守卫行 + 一个默认行
+2026-10-04T09:36:23.2925278Z       ---
+2026-10-04T09:36:23.2925404Z       duration_ms: 0.9468
+2026-10-04T09:36:23.2925554Z       type: 'test'
+2026-10-04T09:36:23.2925686Z       ...
+2026-10-04T09:36:23.2925893Z     # Subtest: 终态 done/cancelled/abandoned 没有任何出边
+2026-10-04T09:36:23.2926167Z     ok 3 - 终态 done/cancelled/abandoned 没有任何出边
+2026-10-04T09:36:23.2926373Z       ---
+2026-10-04T09:36:23.2926505Z       duration_ms: 0.288
+2026-10-04T09:36:23.2926663Z       type: 'test'
+2026-10-04T09:36:23.2926799Z       ...
+2026-10-04T09:36:23.2927019Z     # Subtest: 所有 stop 边都汇入 releasing（stop = 唯一回收入口）
+2026-10-04T09:36:23.2927308Z     ok 4 - 所有 stop 边都汇入 releasing（stop = 唯一回收入口）
+2026-10-04T09:36:23.2927514Z       ---
+2026-10-04T09:36:23.2927646Z       duration_ms: 0.1134
+2026-10-04T09:36:23.2927801Z       type: 'test'
+2026-10-04T09:36:23.2927936Z       ...
+2026-10-04T09:36:23.2928182Z     # Subtest: IN_FLIGHT_STATES 与 jobs 在飞索引口径一致（9 个，含 paused）
+2026-10-04T09:36:23.2928513Z     ok 5 - IN_FLIGHT_STATES 与 jobs 在飞索引口径一致（9 个，含 paused）
+2026-10-04T09:36:23.2928727Z       ---
+2026-10-04T09:36:23.2928854Z       duration_ms: 0.0773
+2026-10-04T09:36:23.2929006Z       type: 'test'
+2026-10-04T09:36:23.2929135Z       ...
+2026-10-04T09:36:23.2929255Z     1..5
+2026-10-04T09:36:23.2929446Z ok 118 - 转移表结构不变量（出边/终态/在飞集合）
+2026-10-04T09:36:23.2929617Z   ---
+2026-10-04T09:36:23.2929761Z   duration_ms: 1.7587
+2026-10-04T09:36:23.2929913Z   type: 'suite'
+2026-10-04T09:36:23.2930046Z   ...
+2026-10-04T09:36:23.2930313Z # Subtest: attempts 单调性与上限（runner 语义：只有 retry 推进 attempts）
+2026-10-04T09:36:23.2930731Z     # Subtest: 穷举 (state, attempts) 可达集：0 <= attempts <= MAX_ATTEMPTS+1，越限只能落终态 abandoned
+2026-10-04T09:36:23.2931198Z     ok 1 - 穷举 (state, attempts) 可达集：0 <= attempts <= MAX_ATTEMPTS+1，越限只能落终态 abandoned
+2026-10-04T09:36:23.2931468Z       ---
+2026-10-04T09:36:23.2931609Z       duration_ms: 0.7234
+2026-10-04T09:36:23.2931771Z       type: 'test'
+2026-10-04T09:36:23.2931907Z       ...
+2026-10-04T09:36:23.2932250Z     # Subtest: 反例对照：把上限改大即不成立（说明该断言对 MAX_ATTEMPTS 敏感）
+2026-10-04T09:36:23.2932545Z     ok 2 - 反例对照：把上限改大即不成立（说明该断言对 MAX_ATTEMPTS 敏感）
+2026-10-04T09:36:23.2932744Z       ---
+2026-10-04T09:36:23.2932876Z       duration_ms: 0.0827
+2026-10-04T09:36:23.2933030Z       type: 'test'
+2026-10-04T09:36:23.2933160Z       ...
+2026-10-04T09:36:23.2933413Z     # Subtest: retry 是唯一能把 attempts 推进的事件（其它事件 attempts 不变）
+2026-10-04T09:36:23.2933735Z     ok 3 - retry 是唯一能把 attempts 推进的事件（其它事件 attempts 不变）
+2026-10-04T09:36:23.2933937Z       ---
+2026-10-04T09:36:23.2934066Z       duration_ms: 0.1595
+2026-10-04T09:36:23.2934217Z       type: 'test'
+2026-10-04T09:36:23.2934354Z       ...
+2026-10-04T09:36:23.2934476Z     1..3
+2026-10-04T09:36:23.2934735Z ok 119 - attempts 单调性与上限（runner 语义：只有 retry 推进 attempts）
+2026-10-04T09:36:23.2934961Z   ---
+2026-10-04T09:36:23.2935098Z   duration_ms: 1.0514
+2026-10-04T09:36:23.2935248Z   type: 'suite'
+2026-10-04T09:36:23.2935382Z   ...
+2026-10-04T09:36:23.2935597Z #       items_fts mode (DDL vs behavior): content-storing
+2026-10-04T09:36:23.2935916Z # Subtest: items(source_site, source_item_id) 局部唯一
+2026-10-04T09:36:23.2936263Z     # Subtest: 正例：同一 site 下 source_item_id = NULL 可多行（NULL 不参与唯一）
+2026-10-04T09:36:23.2936605Z     ok 1 - 正例：同一 site 下 source_item_id = NULL 可多行（NULL 不参与唯一）
+2026-10-04T09:36:23.2936909Z       ---
+2026-10-04T09:36:23.2937053Z       duration_ms: 1.5701
+2026-10-04T09:36:23.2937216Z       type: 'test'
+2026-10-04T09:36:23.2937358Z       ...
+2026-10-04T09:36:23.2937597Z     # Subtest: 负例：重复 (source_site, source_item_id) 必须被拒
+2026-10-04T09:36:23.2937886Z     ok 2 - 负例：重复 (source_site, source_item_id) 必须被拒
+2026-10-04T09:36:23.2938091Z       ---
+2026-10-04T09:36:23.2938223Z       duration_ms: 0.7159
+2026-10-04T09:36:23.2938376Z       type: 'test'
+2026-10-04T09:36:23.2938512Z       ...
+2026-10-04T09:36:23.2938713Z     # Subtest: 正例：同号不同 site 允许（site 是键的一部分）
+2026-10-04T09:36:23.2938962Z     ok 3 - 正例：同号不同 site 允许（site 是键的一部分）
+2026-10-04T09:36:23.2939155Z       ---
+2026-10-04T09:36:23.2939288Z       duration_ms: 0.2518
+2026-10-04T09:36:23.2939443Z       type: 'test'
+2026-10-04T09:36:23.2939576Z       ...
+2026-10-04T09:36:23.2939781Z     # Subtest: 负例：uid 全局唯一（旁证唯一索引不是只对某一列失效）
+2026-10-04T09:36:23.2940012Z     ok 4 - 负例：uid 全局唯一（旁证唯一索引不是只对某一列失效）
+2026-10-04T09:36:23.2940192Z       ---
+2026-10-04T09:36:23.2940323Z       duration_ms: 0.3557
+2026-10-04T09:36:23.2940475Z       type: 'test'
+2026-10-04T09:36:23.2940604Z       ...
+2026-10-04T09:36:23.2940734Z     1..4
+2026-10-04T09:36:23.2940960Z ok 120 - items(source_site, source_item_id) 局部唯一
+2026-10-04T09:36:23.2941166Z   ---
+2026-10-04T09:36:23.2941301Z   duration_ms: 3.4975
+2026-10-04T09:36:23.2941568Z   type: 'suite'
+2026-10-04T09:36:23.2941739Z   ...
+2026-10-04T09:36:23.2941940Z # Subtest: assets.path_norm 全局唯一
+2026-10-04T09:36:23.2942227Z     # Subtest: 正例：不同 path_norm 可多行；负例：重复 path_norm 必须被拒
+2026-10-04T09:36:23.2942615Z     ok 1 - 正例：不同 path_norm 可多行；负例：重复 path_norm 必须被拒
+2026-10-04T09:36:23.2942949Z       ---
+2026-10-04T09:36:23.2943087Z       duration_ms: 1.0998
+2026-10-04T09:36:23.2943237Z       type: 'test'
+2026-10-04T09:36:23.2943374Z       ...
+2026-10-04T09:36:23.2943610Z     # Subtest: 负例：外键 root_id 无效必须被拒（正例见上一条用真实 root）
+2026-10-04T09:36:23.2943877Z     ok 2 - 负例：外键 root_id 无效必须被拒（正例见上一条用真实 root）
+2026-10-04T09:36:23.2944081Z       ---
+2026-10-04T09:36:23.2944213Z       duration_ms: 0.6079
+2026-10-04T09:36:23.2944362Z       type: 'test'
+2026-10-04T09:36:23.2944492Z       ...
+2026-10-04T09:36:23.2944679Z     # Subtest: 负例：item_id 无效必须被拒
+2026-10-04T09:36:23.2944893Z     ok 3 - 负例：item_id 无效必须被拒
+2026-10-04T09:36:23.2945054Z       ---
+2026-10-04T09:36:23.2945204Z       duration_ms: 0.382
+2026-10-04T09:36:23.2945354Z       type: 'test'
+2026-10-04T09:36:23.2945487Z       ...
+2026-10-04T09:36:23.2945610Z     1..3
+2026-10-04T09:36:23.2945804Z ok 121 - assets.path_norm 全局唯一
+2026-10-04T09:36:23.2945969Z   ---
+2026-10-04T09:36:23.2946115Z   duration_ms: 2.5588
+2026-10-04T09:36:23.2946264Z   type: 'suite'
+2026-10-04T09:36:23.2946396Z   ...
+2026-10-04T09:36:23.2946617Z # Subtest: jobs 在飞局部唯一（done/failed 后可再建同 kind）
+2026-10-04T09:36:23.2946892Z     # Subtest: 负例：同 item 同 kind 两个在飞作业必须被拒
+2026-10-04T09:36:23.2947134Z     ok 1 - 负例：同 item 同 kind 两个在飞作业必须被拒
+2026-10-04T09:36:23.2947310Z       ---
+2026-10-04T09:36:23.2947527Z       duration_ms: 0.9193
+2026-10-04T09:36:23.2947684Z       type: 'test'
+2026-10-04T09:36:23.2947817Z       ...
+2026-10-04T09:36:23.2948027Z     # Subtest: 正例：前一个作业 done 后，可再建同 (item, kind)
+2026-10-04T09:36:23.2948289Z     ok 2 - 正例：前一个作业 done 后，可再建同 (item, kind)
+2026-10-04T09:36:23.2948474Z       ---
+2026-10-04T09:36:23.2948601Z       duration_ms: 1.1448
+2026-10-04T09:36:23.2948755Z       type: 'test'
+2026-10-04T09:36:23.2948893Z       ...
+2026-10-04T09:36:23.2949084Z     # Subtest: 正例：failed 不在在飞集合内（可再建同 kind）
+2026-10-04T09:36:23.2949325Z     ok 3 - 正例：failed 不在在飞集合内（可再建同 kind）
+2026-10-04T09:36:23.2949501Z       ---
+2026-10-04T09:36:23.2949643Z       duration_ms: 0.6702
+2026-10-04T09:36:23.2949795Z       type: 'test'
+2026-10-04T09:36:23.2949925Z       ...
+2026-10-04T09:36:23.2950139Z     # Subtest: 负例：paused 属于在飞集合（第二个同 kind 必须被拒）
+2026-10-04T09:36:23.2950403Z     ok 4 - 负例：paused 属于在飞集合（第二个同 kind 必须被拒）
+2026-10-04T09:36:23.2950582Z       ---
+2026-10-04T09:36:23.2950721Z       duration_ms: 0.5845
+2026-10-04T09:36:23.2950870Z       type: 'test'
+2026-10-04T09:36:23.2951002Z       ...
+2026-10-04T09:36:23.2951209Z     # Subtest: 正例：item_id 为 NULL 时不受局部索引限制（可多行）
+2026-10-04T09:36:23.2951461Z     ok 5 - 正例：item_id 为 NULL 时不受局部索引限制（可多行）
+2026-10-04T09:36:23.2951635Z       ---
+2026-10-04T09:36:23.2951765Z       duration_ms: 0.6153
+2026-10-04T09:36:23.2951914Z       type: 'test'
+2026-10-04T09:36:23.2952045Z       ...
+2026-10-04T09:36:23.2952235Z     # Subtest: 正例：同 item 不同 kind 可以同时在飞
+2026-10-04T09:36:23.2952477Z     ok 6 - 正例：同 item 不同 kind 可以同时在飞
+2026-10-04T09:36:23.2952650Z       ---
+2026-10-04T09:36:23.2952792Z       duration_ms: 0.5691
+2026-10-04T09:36:23.2952938Z       type: 'test'
+2026-10-04T09:36:23.2953070Z       ...
+2026-10-04T09:36:23.2953312Z     # Subtest: 边界：在飞索引覆盖全部 9 个在飞状态（queued..paused），不含终态
+2026-10-04T09:36:23.2953617Z     ok 7 - 边界：在飞索引覆盖全部 9 个在飞状态（queued..paused），不含终态
+2026-10-04T09:36:23.2953815Z       ---
+2026-10-04T09:36:23.2953960Z       duration_ms: 4.6645
+2026-10-04T09:36:23.2954108Z       type: 'test'
+2026-10-04T09:36:23.2954242Z       ...
+2026-10-04T09:36:23.2954366Z     1..7
+2026-10-04T09:36:23.2954586Z ok 122 - jobs 在飞局部唯一（done/failed 后可再建同 kind）
+2026-10-04T09:36:23.2954774Z   ---
+2026-10-04T09:36:23.2954914Z   duration_ms: 9.6373
+2026-10-04T09:36:23.2955066Z   type: 'suite'
+2026-10-04T09:36:23.2955196Z   ...
+2026-10-04T09:36:23.2955443Z # Subtest: item_avatars 复合主键 / asset_avatars IFNULL 前缀唯一
+2026-10-04T09:36:23.2955842Z     # Subtest: 负例：item_avatars (item_id, avatar_id) 重复必须被拒；正例：同 item 不同 avatar 允许
+2026-10-04T09:36:23.2956841Z     ok 1 - 负例：item_avatars (item_id, avatar_id) 重复必须被拒；正例：同 item 不同 avatar 允许
+2026-10-04T09:36:23.2957108Z       ---
+2026-10-04T09:36:23.2957240Z       duration_ms: 0.8895
+2026-10-04T09:36:23.2957397Z       type: 'test'
+2026-10-04T09:36:23.2958030Z       ...
+2026-10-04T09:36:23.2958521Z     # Subtest: 负例：asset_avatars 同 (asset,avatar,NULL) 重复必须被拒
+2026-10-04T09:36:23.2960134Z     ok 2 - 负例：asset_avatars 同 (asset,avatar,NULL) 重复必须被拒
+2026-10-04T09:36:23.2960682Z       ---
+2026-10-04T09:36:23.2960840Z       duration_ms: 1.6634
+2026-10-04T09:36:23.2961010Z       type: 'test'
+2026-10-04T09:36:23.2961161Z       ...
+2026-10-04T09:36:23.2961430Z     # Subtest: 边界（IFNULL 语义）：NULL 与 '' 视为同一个前缀，必须冲突
+2026-10-04T09:36:23.2961736Z     ok 3 - 边界（IFNULL 语义）：NULL 与 '' 视为同一个前缀，必须冲突
+2026-10-04T09:36:23.2961948Z       ---
+2026-10-04T09:36:23.2962090Z       duration_ms: 0.5573
+2026-10-04T09:36:23.2962561Z       type: 'test'
+2026-10-04T09:36:23.2962712Z       ...
+2026-10-04T09:36:23.2962962Z     # Subtest: 正例：同 (asset,avatar) 不同非空前缀允许；同前缀重复被拒
+2026-10-04T09:36:23.2963269Z     ok 4 - 正例：同 (asset,avatar) 不同非空前缀允许；同前缀重复被拒
+2026-10-04T09:36:23.2963466Z       ---
+2026-10-04T09:36:23.2963603Z       duration_ms: 0.9211
+2026-10-04T09:36:23.2963771Z       type: 'test'
+2026-10-04T09:36:23.2963906Z       ...
+2026-10-04T09:36:23.2964185Z     # Subtest: 旁证：tags(IFNULL(namespace,''), name) 与 item_tags 复合主键同口径
+2026-10-04T09:36:23.2964576Z     ok 5 - 旁证：tags(IFNULL(namespace,''), name) 与 item_tags 复合主键同口径
+2026-10-04T09:36:23.2964813Z       ---
+2026-10-04T09:36:23.2964947Z       duration_ms: 0.7295
+2026-10-04T09:36:23.2965117Z       type: 'test'
+2026-10-04T09:36:23.2965268Z       ...
+2026-10-04T09:36:23.2965400Z     1..5
+2026-10-04T09:36:23.2965653Z ok 123 - item_avatars 复合主键 / asset_avatars IFNULL 前缀唯一
+2026-10-04T09:36:23.2965880Z   ---
+2026-10-04T09:36:23.2966020Z   duration_ms: 4.9569
+2026-10-04T09:36:23.2966178Z   type: 'suite'
+2026-10-04T09:36:23.2966318Z   ...
+2026-10-04T09:36:23.2966492Z # Subtest: 外键 CASCADE
+2026-10-04T09:36:23.2966968Z     # Subtest: 删除 item → images/assets/jobs/item_avatars/archive_entries/job_events/asset_avatars/source_snapshots 全清
+2026-10-04T09:36:23.2967603Z     ok 1 - 删除 item → images/assets/jobs/item_avatars/archive_entries/job_events/asset_avatars/source_snapshots 全清
+2026-10-04T09:36:23.2967967Z       ---
+2026-10-04T09:36:23.2968107Z       duration_ms: 2.9749
+2026-10-04T09:36:23.2968279Z       type: 'test'
+2026-10-04T09:36:23.2968431Z       ...
+2026-10-04T09:36:23.2968733Z     # Subtest: 删除 avatar → item_avatars/asset_avatars/avatar_aliases 级联；正例对照删除前非零
+2026-10-04T09:36:23.2969152Z     ok 2 - 删除 avatar → item_avatars/asset_avatars/avatar_aliases 级联；正例对照删除前非零
+2026-10-04T09:36:23.2969404Z       ---
+2026-10-04T09:36:23.2969537Z       duration_ms: 1.0726
+2026-10-04T09:36:23.2969697Z       type: 'test'
+2026-10-04T09:36:23.2969838Z       ...
+2026-10-04T09:36:23.2969963Z     1..2
+2026-10-04T09:36:23.2970127Z ok 124 - 外键 CASCADE
+2026-10-04T09:36:23.2970317Z   ---
+2026-10-04T09:36:23.2970495Z   duration_ms: 4.1496
+2026-10-04T09:36:23.2970886Z   type: 'suite'
+2026-10-04T09:36:23.2971072Z   ...
+2026-10-04T09:36:23.2971322Z # Subtest: 外键 RESTRICT
+2026-10-04T09:36:23.2971682Z     # Subtest: items.cover_image_id → 删除被引用图片必须失败；置 NULL 后可删
+2026-10-04T09:36:23.2972133Z     ok 1 - items.cover_image_id → 删除被引用图片必须失败；置 NULL 后可删
+2026-10-04T09:36:23.2972426Z       ---
+2026-10-04T09:36:23.2972654Z       duration_ms: 0.7211
+2026-10-04T09:36:23.2972844Z       type: 'test'
+2026-10-04T09:36:23.2972987Z       ...
+2026-10-04T09:36:23.2973286Z     # Subtest: assets.root_id → 删除被引用 library_root 必须失败；删掉 asset 后可删 root
+2026-10-04T09:36:23.2973678Z     ok 2 - assets.root_id → 删除被引用 library_root 必须失败；删掉 asset 后可删 root
+2026-10-04T09:36:23.2973910Z       ---
+2026-10-04T09:36:23.2974047Z       duration_ms: 1.1199
+2026-10-04T09:36:23.2974208Z       type: 'test'
+2026-10-04T09:36:23.2974345Z       ...
+2026-10-04T09:36:23.2974681Z     # Subtest: project_imports.asset_id → RESTRICT；正例对照：asset_id 为 NULL 的导入可随 item 级联删
+2026-10-04T09:36:23.2975230Z     ok 3 - project_imports.asset_id → RESTRICT；正例对照：asset_id 为 NULL 的导入可随 item 级联删
+2026-10-04T09:36:23.2975502Z       ---
+2026-10-04T09:36:23.2975642Z       duration_ms: 2.5615
+2026-10-04T09:36:23.2975847Z       type: 'test'
+2026-10-04T09:36:23.2975988Z       ...
+2026-10-04T09:36:23.2976231Z     # Subtest: 反例缺口自证：外键 enforcement 确实打开（关掉后同一删除会成功）
+2026-10-04T09:36:23.2976653Z     ok 4 - 反例缺口自证：外键 enforcement 确实打开（关掉后同一删除会成功）
+2026-10-04T09:36:23.2976850Z       ---
+2026-10-04T09:36:23.2976983Z       duration_ms: 0.9697
+2026-10-04T09:36:23.2977135Z       type: 'test'
+2026-10-04T09:36:23.2977268Z       ...
+2026-10-04T09:36:23.2977388Z     1..4
+2026-10-04T09:36:23.2977560Z ok 125 - 外键 RESTRICT
+2026-10-04T09:36:23.2977705Z   ---
+2026-10-04T09:36:23.2977843Z   duration_ms: 5.5697
+2026-10-04T09:36:23.2977997Z   type: 'suite'
+2026-10-04T09:36:23.2978132Z   ...
+2026-10-04T09:36:23.2978308Z # Subtest: schema 自身完整性
+2026-10-04T09:36:23.2978539Z     # Subtest: 15 张核心表 + FTS5 虚拟表存在
+2026-10-04T09:36:23.2978779Z     ok 1 - 15 张核心表 + FTS5 虚拟表存在
+2026-10-04T09:36:23.2978947Z       ---
+2026-10-04T09:36:23.2979084Z       duration_ms: 0.5313
+2026-10-04T09:36:23.2979242Z       type: 'test'
+2026-10-04T09:36:23.2979379Z       ...
+2026-10-04T09:36:23.2982432Z     # Subtest: FTS5 使用 trigram 分词器；content 模式与 DDL 文本自洽（行为对照）
+2026-10-04T09:36:23.2983017Z     ok 2 - FTS5 使用 trigram 分词器；content 模式与 DDL 文本自洽（行为对照）
+2026-10-04T09:36:23.2983272Z       ---
+2026-10-04T09:36:23.2983424Z       duration_ms: 4.0954
+2026-10-04T09:36:23.2983596Z       type: 'test'
+2026-10-04T09:36:23.2983822Z       ...
+2026-10-04T09:36:23.2984249Z     # Subtest: schema_meta/settings 主键可幂等写入（ON CONFLICT 语义的前置条件）
+2026-10-04T09:36:23.2984622Z     ok 3 - schema_meta/settings 主键可幂等写入（ON CONFLICT 语义的前置条件）
+2026-10-04T09:36:23.2984848Z       ---
+2026-10-04T09:36:23.2984991Z       duration_ms: 0.3707
+2026-10-04T09:36:23.2985153Z       type: 'test'
+2026-10-04T09:36:23.2985292Z       ...
+2026-10-04T09:36:23.2985428Z     1..3
+2026-10-04T09:36:23.2985619Z ok 126 - schema 自身完整性
+2026-10-04T09:36:23.2985774Z   ---
+2026-10-04T09:36:23.2985913Z   duration_ms: 5.1557
+2026-10-04T09:36:23.2986064Z   type: 'suite'
+2026-10-04T09:36:23.2986203Z   ...
+2026-10-04T09:36:23.2986391Z #       items_fts content mode: content-storing
+2026-10-04T09:36:23.2986680Z # Subtest: trigram 日文子串（>=3 字符）
+2026-10-04T09:36:23.2986924Z     # Subtest: 正例：前缀 マヌカ → 命中 rowid 1
+2026-10-04T09:36:23.2987156Z     ok 1 - 正例：前缀 マヌカ → 命中 rowid 1
+2026-10-04T09:36:23.2987328Z       ---
+2026-10-04T09:36:23.2987471Z       duration_ms: 1.6114
+2026-10-04T09:36:23.2987632Z       type: 'test'
+2026-10-04T09:36:23.2987779Z       ...
+2026-10-04T09:36:23.2988010Z     # Subtest: 正例：**中段**子串 ヌカち（非前缀）也命中 —— trigram 的价值所在
+2026-10-04T09:36:23.2988299Z     ok 2 - 正例：**中段**子串 ヌカち（非前缀）也命中 —— trigram 的价值所在
+2026-10-04T09:36:23.2988499Z       ---
+2026-10-04T09:36:23.2988631Z       duration_ms: 0.3088
+2026-10-04T09:36:23.2988789Z       type: 'test'
+2026-10-04T09:36:23.2988948Z       ...
+2026-10-04T09:36:23.2989348Z     # Subtest: 正例：跨字段边界子串 ちゃん用 命中 1（title）与 2（description）
+2026-10-04T09:36:23.2989681Z     ok 3 - 正例：跨字段边界子串 ちゃん用 命中 1（title）与 2（description）
+2026-10-04T09:36:23.2989887Z       ---
+2026-10-04T09:36:23.2990029Z       duration_ms: 0.202
+2026-10-04T09:36:23.2990197Z       type: 'test'
+2026-10-04T09:36:23.2990348Z       ...
+2026-10-04T09:36:23.2990632Z     # Subtest: 负例：不存在的词 只命中它真正所在的 rowid 3
+2026-10-04T09:36:23.2990871Z     ok 4 - 负例：不存在的词 只命中它真正所在的 rowid 3
+2026-10-04T09:36:23.2991048Z       ---
+2026-10-04T09:36:23.2991174Z       duration_ms: 0.197
+2026-10-04T09:36:23.2991332Z       type: 'test'
+2026-10-04T09:36:23.2991475Z       ...
+2026-10-04T09:36:23.2991601Z     1..4
+2026-10-04T09:36:23.2991788Z ok 127 - trigram 日文子串（>=3 字符）
+2026-10-04T09:36:23.2991952Z   ---
+2026-10-04T09:36:23.2992085Z   duration_ms: 2.8513
+2026-10-04T09:36:23.2992241Z   type: 'suite'
+2026-10-04T09:36:23.2992379Z   ...
+2026-10-04T09:36:23.2992587Z # Subtest: trigram 中文子串（>=3 字符）
+2026-10-04T09:36:23.2992828Z     # Subtest: 正例：中段子串 乃ちゃ → 命中 rowid 2
+2026-10-04T09:36:23.2993059Z     ok 1 - 正例：中段子串 乃ちゃ → 命中 rowid 2
+2026-10-04T09:36:23.2993233Z       ---
+2026-10-04T09:36:23.2993369Z       duration_ms: 0.272
+2026-10-04T09:36:23.2993529Z       type: 'test'
+2026-10-04T09:36:23.2993675Z       ...
+2026-10-04T09:36:23.2993894Z     # Subtest: 正例：含数字的 3 字符子串 対応1 → 命中有「対応1.01」的 rowid 2
+2026-10-04T09:36:23.2994187Z     ok 2 - 正例：含数字的 3 字符子串 対応1 → 命中有「対応1.01」的 rowid 2
+2026-10-04T09:36:23.2994384Z       ---
+2026-10-04T09:36:23.2994517Z       duration_ms: 0.3042
+2026-10-04T09:36:23.2994676Z       type: 'test'
+2026-10-04T09:36:23.2994816Z       ...
+2026-10-04T09:36:23.2995072Z     # Subtest: 边界：2 字符子串 雪乃 在 FTS 层为 0 行（<3 字符必须回退 LIKE，见下一条对照）
+2026-10-04T09:36:23.2995511Z     ok 3 - 边界：2 字符子串 雪乃 在 FTS 层为 0 行（<3 字符必须回退 LIKE，见下一条对照）
+2026-10-04T09:36:23.2995862Z       ---
+2026-10-04T09:36:23.2996081Z       duration_ms: 0.2351
+2026-10-04T09:36:23.3008868Z       type: 'test'
+2026-10-04T09:36:23.3009193Z       ...
+2026-10-04T09:36:23.3009673Z     # Subtest: 正例对照：同一份数据 items 基表 LIKE '%雪乃%' 命中 1 行 —— 证明上面的 0 是分词阈值
+2026-10-04T09:36:23.3010177Z     ok 4 - 正例对照：同一份数据 items 基表 LIKE '%雪乃%' 命中 1 行 —— 证明上面的 0 是分词阈值
+2026-10-04T09:36:23.3010481Z       ---
+2026-10-04T09:36:23.3010676Z       duration_ms: 0.7147
+2026-10-04T09:36:23.3011340Z       type: 'test'
+2026-10-04T09:36:23.3011665Z       ...
+2026-10-04T09:36:23.3011812Z     1..4
+2026-10-04T09:36:23.3012386Z ok 128 - trigram 中文子串（>=3 字符）
+2026-10-04T09:36:23.3012979Z   ---
+2026-10-04T09:36:23.3013422Z   duration_ms: 1.9702
+2026-10-04T09:36:23.3013693Z   type: 'suite'
+2026-10-04T09:36:23.3013896Z   ...
+2026-10-04T09:36:23.3014232Z # Subtest: trigram ASCII 子串与大小写
+2026-10-04T09:36:23.3014644Z     # Subtest: 正例：ASCII 中段子串 hinano（在 Shinano 内部）命中 rowid 2
+2026-10-04T09:36:23.3015097Z     ok 1 - 正例：ASCII 中段子串 hinano（在 Shinano 内部）命中 rowid 2
+2026-10-04T09:36:23.3015387Z       ---
+2026-10-04T09:36:23.3015588Z       duration_ms: 0.4447
+2026-10-04T09:36:23.3015819Z       type: 'test'
+2026-10-04T09:36:23.3016224Z       ...
+2026-10-04T09:36:23.3016572Z     # Subtest: 正例：大小写不敏感（Shinano / SHINANO / shinano 同结果）
+2026-10-04T09:36:23.3017048Z     ok 2 - 正例：大小写不敏感（Shinano / SHINANO / shinano 同结果）
+2026-10-04T09:36:23.3017367Z       ---
+2026-10-04T09:36:23.3017591Z       duration_ms: 0.4252
+2026-10-04T09:36:23.3017839Z       type: 'test'
+2026-10-04T09:36:23.3018049Z       ...
+2026-10-04T09:36:23.3018371Z     # Subtest: 负例：不存在的 ASCII 子串 qwerty 必须 0 行
+2026-10-04T09:36:23.3018781Z     ok 3 - 负例：不存在的 ASCII 子串 qwerty 必须 0 行
+2026-10-04T09:36:23.3019087Z       ---
+2026-10-04T09:36:23.3019299Z       duration_ms: 0.1537
+2026-10-04T09:36:23.3019547Z       type: 'test'
+2026-10-04T09:36:23.3019757Z       ...
+2026-10-04T09:36:23.3019956Z     1..3
+2026-10-04T09:36:23.3020477Z ok 129 - trigram ASCII 子串与大小写
+2026-10-04T09:36:23.3020736Z   ---
+2026-10-04T09:36:23.3020930Z   duration_ms: 1.183
+2026-10-04T09:36:23.3021158Z   type: 'suite'
+2026-10-04T09:36:23.3021366Z   ...
+2026-10-04T09:36:23.3021708Z # Subtest: 分词器配置与维护路径（行为断言，不只看 DDL 文本）
+2026-10-04T09:36:23.3022073Z     # Subtest: DDL 声明 tokenize='trigram'
+2026-10-04T09:36:23.3022440Z     ok 1 - DDL 声明 tokenize='trigram'
+2026-10-04T09:36:23.3022722Z       ---
+2026-10-04T09:36:23.3022929Z       duration_ms: 0.413
+2026-10-04T09:36:23.3023180Z       type: 'test'
+2026-10-04T09:36:23.3023506Z       ...
+2026-10-04T09:36:23.3023871Z     # Subtest: 当前模式：内容存储型（title 列可读回；若 content='' 恢复则本断言应改为 NULL）
+2026-10-04T09:36:23.3024374Z     ok 2 - 当前模式：内容存储型（title 列可读回；若 content='' 恢复则本断言应改为 NULL）
+2026-10-04T09:36:23.3024700Z       ---
+2026-10-04T09:36:23.3024892Z       duration_ms: 0.7444
+2026-10-04T09:36:23.3025113Z       type: 'test'
+2026-10-04T09:36:23.3025307Z       ...
+2026-10-04T09:36:23.3025685Z     # Subtest: 维护路径：DELETE 一条 FTS 行后该行不再被命中（contentless 表此处会抛错）
+2026-10-04T09:36:23.3026193Z     ok 3 - 维护路径：DELETE 一条 FTS 行后该行不再被命中（contentless 表此处会抛错）
+2026-10-04T09:36:23.3026515Z       ---
+2026-10-04T09:36:23.3026718Z       duration_ms: 58.4638
+2026-10-04T09:36:23.3026979Z       type: 'test'
+2026-10-04T09:36:23.3027173Z       ...
+2026-10-04T09:36:23.3027493Z     # Subtest: 负例：FTS 语法错误（未闭合引号）必须抛错而不是静默返回空集
+2026-10-04T09:36:23.3027889Z     ok 4 - 负例：FTS 语法错误（未闭合引号）必须抛错而不是静默返回空集
+2026-10-04T09:36:23.3028143Z       ---
+2026-10-04T09:36:23.3028339Z       duration_ms: 0.5921
+2026-10-04T09:36:23.3028592Z       type: 'test'
+2026-10-04T09:36:23.3028786Z       ...
+2026-10-04T09:36:23.3028956Z     1..4
+2026-10-04T09:36:23.3029242Z ok 130 - 分词器配置与维护路径（行为断言，不只看 DDL 文本）
+2026-10-04T09:36:23.3029500Z   ---
+2026-10-04T09:36:23.3029696Z   duration_ms: 60.4356
+2026-10-04T09:36:23.3029901Z   type: 'suite'
+2026-10-04T09:36:23.3030091Z   ...
+2026-10-04T09:36:23.3030266Z 1..130
+2026-10-04T09:36:23.3030451Z # tests 188
+2026-10-04T09:36:23.3030653Z # suites 19
+2026-10-04T09:36:23.3030830Z # pass 170
+2026-10-04T09:36:23.3031021Z # fail 1
+2026-10-04T09:36:23.3031204Z # cancelled 0
+2026-10-04T09:36:23.3031408Z # skipped 17
+2026-10-04T09:36:23.3031588Z # todo 0
+2026-10-04T09:36:23.3031959Z # duration_ms 5246.6463
+2026-10-04T09:36:23.3929478Z ##[error]Process completed with exit code 1.
+2026-10-04T09:36:23.4159619Z Post job cleanup.
+2026-10-04T09:36:23.5565697Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-10-04T09:36:23.5800271Z git version 2.55.0.windows.5
+2026-10-04T09:36:23.5862382Z Temporarily overriding HOME='D:\a\_temp\5cb57491-3aac-4a81-b5d8-cb5f1f3078fe' before making global git config changes
+2026-10-04T09:36:23.5863401Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-04T09:36:23.5872641Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\asset-vault\asset-vault
+2026-10-04T09:36:23.6211726Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-10-04T09:36:23.6539092Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-10-04T09:36:24.1855510Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-04T09:36:24.2080410Z http.https://github.com/.extraheader
+2026-10-04T09:36:24.2117578Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all http.https://github.com/.extraheader
+2026-10-04T09:36:24.2377370Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-10-04T09:36:24.6936551Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-04T09:36:24.7210556Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-10-04T09:36:25.2013048Z Cleaning up orphan processes
+2026-10-04T09:36:25.2212874Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/setup-node@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
