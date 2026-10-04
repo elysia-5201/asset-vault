@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
@@ -46,6 +46,7 @@ export function ItemDetail(props: {
   const [compatPick, setCompatPick] = useState<number | "">("");
   const [compatMatch, setCompatMatch] = useState<AvatarMatch>("any");
   const [busy, setBusy] = useState(false);
+  const boothInputRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(() => {
     setLoading(true); setErr("");
@@ -128,6 +129,25 @@ export function ItemDetail(props: {
       });
   };
 
+  /** 「关联 BOOTH 商品」：把商品页的标题/店铺/价格/分类/标签 + 图集灌进当前条目；已关联的条目重跑即"补全"。 */
+  const runBoothLink = (url: string, okText: (r: any) => string) => {
+    const u = url.trim();
+    if (!u || boothBusy) return;
+    setBoothBusy(true); setBoothHint("");
+    linkBooth(itemId, u, false)
+      .then((res: any) => { props.onToast("ok", okText(res)); setBoothUrl(""); load(); props.onChanged(); })
+      .catch((e) => props.onToast("bad", describeError(e)))
+      .finally(() => setBoothBusy(false));
+  };
+
+  /** 没有可用商品链接时：把「关联 BOOTH 商品」输入框滚进视野并聚焦。 */
+  const focusBoothPanel = () => {
+    const el = boothInputRef.current;
+    if (!el) { props.onToast("info", "该条目没有 BOOTH 商品链接，请先在下方粘贴商品链接"); return; }
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.focus();
+  };
+
   if (loading) return <div className="backdrop"><div className="drawer"><div className="empty"><Spinner /> 载入条目 #{itemId}…</div></div></div>;
   if (err || !detail) return (
     <div className="backdrop" onClick={props.onClose}>
@@ -139,6 +159,8 @@ export function ItemDetail(props: {
   );
 
   const it = detail.item;
+  /** 已有 BOOTH 商品链接 → 该按钮直接重跑抓取（补全元数据/图集）；否则只引导到粘贴框。 */
+  const boothUrlFromItem = it.source_site === "booth" && it.source_url ? it.source_url : "";
   const tags = localTags ?? detail.tags ?? [];
   const imported = props.importedIds.includes(itemId);
 
@@ -160,10 +182,11 @@ export function ItemDetail(props: {
         </div>
         <div className="drawer-body">
           <div className="left">
-            {detail.sourceSite === "local" && (
+            {(detail.sourceSite === "local" || !it.source_url) && (
               <Section title="关联 BOOTH 商品（补全标题/店铺/价格/标签 + 抓图集）">
                 <div className="row">
                   <input
+                    ref={boothInputRef}
                     type="url"
                     placeholder="https://booth.pm/zh-cn/items/6747912"
                     value={boothUrl}
@@ -185,17 +208,7 @@ export function ItemDetail(props: {
                   <button
                     className="btn"
                     disabled={!boothUrl.trim() || boothBusy}
-                    onClick={async () => {
-                      setBoothBusy(true); setBoothHint("");
-                      try {
-                        const r: any = await linkBooth(itemId, boothUrl.trim(), false);
-                        props.onToast("ok", "已关联 BOOTH " + r?.meta?.itemId + "，抓取 " + (r?.images ?? 0) + " 张图");
-                        setBoothUrl("");
-                        load();
-                        props.onChanged();
-                      } catch (e) { props.onToast("bad", describeError(e)); }
-                      finally { setBoothBusy(false); }
-                    }}
+                    onClick={() => runBoothLink(boothUrl, (r) => "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "，抓取 " + (r?.images ?? 0) + " 张图")}
                   >抓取</button>
                   {boothBusy && <Spinner />}
                 </div>
@@ -291,7 +304,23 @@ export function ItemDetail(props: {
               <table className="kv">
                 <tbody>
                   <tr><td className="k">id / uid</td><td className="mono">{it.id} · {it.uid}</td></tr>
-                  <tr><td className="k">来源</td><td>{SITE_LABEL[it.source_site]} {it.source_item_id ?? ""} {it.source_url ? <a href={it.source_url} target="_blank" rel="noreferrer">链接</a> : null}</td></tr>
+                  <tr>
+                    <td className="k">来源</td>
+                    <td>
+                      {it.source_url
+                        ? <a href={it.source_url} target="_blank" rel="noreferrer" title={"在浏览器打开来源页：" + it.source_url}>{SITE_LABEL[it.source_site]} {it.source_item_id ?? ""}</a>
+                        : <span>{SITE_LABEL[it.source_site]}{it.source_item_id ? " " + it.source_item_id : ""}</span>}
+                      {" "}
+                      <button
+                        className="btn tiny"
+                        disabled={boothBusy}
+                        title="关联 BOOTH 商品（补全标题/店铺/价格/标签 + 抓图集）"
+                        onClick={() => (boothUrlFromItem
+                          ? runBoothLink(boothUrlFromItem, (res) => "已补全 BOOTH " + (res?.meta?.itemId ?? "") + " 元数据/标签，新增 " + (res?.images ?? 0) + " 张图")
+                          : focusBoothPanel())}
+                      >{boothUrlFromItem ? "补全 BOOTH" : "关联 BOOTH 商品"}</button>
+                    </td>
+                  </tr>
                   <tr><td className="k">店铺/作者</td><td>{it.shop_name ?? "—"} / {it.author ?? "—"}</td></tr>
                   <tr><td className="k">分类</td><td>{it.category_parent ? it.category_parent + " › " : ""}{it.category_name ?? "—"}</td></tr>
                   <tr><td className="k">价格</td><td>{formatYen(it.price_yen, it.price_text)} {it.purchased ? "· 已购入" : ""}</td></tr>
