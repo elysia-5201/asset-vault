@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { UnityMcp, parseMcpBody, translateToHost, listUnityPackageCandidates, type UnityPackageCandidate } from "../src/services/unity";
+import { UnityMcp, parseMcpBody, translateToHost, listUnityPackageCandidates, matchAvatarByText, tokenize, type UnityPackageCandidate } from "../src/services/unity";
 
 test("parseMcpBody：纯 JSON 与 SSE 两种响应都能解", () => {
   assert.deepEqual(parseMcpBody('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'), { jsonrpc: "2.0", id: 1, result: { ok: true } });
@@ -20,6 +20,21 @@ test("translateToHost：/mnt/<盘> → 盘符；其余 → \\wsl.localhost\<dist
   assert.equal(translateToHost("/root/Code/x.unitypackage", "Ubuntu-26.04-LTS"), "\\\\wsl.localhost\\Ubuntu-26.04-LTS\\root\\Code\\x.unitypackage");
   assert.equal(translateToHost("/root/Code/x.unitypackage", ""), "/root/Code/x.unitypackage");
   assert.equal(translateToHost("E:\\tool\\x.unitypackage", "Ubuntu-26.04-LTS"), "E:\\tool\\x.unitypackage");
+});
+
+test("matchAvatarByText：整词命中名字或别名，猜不到就 null（防误判）", () => {
+  const avatars = [
+    { id: 1, name: "Manuka", aliases: ["マヌカ", "まぬか", "MANUKA"] },
+    { id: 6, name: "Lime", aliases: ["ライム"] },
+    { id: 5, name: "Moe", aliases: [] },
+  ];
+  assert.deepEqual(matchAvatarByText(avatars, "Butterfly_Pussy_for_manuka.zip"), { id: 1, name: "Manuka", via: "Manuka" });
+  assert.deepEqual(matchAvatarByText(avatars, "E:/game/vrchatcache/manuka"), { id: 1, name: "Manuka", via: "Manuka" });
+  assert.deepEqual(matchAvatarByText(avatars, "xxx_ライム_tex"), { id: 6, name: "Lime", via: "ライム" });
+  assert.equal(matchAvatarByText(avatars, "moefication_shader"), null); // "moe" 不能命中更长单词
+  assert.equal(matchAvatarByText(avatars, "unknown_avatar_pack"), null);
+  assert.equal(matchAvatarByText([], "manuka"), null);
+  assert.deepEqual(tokenize("Butterfly Pussy for Manuka"), ["butterfly", "pussy", "for", "manuka"]);
 });
 
 /** 假 repo：只实现 listUnityPackageCandidates 用到的三个方法。 */
@@ -45,7 +60,8 @@ test("listUnityPackageCandidates：.unitypackage 直接算；压缩包内的按 
       { path: "Set/tiny.unitypackage", size: 512, isDir: 0 }, // < 1KB 的忽略
     ] },
   );
-  const out = await listUnityPackageCandidates(repo, 4);
+  const { packages: out, scanErrors } = await listUnityPackageCandidates(repo, 4);
+  assert.equal(scanErrors, 0); // 内层 zip 没读成功时不该静默返回空结果
   assert.deepEqual(out.map((c: UnityPackageCandidate) => c.label), ["Big.unitypackage", "Small.unitypackage", "Direct.unitypackage"]);
   assert.deepEqual(out.map((c) => c.key), ["2|Set/Big.unitypackage", "2|Set/Small.unitypackage", "1|"]);
   assert.equal(out[0]!.entryPath, "Set/Big.unitypackage");

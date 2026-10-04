@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
 import { importBoothUrl } from "../services/booth";
-import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, sleep } from "../services/unity";
+import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, sleep } from "../services/unity";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -40,7 +40,13 @@ let deps_log: (m: string) => void = () => {};
 
 export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
+  setUnityLogger(deps.log);
   const { repo, media, booth } = deps;
+
+  /** 头像名单（名字 + 别名）——用来把"包名/工程名"认成 avatar。 */
+  const avatarLite = () => (repo.listAvatars() as any[]).map((a) => ({ id: Number(a.id), name: String(a.name), aliases: (a.aliases ?? []) as string[] }));
+  /** 工程目录名 → avatar（E:\\game\\vrchatcache\\manuka → Manuka）。 */
+  const projectAvatarOf = (projectPath?: string | null) => (projectPath ? matchAvatarByText(avatarLite(), String(projectPath)) : null);
 
   /** Unity 桥端点：settings.unity_mcp_url 优先，否则探测本机两个已知端口。 */
   const unityUrls = (): string[] => {
@@ -496,19 +502,30 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const editor = await unityEditorInfo(u);
       const proj = (repo.listProjects() as any[]).find((p) => p.path_norm === normalizePath(editor.projectPath));
-      return { ok: true, endpoint: u.endpoint, serverName: u.serverName, editor, projectId: proj?.id ?? null, registered: !!proj, candidates };
+      return { ok: true, endpoint: u.endpoint, serverName: u.serverName, editor, projectAvatar: projectAvatarOf(editor.projectPath), projectId: proj?.id ?? null, registered: !!proj, candidates };
     } catch (e) {
-      return { ok: false, endpoint: u.endpoint, serverName: "", error: String((e as Error)?.message ?? e), candidates };
+      return { ok: false, endpoint: u.endpoint, serverName: "", error: String((e as Error)?.message ?? e), projectAvatar: null, candidates };
     }
   });
 
-  /** 列出这个条目里所有可导入的 .unitypackage（压缩包内的也列，附大小）。 */
+  /**
+   * 列出这个条目里所有可导入的 .unitypackage（压缩包内的、zip 套 zip 的都列）。
+   * ?project=<工程路径> → 顺便把"这个包是给哪个 avatar 的 / 是不是当前工程那个"标出来。
+   */
   app.get("/api/unity/packages", async (req, reply) => {
     try {
-      const itemId = toInt((req.query as any).itemId, 0);
+      const q = req.query as any;
+      const itemId = toInt(q.itemId, 0);
       if (!itemId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 必填" } });
-      const packages = await listUnityPackageCandidates(repo, itemId);
-      return { itemId, packages };
+      const projectAvatar = projectAvatarOf(q.project ? String(q.project) : null);
+      const scan = await listUnityPackageCandidates(repo, itemId, {
+        avatars: avatarLite(), projectAvatarId: projectAvatar?.id ?? null,
+        refresh: q.refresh === "1" || q.refresh === "true",
+      });
+      return {
+        itemId, projectAvatar, scanErrors: scan.scanErrors,
+        packages: scan.packages.map((p) => ({ ...p, avatar: p.avatar ?? null, matched: !!p.matched })),
+      };
     } catch (e) { return fail(reply, e); }
   });
 
@@ -522,9 +539,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
       const u = unity();
       const editor = await unityEditorInfo(u);
-      const all = await listUnityPackageCandidates(repo, itemId);
+      const projectAvatar = projectAvatarOf(editor.projectPath);
+      const all = (await listUnityPackageCandidates(repo, itemId, { avatars: avatarLite(), projectAvatarId: projectAvatar?.id ?? null })).packages;
       const keys: string[] = Array.isArray(b.keys) ? b.keys.map((k: any) => String(k)) : [];
-      const picked = (keys.length ? all.filter((c) => keys.includes(c.key)) : all).slice(0, 20);
+      // 没显式指定要哪些包时：优先只导"当前工程那个 avatar"的包（存在的话），否则全导
+      const auto = projectAvatar ? all.filter((c) => c.matched) : [];
+      const picked = (keys.length ? all.filter((c) => keys.includes(c.key)) : (auto.length ? auto : all)).slice(0, 20);
       if (!picked.length) {
         return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "这个条目里没有可导入的 .unitypackage（压缩包还没索引的话，先在资产上重建索引）" } });
       }
@@ -552,7 +572,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
       return {
         ok: r.failed.length === 0, endpoint: u.endpoint,
-        project: { id: projectId, name: editor.projectName, path: editor.projectPath, unityVersion: editor.unityVersion },
+        project: { id: projectId, name: editor.projectName, path: editor.projectPath, unityVersion: editor.unityVersion, avatar: projectAvatar },
+        autoMatched: keys.length === 0 && auto.length > 0,
         imported: staged.map((s) => ({ key: s.key, label: s.label, stagedPath: s.stagedPath, bytes: s.bytes })),
         consoleCleared, queued: r.queued, failed: r.failed, consoleErrors, raw: r.raw,
       };

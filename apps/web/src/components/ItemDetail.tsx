@@ -53,6 +53,7 @@ export function ItemDetail(props: {
   const [unityPicked, setUnityPicked] = useState<Set<string>>(new Set());
   const [unityBusy, setUnityBusy] = useState(false);
   const [unityNote, setUnityNote] = useState("");
+  const [unityPickNote, setUnityPickNote] = useState("");
   const [unityErrors, setUnityErrors] = useState<string[]>([]);
 
   const load = useCallback(() => {
@@ -147,21 +148,40 @@ export function ItemDetail(props: {
       .finally(() => setBoothBusy(false));
   };
 
-  /** 探测当前打开的 Unity（MCP for Unity）+ 这个条目里的 .unitypackage 清单。 */
-  const loadUnity = useCallback(() => {
-    setUnityBusy(true); setUnityNote(""); setUnityErrors([]);
-    Promise.allSettled([unityStatus(), unityPackages(itemId)])
-      .then(([st, pk]) => {
-        const s = st.status === "fulfilled" ? st.value : null;
-        setUnity(s ?? { ok: false, endpoint: "", error: st.status === "rejected" ? describeError(st.reason) : "MCP 未响应", candidates: [] });
-        const list = pk.status === "fulfilled" ? pk.value.packages : [];
-        setUnityPkgs(list);
-        setUnityPicked(new Set(list.map((p) => p.key)));
-      })
-      .finally(() => setUnityBusy(false));
+  /**
+   * 探测当前打开的 Unity（MCP for Unity）+ 这个条目里的 .unitypackage 清单。
+   * 认得出"当前工程是哪个 avatar"时，只预选那个 avatar 的包（其余仍列出来，手动可勾）。
+   */
+  const loadUnity = useCallback(async (refresh = false) => {
+    setUnityBusy(true); setUnityNote(""); setUnityPickNote(""); setUnityErrors([]);
+    try {
+      let st: UnityStatusWeb;
+      try { st = await unityStatus(); }
+      catch (e) { st = { ok: false, endpoint: "", error: describeError(e), candidates: [], projectAvatar: null }; }
+      setUnity(st);
+      let list: UnityPackageWeb[] = [];
+      let projAvatar = st.projectAvatar ?? null;
+      let scanErrors = 0;
+      try {
+        const pk = await unityPackages(itemId, st.editor?.projectPath, refresh);
+        list = pk.packages;
+        projAvatar = pk.projectAvatar ?? projAvatar;
+        scanErrors = pk.scanErrors ?? 0;
+      } catch (e) { if (!st.ok) setUnityNote("列包失败：" + describeError(e)); }
+      setUnityPkgs(list);
+      const matched = list.filter((p) => p.matched);
+      setUnityPicked(new Set((matched.length ? matched : list).map((p) => p.key)));
+      if (scanErrors > 0) {
+        setUnityNote("有 " + scanErrors + " 个内层压缩包这次没读成功（网络盘/杀软偶发），点右上「重新检测」重扫。");
+      } else if (matched.length && matched.length < list.length) {
+        setUnityPickNote("已按当前工程 @" + (projAvatar?.name ?? "?") + " 预选 " + matched.length + "/" + list.length + " 个包（其余是给别的 avatar 的，要装可以自己勾）");
+      } else if (list.length > 1 && !matched.length && projAvatar) {
+        setUnityPickNote("这 " + list.length + " 个包里没有认出 @ " + projAvatar.name + " 的（工程名对不上包名），已全选，请自己确认");
+      }
+    } finally { setUnityBusy(false); }
   }, [itemId]);
 
-  useEffect(() => { loadUnity(); }, [loadUnity]);
+  useEffect(() => { void loadUnity(); }, [loadUnity]);
 
   const doUnityImport = () => {
     if (!unityPicked.size || unityBusy) return;
@@ -376,7 +396,7 @@ export function ItemDetail(props: {
 
             <Section
               title="导入到 Unity 工程"
-              right={<button className="btn tiny" disabled={unityBusy} onClick={loadUnity}>{unityBusy ? "检测中…" : "重新检测"}</button>}
+              right={<button className="btn tiny" disabled={unityBusy} onClick={() => void loadUnity(true)}>{unityBusy ? "检测中…" : "重新检测"}</button>}
             >
               {unity?.ok && unity.editor ? (
                 <>
@@ -393,18 +413,19 @@ export function ItemDetail(props: {
                   {unityPkgs.length > 0 && (
                     <>
                       <div className="hint" style={{ marginTop: "6px" }}>
-                        找到 {unityPkgs.length} 个包。导入前会清空 Unity 控制台，导入后回读报错。
+                        找到 {unityPkgs.length} 个包{unityPkgs.some((p) => p.matched) ? "（★ 是当前工程那个 avatar 的）" : ""}。导入前会清空 Unity 控制台，导入后回读报错。
                       </div>
                       <div className="unity-pkgs">
                         {unityPkgs.map((p) => (
-                          <label className="unity-pkg" key={p.key} title={p.entryPath ? p.sourcePath + " › " + p.entryPath : p.sourcePath}>
+                          <label className={"unity-pkg" + (p.matched ? " on" : "")} key={p.key} title={(p.entryPath ? p.sourcePath + " › " + p.entryPath : p.sourcePath) + (p.avatar ? " ｜ avatar: " + p.avatar.name + "（命中 " + p.avatar.via + "）" : " ｜ 没认出 avatar")}>
                             <input
                               type="checkbox"
                               checked={unityPicked.has(p.key)}
                               onChange={(e) => setUnityPicked((prev) => { const n = new Set(prev); if (e.target.checked) n.add(p.key); else n.delete(p.key); return n; })}
                             />
+                            <span className={"unity-pkg-avatar" + (p.matched ? " on" : "")}>{p.avatar ? "@" + p.avatar.name : "@?"}</span>
                             <span className="unity-pkg-name">{p.label}</span>
-                            <span className="hint">{formatBytes(p.size)}{p.note ? " · " + p.note : ""}</span>
+                            <span className="hint">{formatBytes(p.size)}</span>
                           </label>
                         ))}
                       </div>
@@ -412,9 +433,13 @@ export function ItemDetail(props: {
                         <button className="btn" disabled={unityBusy || !unityPicked.size} onClick={doUnityImport}>
                           {unityBusy ? "导入中…" : "导入到 " + unity.editor.projectName + "（" + unityPicked.size + "）"}
                         </button>
+                        {unity.projectAvatar && unityPkgs.some((p) => p.matched) && (
+                          <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.filter((p) => p.matched).map((p) => p.key)))}>只选 @{unity.projectAvatar.name}</button>
+                        )}
                         <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.map((p) => p.key)))}>全选</button>
                         <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set())}>全不选</button>
                       </div>
+                      {unityPickNote && <div className="hint" style={{ marginTop: "4px" }}>{unityPickNote}</div>}
                     </>
                   )}
                   {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}

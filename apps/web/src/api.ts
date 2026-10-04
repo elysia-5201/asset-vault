@@ -218,24 +218,31 @@ export interface UnityEditorInfoWeb {
   endpoint: string; serverName: string; dataPath: string; projectPath: string; projectName: string;
   unityVersion: string; isPlaying: boolean; isCompiling: boolean; scenePath: string;
 }
+/** 从包名/工程路径里认出来的 avatar。 */
+export interface UnityAvatarHintWeb { id: number; name: string; via: string }
 export interface UnityStatusWeb {
   ok: boolean; endpoint: string; serverName?: string; error?: string; editor?: UnityEditorInfoWeb;
-  projectId?: number | null; registered?: boolean; candidates: string[];
+  projectAvatar?: UnityAvatarHintWeb | null; projectId?: number | null; registered?: boolean; candidates: string[];
 }
 export interface UnityPackageWeb {
   key: string; label: string; assetId: number; container: string; sourcePath: string;
   entryPath: string | null; innerEntryPath: string | null; size: number; note?: string;
+  /** 这个包是给哪个 avatar 的（认不出来是 null） */
+  avatar?: UnityAvatarHintWeb | null;
+  /** 是否匹配"当前打开那个工程"的 avatar */
+  matched?: boolean;
 }
 export interface UnityImportWeb {
-  ok: boolean; endpoint: string; project: { id: number; name: string; path: string; unityVersion: string };
+  ok: boolean; endpoint: string; autoMatched?: boolean;
+  project: { id: number; name: string; path: string; unityVersion: string; avatar?: UnityAvatarHintWeb | null };
   imported: { key: string; label: string; stagedPath: string; bytes: number }[];
   queued: string[]; failed: string[]; consoleErrors: string[]; consoleCleared?: boolean; raw: string;
 }
 /** 探测当前打开的 Unity 编辑器（MCP for Unity）。Unity 没开时返回 {ok:false}，不抛错。 */
 export function unityStatus(): Promise<UnityStatusWeb> { return request("GET", "/unity/status", undefined, { timeoutMs: 12000 }); }
-/** 这个条目里能导入 Unity 的 .unitypackage（压缩包内的也列出来）。 */
-export function unityPackages(itemId: number): Promise<{ itemId: number; packages: UnityPackageWeb[] }> {
-  return request("GET", "/unity/packages" + queryString({ itemId }), undefined, { timeoutMs: 60000 });
+/** 这个条目里能导入 Unity 的 .unitypackage（压缩包内的、zip 套 zip 的都列）。传 projectPath 时会标出"哪些是当前工程那个 avatar 的"。 */
+export function unityPackages(itemId: number, projectPath?: string | null, refresh = false): Promise<{ itemId: number; projectAvatar: UnityAvatarHintWeb | null; scanErrors?: number; packages: UnityPackageWeb[] }> {
+  return request("GET", "/unity/packages" + queryString({ itemId, project: projectPath ?? undefined, refresh: refresh ? 1 : undefined }), undefined, { timeoutMs: 150000 });
 }
 /** 真正导入到当前打开的 Unity 工程；keys 省略 = 全部导入。 */
 export function unityImport(itemId: number, keys?: string[]): Promise<UnityImportWeb> {

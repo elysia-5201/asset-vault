@@ -6,17 +6,21 @@
  * 只需要三件事——initialize → notifications/initialized → tools/call。
  * 端点优先取 settings.unity_mcp_url，缺省按 UNITY_MCP_URLS 逐个探测。
  */
-import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
+import { normKey } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 
 /** 本机两个已知的 Unity 桥（都只监听 127.0.0.1）。 */
 export const UNITY_MCP_URLS = ["http://127.0.0.1:8080/mcp", "http://127.0.0.1:14523/mcp"];
 const MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_NESTED_ZIPS = 2;
+/** 内层 zip 下钻上限：VRChat 素材常见"一个 7z 里 9 个 per-avatar zip"，所以放得比较宽。 */
+const MAX_NESTED_ZIPS = 16;
+const NESTED_ZIP_MAX_BYTES = 512 * 1024 * 1024;
+const NESTED_CACHE_MAX = 64;
 
 /** 取文件名：本服务可能在 WSL 里跑而路径是 Windows 形式，path.basename 在 POSIX 下不认反斜杠。 */
 const baseName = (p: string): string => String(p).split(/[\\/]/).filter(Boolean).pop() ?? String(p);
@@ -26,11 +30,54 @@ export interface UnityEditorInfo {
   unityVersion: string; isPlaying: boolean; isCompiling: boolean; scenePath: string;
 }
 
+/** 从包名/内层 zip 名/工程路径里认出来的 avatar（用于"按当前工程自动匹配"）。 */
+export interface UnityAvatarHint { id: number; name: string; via: string }
+export interface AvatarLite { id: number; name: string; aliases?: string[] }
+
 export interface UnityPackageCandidate {
   /** 稳定 key：assetId + 包内路径，前端勾选后回传 */
   key: string; label: string; assetId: number; container: string;
   sourcePath: string; entryPath: string | null; innerEntryPath: string | null;
   size: number; note?: string;
+  /** 这个包是给哪个 avatar 的（认不出来就是 null） */
+  avatar?: UnityAvatarHint | null;
+  /** 是否匹配"当前打开的那个工程"的 avatar */
+  matched?: boolean;
+}
+
+/** 按分隔符切词（保留中日文）后再 normKey —— 整词比对，避免 "moe" 命中 "moefication"。 */
+export function tokenize(text: string): string[] {
+  return String(text ?? "")
+    .split(/[^0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]+/)
+    .map((t) => normKey(t))
+    .filter(Boolean);
+}
+
+/** 在一段文本（包名、内层 zip 名、工程路径）里找 avatar：整词命中名字或别名，取最长命中。 */
+export function matchAvatarByText(avatars: AvatarLite[], text: string): UnityAvatarHint | null {
+  const tokens = new Set(tokenize(text));
+  if (!tokens.size) return null;
+  let best: UnityAvatarHint | null = null;
+  let bestLen = 0;
+  for (const a of avatars) {
+    for (const raw of [a.name, ...(a.aliases ?? [])]) {
+      const k = normKey(String(raw ?? ""));
+      if (k.length < 3 || k.length <= bestLen) continue; // <3 字符的别名太容易误判（in/ri/…）
+      if (!tokens.has(k)) continue;
+      best = { id: a.id, name: a.name, via: String(raw) };
+      bestLen = k.length;
+    }
+  }
+  return best;
+}
+
+/** 内层 zip 扫描结果缓存（key = assetId:size:mtime），抽屉反复打开不用重扫。 */
+const nestedCache = new Map<string, UnityPackageCandidate[]>();
+
+export interface UnityPackageScan {
+  packages: UnityPackageCandidate[];
+  /** 有几个内层 zip 没读成功（网络盘/9p 偶发失败；>0 时结果不进缓存，点「重新检测」会重扫） */
+  scanErrors: number;
 }
 
 /** SSE / 纯 JSON 两种响应都能解（Streamable HTTP 允许任一种）。 */
@@ -43,6 +90,10 @@ export function parseMcpBody(text: string): any {
   if (!last) return null;
   try { return JSON.parse(last); } catch { return null; }
 }
+
+/** 诊断日志出口（routes 注册时接上；单测/脚本下静默）。 */
+let optsLog: (m: string) => void = () => {};
+export function setUnityLogger(fn: (m: string) => void): void { optsLog = fn; }
 
 let distroCache: string | null = null;
 /** WSL 里跑服务、Windows 上跑 Unity 时，得把路径翻译成 Unity 能读的形式。 */
@@ -174,8 +225,13 @@ export async function unityEditorInfo(u: UnityMcp): Promise<UnityEditorInfo> {
   };
 }
 
-/** 列出条目里可以导入 Unity 的 .unitypackage（压缩包内的也算，含一层 zip 套 zip）。 */
-export async function listUnityPackageCandidates(repo: Repo, itemId: number): Promise<UnityPackageCandidate[]> {
+/** 列出条目里可以导入 Unity 的 .unitypackage（压缩包内的、zip 套 zip 的也算），并按"是不是当前工程的 avatar"排前。 */
+export async function listUnityPackageCandidates(
+  repo: Repo,
+  itemId: number,
+  opts: { avatars?: AvatarLite[]; projectAvatarId?: number | null; refresh?: boolean } = {},
+): Promise<UnityPackageScan> {
+  let scanErrors = 0;
   const out: UnityPackageCandidate[] = [];
   const seen = new Set<string>();
   const push = (c: UnityPackageCandidate) => { if (!seen.has(c.key)) { seen.add(c.key); out.push(c); } };
@@ -203,26 +259,53 @@ export async function listUnityPackageCandidates(repo: Repo, itemId: number): Pr
       });
     }
     if (pkgs.length) continue;
-    // 压缩包里没有直接的 unitypackage：下钻一层 zip（和抽缩略图时的规则一致），最多 2 个
-    const zips = entries.filter((e) => !e.isDir && /\.zip$/i.test(String(e.path)) && Number(e.size) > 4096 && Number(e.size) < 256 * 1024 * 1024)
+    // 压缩包里没有直接的 unitypackage：把内层 zip 全部下钻（实测 VRChat 素材常见"一个包里 N 个 per-avatar zip"）。
+    const zips = entries
+      .filter((e) => !e.isDir && /\.zip$/i.test(String(e.path)) && Number(e.size) > 4096 && Number(e.size) < NESTED_ZIP_MAX_BYTES)
       .sort((a, b) => Number(b.size) - Number(a.size)).slice(0, MAX_NESTED_ZIPS);
-    for (const z of zips) {
-      const tmp = join(tmpdir(), "av-unity-" + process.pid + "-" + Date.now() + "-" + basename(String(z.path)).replace(/[^\w.\-]+/g, "_"));
+    if (!zips.length) continue;
+
+    const cacheKey = asset.id + ":" + asset.size + ":" + String(asset.mtime ?? "");
+    let nested = opts.refresh ? undefined : nestedCache.get(cacheKey);
+    if (!nested) {
+      nested = [];
+      let failed = 0;
+      const tmpDir = mkdtempSync(join(tmpdir(), "av-unity-nested-"));
       try {
-        writeFileSync(tmp, await readArchiveEntry(asset.path, String(z.path), MAX_PACKAGE_BYTES));
-        const inner = await listArchive(tmp, { maxEntries: 5000 });
-        for (const e of inner.entries.filter((x) => !x.isDir && /\.unitypackage$/i.test(x.path) && x.size > 1024).sort((a, b) => b.size - a.size).slice(0, 5)) {
-          push({
-            key: asset.id + "|" + z.path + "|" + e.path, label: e.path.split("/").pop() ?? e.path, assetId: asset.id,
-            container: "zip", sourcePath: asset.path, entryPath: String(z.path), innerEntryPath: e.path, size: e.size,
-            note: "压缩包内 " + basename(String(z.path)),
-          });
+        for (let i = 0; i < zips.length; i++) {
+          const z = zips[i]!;
+          const tmp = join(tmpDir, i + "-" + (baseName(String(z.path)).replace(/[^\w.\-]+/g, "_") || "inner.zip"));
+          try {
+            writeFileSync(tmp, await readArchiveEntry(asset.path, String(z.path), MAX_PACKAGE_BYTES));
+            const inner = await listArchive(tmp, { maxEntries: 5000 });
+            for (const e of inner.entries.filter((x) => !x.isDir && /\.unitypackage$/i.test(x.path) && x.size > 1024).sort((a, b) => b.size - a.size).slice(0, 8)) {
+              // 注意：这里必须进 nested（缓存的是它），进 out 会让缓存永远是空数组
+              nested.push({
+                key: asset.id + "|" + z.path + "|" + e.path, label: e.path.split("/").pop() ?? e.path, assetId: asset.id,
+                container: "zip", sourcePath: asset.path, entryPath: String(z.path), innerEntryPath: e.path, size: e.size,
+                note: baseName(String(z.path)),
+              });
+            }
+          } catch { failed++; optsLog("内层 zip 读取失败（不影响其他的）：" + z.path); }
         }
-      } catch { /* 单个内层 zip 失败不影响 */ }
-      finally { try { unlinkSync(tmp); } catch { /* ignore */ } }
+      } finally { try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } }
+      // 有读失败的就不写缓存：网络盘/9p 偶发失败不能把"空结果"钉死在内存里（否则要重启才恢复）。
+      if (failed === 0) {
+        nestedCache.set(cacheKey, nested);
+        if (nestedCache.size > NESTED_CACHE_MAX) { const oldest = nestedCache.keys().next().value; if (oldest) nestedCache.delete(oldest); }
+      } else { scanErrors += failed; }
     }
+    for (const c of nested) push({ ...c });
   }
-  return out.sort((a, b) => b.size - a.size);
+  // 认 avatar：包名 + 内层 zip 名 + 包内路径都要看（很多素材把 avatar 名放在目录上）
+  const avatars = opts.avatars ?? [];
+  for (const c of out) {
+    c.avatar = avatars.length ? matchAvatarByText(avatars, [c.label, c.note ?? "", c.entryPath ?? "", c.innerEntryPath ?? ""].join(" ")) : null;
+    c.matched = !!(opts.projectAvatarId && c.avatar && c.avatar.id === opts.projectAvatarId);
+  }
+  // 匹配当前工程的排前面，其余按大小
+  out.sort((a, b) => (Number(!!b.matched) - Number(!!a.matched)) || (b.size - a.size));
+  return { packages: out, scanErrors };
 }
 
 /** 把候选包"落地"成 Unity 能读到的磁盘路径（包本体直接用；压缩包内的解到 staging 目录）。 */
