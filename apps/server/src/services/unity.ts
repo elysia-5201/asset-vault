@@ -11,6 +11,7 @@ import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
+import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
 import { normKey } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 
@@ -223,6 +224,34 @@ export async function unityEditorInfo(u: UnityMcp): Promise<UnityEditorInfo> {
     projectName: baseName(projectPath), unityVersion,
     isPlaying: playing === "1", isCompiling: compiling === "1", scenePath,
   };
+}
+
+/** 归档资产里所有 .unitypackage 的 assetPath（按内容匹配 avatar 用）；带内存缓存。 */
+const pkgPathsCache = new Map<string, string[]>();
+export async function unityPackagePathsOf(repo: Repo, asset: { id: number; item_id: number; container: string; size: number; mtime?: string | null }): Promise<string[]> {
+  if (asset.container === "unitypackage") return (repo.getUnityPackageAssets(asset.id) as any[]).map((a) => String(a.assetPath));
+  if (asset.container !== "zip" && asset.container !== "7z" && asset.container !== "rar") return [];
+  const key = asset.id + ":" + asset.size + ":" + String(asset.mtime ?? "");
+  const hit = pkgPathsCache.get(key);
+  if (hit) return hit;
+  const out: string[] = [];
+  const dir = mkdtempSync(join(tmpdir(), "av-match-"));
+  try {
+    const cands = (await listUnityPackageCandidates(repo, asset.item_id)).packages.filter((c) => c.assetId === asset.id).slice(0, 6);
+    for (const c of cands) {
+      try {
+        const staged = await stageUnityPackage(c, dir);
+        const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
+        for (const x of listing.assets) out.push(String(x.assetPath));
+      } catch { /* 单个内层包失败不影响 */ }
+    }
+  } finally { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } }
+  // 空结果不缓存：偶发读失败不该让这个资产永远认不出内容
+  if (out.length) {
+    pkgPathsCache.set(key, out);
+    if (pkgPathsCache.size > 64) { const oldest = pkgPathsCache.keys().next().value; if (oldest) pkgPathsCache.delete(oldest); }
+  }
+  return out;
 }
 
 /** 列出条目里可以导入 Unity 的 .unitypackage（压缩包内的、zip 套 zip 的也算），并按"是不是当前工程的 avatar"排前。 */

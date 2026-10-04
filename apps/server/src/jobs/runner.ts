@@ -157,7 +157,7 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
     // ---- matching ----
     for (const itemId of scratch.itemIds) {
       try {
-        const o = matchItem(repo, itemId, scratchByItem.get(itemId) ?? {});
+        const o = await matchItem(repo, itemId, scratchByItem.get(itemId) ?? {});
         if (o.addedItem + o.addedAsset > 0) deps.log(`avatars: item ${itemId} +${o.addedItem} item / +${o.addedAsset} asset (declared=${o.declared})`);
       } catch (e) { scratch.errors.push(`match item ${itemId}: ${asError(e).message}`); }
     }

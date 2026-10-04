@@ -280,7 +280,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const url = String(b?.url ?? "");
       if (!url) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "url 必填" } });
       const out = await importBoothUrl(repo, media, booth, url, { targetItemId: id, onConflict: b.merge ? "merge" : "error" });
-      const matched = matchItem(repo, out.itemId, {});
+      const matched = await matchItem(repo, out.itemId, {});
       deps.log("link-booth: item " + id + " -> booth " + out.meta.itemId + " images=" + out.images + " avatars+" + matched.addedItem);
       return { ...out, matched };
     } catch (e) {
@@ -295,7 +295,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/items/:id/match-avatars", async (req, reply) => {
     try {
       const itemId = toInt((req.params as any).id, 0);
-      const outcome = matchItem(repo, itemId, {});
+      const outcome = await matchItem(repo, itemId, {});
       return outcome;
     } catch (e) { return fail(reply, e); }
   });
@@ -418,7 +418,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const a = repo.getAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const r = await indexAsset(repo, media, id, { hashMaxBytes: 8 * 1024 * 1024 * 1024 });
-      matchItem(repo, a.item_id, {});
+      await matchItem(repo, a.item_id, {});
       return r;
     } catch (e) { return fail(reply, e); }
   });
@@ -765,7 +765,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const sourceId = toInt(b.sourceId, 0), targetId = toInt(b.targetId, 0);
       if (!sourceId || !targetId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "sourceId/targetId 必填" } });
       const r = repo.mergeItems(sourceId, targetId);
-      matchItem(repo, targetId, {});
+      await matchItem(repo, targetId, {});
       deps.log("merge: item " + sourceId + " -> " + targetId + " assets=" + r.movedAssets + " images=" + r.movedImages);
       return { ...r, target: repo.getItem(targetId) };
     } catch (e) { return fail(reply, e); }
@@ -865,7 +865,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const rows = repo.listItems({ limit: 100000, includeTrashed: false }) as any;
       let done = 0, errors = 0;
       for (const card of rows.items.slice(0, limit)) {
-        try { matchItem(repo, card.id, {}); done++; }
+        try { await matchItem(repo, card.id, {}); done++; }
         catch { errors++; }
       }
       return { requeued: done, errors, total: rows.items.length };

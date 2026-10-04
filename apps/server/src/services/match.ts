@@ -1,6 +1,7 @@
 import { normKey, type AvatarDetectionResult, type KnownAvatar } from "../../../../packages/core/src/contracts";
 import { detectAvatars, avatarNamesFromPaths } from "../../../../packages/core/src/avatars/detect";
 import { parseDeclaredCount } from "../../../../packages/core/src/avatars/normalize";
+import { unityPackagePathsOf } from "./unity";
 import type { Repo } from "../db/repo";
 
 export interface MatchOutcome {
@@ -10,24 +11,29 @@ export interface MatchOutcome {
   removedItem: number;
 }
 
-function pathsOfAsset(repo: Repo, assetId: number, container: string): string[] {
-  if (container === "unitypackage") return repo.getUnityPackageAssets(assetId).map((a: any) => String(a.assetPath));
+/** 压缩包的外层条目（不解包就能拿到）。 */
+function archivePathsOfAsset(repo: Repo, assetId: number): string[] {
   return repo.getArchiveEntries(assetId).map((e: any) => String(e.path));
 }
 
 /** 依据 6 类证据为条目/资产标注适配 avatar；manual/confirmed 的关联绝不被自动结果覆盖。 */
-export function matchItem(repo: Repo, itemId: number, extra: { fileNames?: string[] } = {}): MatchOutcome {
+export async function matchItem(repo: Repo, itemId: number, extra: { fileNames?: string[] } = {}): Promise<MatchOutcome> {
   const detail = repo.getItem(itemId);
   if (!detail) throw Object.assign(new Error(`item ${itemId} not found`), { code: "NOT_FOUND", status: 404 });
   const item = detail.item;
   const known: KnownAvatar[] = repo.listAvatars().map((a) => ({ name: a.name, aliases: a.aliases, kind: a.kind }));
 
-  const assetPaths: { assetId: number; container: string; paths: string[] }[] = detail.assets.map((a) => ({
-    assetId: a.id, container: a.container, paths: pathsOfAsset(repo, a.id, a.container),
-  }));
-  const allPaths = assetPaths.flatMap((a) => a.paths);
-  const upkgPaths = assetPaths.filter((a) => a.container === "unitypackage").flatMap((a) => a.paths);
-  const archivePaths = assetPaths.filter((a) => a.container !== "unitypackage").flatMap((a) => a.paths);
+  // 关键：压缩包里的 .unitypackage 也要解出 assetPath —— 素材的 per-avatar 目录/预制体都在里面，
+  // 只看外层 zip 的 18 个条目，等于把"包里明明有 16 个模型的 prefab"当成"商品页标签"。
+  const assetPaths = await Promise.all(detail.assets.map(async (a) => ({
+    assetId: a.id,
+    container: a.container,
+    paths: a.container === "unitypackage" ? [] : archivePathsOfAsset(repo, a.id),
+    upkgPaths: await unityPackagePathsOf(repo, a).catch(() => [] as string[]),
+  })));
+  const allPaths = assetPaths.flatMap((a) => [...a.paths, ...a.upkgPaths]);
+  const upkgPaths = assetPaths.flatMap((a) => a.upkgPaths);
+  const archivePaths = assetPaths.flatMap((a) => a.paths);
 
   const input = {
     title: item.title, description: item.description, tags: detail.tags,
@@ -71,8 +77,9 @@ export function matchItem(repo: Repo, itemId: number, extra: { fileNames?: strin
 
   let addedAsset = 0;
   for (const a of assetPaths) {
-    if (a.paths.length === 0) continue;
-    for (const { name, prefix } of avatarNamesFromPaths(a.paths, known)) {
+    const paths = [...a.paths, ...a.upkgPaths];
+    if (paths.length === 0) continue;
+    for (const { name, prefix } of avatarNamesFromPaths(paths, known)) {
       const avatarId = resolveAvatar(name);
       const av = repo.getAvatar(avatarId);
       const conf = av && av.kind !== "unknown" ? 0.9 : 0.7;
