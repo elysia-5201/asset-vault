@@ -2,12 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
-  deleteCollection, getCollection, getItem, getItemDuplicates, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
+  deleteCollection, getCollection, getItem, getItemDuplicates, getRelatedItems, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
   unityImport, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
-import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb } from "../types";
+import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, RelatedMatch } from "../types";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
@@ -100,6 +100,41 @@ export function ItemDetail(props: {
   const [dups, setDups] = useState<DuplicateMatch[]>([]);
   const [dupBusy, setDupBusy] = useState(false);
   const [dupOpen, setDupOpen] = useState<Set<number>>(new Set());
+  /**
+   * 详情页「疑似同商品」（模型包 / 材质包 / DLC 分开打包）。端点不存在（mock/旧版）或请求失败时静默；
+   * 没有匹配时整个提示不渲染。
+   */
+  const [related, setRelated] = useState<RelatedMatch[]>([]);
+
+  const loadRelated = useCallback(() => {
+    setRelated([]);
+    getRelatedItems(itemId)
+      .then((r) => setRelated(r.matches))
+      .catch(() => setRelated([]));
+  }, [itemId]);
+  useEffect(() => { loadRelated(); }, [itemId, loadRelated]);
+
+  /** 把某条「疑似同商品」与本条归入同一套装（保留各自条目）；套装名优先用输入框，其次共有产品名。 */
+  const doRelateCollect = (m: RelatedMatch) => {
+    const name = collName.trim() || m.shared[0] || m.title || detail?.title || "同商品";
+    guard(createCollection(name, [m.itemId, itemId]), "已把 #" + m.itemId + " 与本条归入套装「" + name + "」");
+  };
+
+  /** 把某条「疑似同商品」并进本条（对方进回收站，可恢复）——与「合并到本条」同风格。 */
+  const doRelateMerge = (m: RelatedMatch) => {
+    if (busy) return;
+    if (!window.confirm("把 #" + m.itemId + "「" + m.title + "」并入本条？\n它的压缩包/图片/标签/模型会归到本条，#" + m.itemId + " 进回收站（可恢复）。")) return;
+    setBusy(true);
+    mergeItems(m.itemId, itemId)
+      .then(() => {
+        props.onToast("ok", "已把 #" + m.itemId + " 并入本条");
+        setRelated((prev) => prev.filter((x) => x.itemId !== m.itemId));
+        load();
+        props.onChanged();
+      })
+      .catch((e) => props.onToast("bad", describeError(e)))
+      .finally(() => setBusy(false));
+  };
 
   const load = useCallback(() => {
     setLoading(true); setErr("");
@@ -396,6 +431,19 @@ export function ItemDetail(props: {
                   </span>
                 ))}
               </div>
+              {/* 疑似同商品：模型包 / 材质包 / DLC 分开打包时把它们认出来（没有匹配就整段不渲染）。
+                  同商品 ≠ 重复内容：这里只提示，归组（加入套装）或并入由用户点按钮决定。 */}
+              {related.length > 0 && (
+                <div style={{ marginTop: "4px" }}>
+                  {related.map((m) => (
+                    <div key={m.itemId} className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "2px" }}>
+                      <span className="hint">疑似同商品（模型包 / 材质包）：《#{m.itemId} {m.title}》 共有「{m.shared[0] ?? m.reason}」</span>
+                      <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 与本条归入同一个套装（保留各自条目）"} onClick={() => doRelateCollect(m)}>加入套装</button>
+                      <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 并进本条（对方进回收站，可恢复）"} onClick={() => doRelateMerge(m)}>并入本条</button>
+                    </div>
+                  ))}
+                </div>
+              )}
               {/* 套装只是归组：成员仍是各自独立的条目。这里直接把同套装的其它条目并进来（可恢复）。 */}
               {(detail.collections ?? []).map((c) => {
                 const others = (collMembers[c.id] ?? []).filter((m) => m.id !== itemId && m.status !== "trashed");

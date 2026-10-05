@@ -5,9 +5,11 @@ import { listArchive } from "../../../../packages/core/src/archive/list";
 import { listUnityPackage, readUnityPackageAsset } from "../../../../packages/core/src/unitypackage";
 import { basename, extname } from "node:path";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
+import { normKey } from "../../../../packages/core/src/contracts";
 import { BoothClient, parseBoothUrl } from "../../../../packages/core/src/source/booth";
 import { walkCandidates, registerAssets } from "../services/scan";
 import { matchItem } from "../services/match";
+import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import type { Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
@@ -21,6 +23,7 @@ import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../servi
 import { importBoothUrl } from "../services/booth";
 import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, baseName, sleep } from "../services/unity";
 import { findDuplicatesForItem, listDuplicateGroups, recomputeSignatures } from "../services/dedupe";
+import { relateItems } from "../../../../packages/core/src/related";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -769,6 +772,94 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await matchItem(repo, targetId, {});
       deps.log("merge: item " + sourceId + " -> " + targetId + " assets=" + r.movedAssets + " images=" + r.movedImages);
       return { ...r, target: repo.getItem(targetId) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  // ---------- 疑似同商品（模型包 / 材质包 / DLC 分别打包）----------
+  /**
+   * 归档里的一级条目名（目录名/文件名）：zip/7z/rar 取最外层条目（path 不含分隔符）、
+   * unitypackage 取 asset_path 的一级段。只读缓存表，不重扫包。
+   */
+  const relatedEntryNames = (itemId: number): string[] => {
+    const out = new Set<string>();
+    for (const a of repo.listAssets(itemId)) {
+      if (a.container === "unitypackage") {
+        for (const u of repo.getUnityPackageAssets(a.id) as any[]) {
+          const seg = String(u?.assetPath ?? "").split(/[\\/]/).filter(Boolean)[0];
+          if (seg) out.add(seg);
+        }
+      } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
+        for (const en of repo.getArchiveEntries(a.id) as any[]) {
+          const p = String(en?.path ?? "");
+          if (!p || p.includes("/") || p.includes("\\")) continue;   // 只看最外层
+          out.add(p);
+        }
+      }
+    }
+    return [...out];
+  };
+
+  /**
+   * 某条目的「疑似同商品」：比标题/标签/包内一级条目名，不比字节（那是去重的活）。
+   * 候选 = 所有非 trashed 条目（分页取全，listItems 单页上限 500），排除自己；
+   * 同商品但已在同一 collection 里的也照常返回（UI 自己决定显示什么）。
+   */
+  app.get("/api/items/:id/related", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const self = repo.getItem(id);
+      if (!self) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      const q = req.query as any;
+      const rawMin = Number(q.min);
+      const min = Number.isFinite(rawMin) ? Math.min(1, Math.max(0, rawMin)) : 0.6;
+      const limit = Math.min(100, Math.max(1, toInt(q.limit, 10)));
+      // 先把候选取全：既要算"标签文档频率"，也要在排序后再截断
+      const cards: any[] = [];
+      for (let offset = 0; ; offset += 500) {
+        const page = repo.listItems({ limit: 500, offset, includeTrashed: false });
+        for (const card of page.items) if (card.id !== id) cards.push(card);
+        if (page.items.length === 0 || offset + 500 >= page.total) break;
+      }
+      // 通用标签不构成"同商品"证据：VRChat / マヌカ / セレスティア 这类被三成以上条目打过的标签直接不喂给匹配器
+      // （否则 #6 那种 33 标签的条目，反向查同商品时前 10 条全是标签误报，真正同商品的材质包被挤出 limit）。
+      const df = new Map<string, number>();
+      for (const c of cards) for (const t of new Set<string>((c.tags ?? []).map((x: any) => String(x)))) df.set(t, (df.get(t) ?? 0) + 1);
+      const commonCut = Math.max(3, Math.ceil(cards.length * 0.3));
+      const rareTags = (tags: unknown): string[] => (Array.isArray(tags) ? tags.map((t) => String(t)) : []).filter((t) => (df.get(t) ?? 0) < commonCut);
+
+      // 哪些 key 根本不能当"商品名"证据：
+      //  ① 头像名/别名（MANUKA / SELESTIA / MILFY…）——那是"适配谁"，不是"哪个商品"；
+      //     实测不排掉的话，#6（包内全是 *_V2.zip）会和一堆含 Manuka 内容的条目 100% 判成同商品。
+      //  ② 全库高频 key（≥30% 条目都出现的词）——VRChat / テクスチャ 这类通用词。
+      const avatarKeys = new Set<string>();
+      for (const a of repo.listAvatars() as any[]) {
+        avatarKeys.add(normKey(String(a.name ?? "")));
+        for (const al of a.aliases ?? []) avatarKeys.add(normKey(String(al)));
+      }
+      const entriesById = new Map<number, string[]>();
+      for (const card of cards) entriesById.set(card.id, relatedEntryNames(card.id));
+      const selfEntries = relatedEntryNames(id);
+
+      const keyDf = new Map<string, number>();
+      const bump = (texts: string[]): void => {
+        for (const k of new Set(texts.flatMap((t) => productKeysOf(t)).map((k) => normKey(k)))) keyDf.set(k, (keyDf.get(k) ?? 0) + 1);
+      };
+      for (const card of cards) bump([...rareTags(card.tags), ...(entriesById.get(card.id) ?? [])]);
+      bump([...rareTags(self.tags), ...selfEntries]);
+      const keyCut = Math.max(3, Math.ceil((cards.length + 1) * 0.3));
+      const ignoreKeys = new Set<string>(avatarKeys);
+      for (const [k, n] of keyDf) if (n >= keyCut) ignoreKeys.add(k);
+
+      const selfInput = { itemId: id, title: self.title, tags: rareTags(self.tags), entryNames: selfEntries };
+
+      const matches: { itemId: number; title: string; score: number; level: string; shared: string[]; reason: string; assetCount: number; imageCount: number }[] = [];
+      for (const card of cards) {
+        const m = relateItems(selfInput, { itemId: card.id, title: card.title, tags: rareTags(card.tags), entryNames: entriesById.get(card.id) ?? [] }, min, { ignoreKeys });
+        if (!m) continue;
+        matches.push({ itemId: card.id, title: card.title, score: m.score, level: m.level, shared: m.shared, reason: m.reason, assetCount: card.assetCount, imageCount: card.imageCount });
+      }
+      matches.sort((a, b) => b.score - a.score || a.itemId - b.itemId);
+      return { itemId: id, min, matches: matches.slice(0, limit) };
     } catch (e) { return fail(reply, e); }
   });
 

@@ -13,8 +13,8 @@ import type {
   AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BoothPeekResponse,
   DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
   DuplicateLevel, DuplicateMatch, HealthResponse,
-  ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, JobIdResponse, JobsResponse, JobActionResponse,
-  RecomputeResponse,
+  ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, JobIdResponse, JobsResponse, JobActionResponse,
+  RecomputeResponse, RelatedLevel, RelatedMatch,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse, ViewMode,
 } from "./types";
 
@@ -538,6 +538,34 @@ export async function getDuplicateGroups(min?: number, limit = 100): Promise<Dup
     };
   });
   return { min: numOr(r.min, min ?? 0.9), groups };
+}
+
+function relLevel(x: unknown): RelatedLevel { return x === "same-product" ? "same-product" : "likely"; }
+function relatedMatch(x: unknown): RelatedMatch {
+  const r = rec(x);
+  return {
+    itemId: numOr(r.itemId, 0),
+    title: dupStr(r.title),
+    score: numOr(r.score, 0),
+    level: relLevel(r.level),
+    shared: arr<unknown>(r.shared).map((s) => String(s)).filter(Boolean),
+    reason: dupStr(r.reason),
+    assetCount: numOr(r.assetCount, 0),
+    imageCount: numOr(r.imageCount, 0),
+  };
+}
+
+/**
+ * 疑似同商品（模型包 / 材质包 / DLC 分开打包）：后端端点不存在（mock/旧版）或请求失败时由调用方静默。
+ */
+export async function getRelatedItems(itemId: number, min?: number): Promise<ItemRelatedResponse> {
+  const raw = await request<unknown>("GET", "/items/" + itemId + "/related" + queryString({ min }));
+  const r = rec(raw);
+  return {
+    itemId: numOr(r.itemId, itemId),
+    min: numOr(r.min, min ?? 0.6),
+    matches: pickArray<unknown>(raw, "matches").map(relatedMatch),
+  };
 }
 
 /** 重算全部资产的重复签名（可能很慢，给 120s 超时）。 */

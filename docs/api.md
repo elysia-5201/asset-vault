@@ -24,6 +24,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | DELETE | `/items/:id/avatars/:avatarId` | |
 | POST | `/items/:id/check-update` | 起 check_update 作业 → `{jobId}` |
 | GET | `/items/:id/duplicates?min=0.9&limit=20&rescan=1` | 该条目的重复资产 → `{itemId, min, matches: DuplicateMatch[]}`（见「去重」） |
+| GET | `/items/:id/related?min=0.6&limit=10` | 疑似同商品（模型包/材质包/DLC 分开打包）→ `{itemId, min, matches: [{itemId, title, score, level, shared, reason, assetCount, imageCount}]}`（见「疑似同商品」） |
 
 ## 资产 / 内容
 | 方法 | 路径 | 说明 |
@@ -48,6 +49,23 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 `similarity===1` 且 diff 全空 → `same-content`（内容一致、文件名或压缩方式不同），其余达到阈值 → `near`。
 `diff` 的 added/removed/changed 每类最多 50 条，总数写在 `reason`（「新增 x / 删除 y / 修改 z」）。
 条目端点返回的 `DuplicateMatch` 额外带 `otherTitle`/`otherPath`/`otherVersionKey`，便于 UI 直接显示。
+
+## 疑似同商品（模型包 / 材质包 / DLC 分开打包）
+把"同一商品被拆成多个包装"认出来（模型包 + 材质包 + 本体）。只比**标题 / 标签 / 包内一级条目名**里的产品名片段，
+不比字节、不算哈希、不改任何数据；与「去重」的"同内容"是两件事。候选 = 所有非 `trashed` 条目（排除自己），
+同商品但已在同一 collection 里的也照常返回（UI 自己决定显示什么）。
+`entryNames` 取 zip/7z/rar 的**最外层**条目名（`entry_path` 不含 `/`）与 `.unitypackage` 的 `asset_path` 一级段。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/items/:id/related?min=0.6&limit=10` | → `{itemId, min, matches: [{itemId, title, score, level, shared, reason, assetCount, imageCount}]}`，按 score 降序、组外按 item id 升序，limit 默认 10 |
+
+**口径（冻结）**：NFKC + 小写；emoji/符号/标点/空白一律当分隔符（保留中日文与字母数字，中日文↔ASCII 交界再切一刀）；
+独立片段命中噪音词表（material/材质/マテリアル/texture/モデル/本体/readme/dlc/set…）或形如 `v2`/`1.2` 的版本片段 → 丢弃
+（`25Avatars`/`007`/`伊吹` 这类保留）。两边候选 key **完全相等** → `score=1.0`、`level="same-product"`；
+否则最长公共子串 L ≥ `max(3, ceil(0.6 × min(len_a, len_b)))` → `score=0.75`、`level="likely"`；都不过或低于 `min` → 不返回。
+`shared` 为命中的共有片段（保留原文大小写、去重、按长度降序、最多 5 个），`reason` 是含最长命中片段的中文一句话
+（命中来自包内文件时为「标题/包内文件共有「X」」）。
 
 ## 头像
 | 方法 | 路径 | 说明 |

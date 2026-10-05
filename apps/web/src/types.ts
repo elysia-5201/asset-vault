@@ -234,3 +234,27 @@ export interface RecomputeResponse {
   scanned: number;
   updated: number;
 }
+
+// ---------------- 疑似同商品（/api/items/:id/related） ----------------
+/** same-product = 认成同一商品（产品名片段完全一致）；likely = 疑似（片段高度重合）。 */
+export type RelatedLevel = "same-product" | "likely";
+
+/** GET /items/:id/related 的一条匹配。 */
+export interface RelatedMatch {
+  itemId: number;
+  title: string;
+  /** 0..1，四位小数（1.0 same-product / 0.75 likely） */
+  score: number;
+  level: RelatedLevel;
+  /** 命中的共有产品名片段（去重、按长度降序，最多 5 个） */
+  shared: string[];
+  /** 中文一句话，如「标题/包内文件共有「真実の穴」」 */
+  reason: string;
+  assetCount: number;
+  imageCount: number;
+}
+export interface ItemRelatedResponse {
+  itemId: number;
+  min: number;
+  matches: RelatedMatch[];
+}
