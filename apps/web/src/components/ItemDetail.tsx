@@ -2,19 +2,41 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
-  deleteCollection, getCollection, getItem, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
+  deleteCollection, getCollection, getItem, getItemDuplicates, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
   unityImport, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
-import type { AvatarCard, ItemDetailWeb } from "../types";
-import { formatBytes, formatDate, formatYen } from "../util";
+import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb } from "../types";
+import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
 export interface ProjectLite { id: number; name: string; path: string }
 
 const orderKey = (id: number) => "av.imgorder." + id;
+
+/** 「疑似重复」的 level 徽章文案 / 色调（契约：exact | same-content | near）。 */
+const DUP_LEVEL_LABEL: Record<DuplicateLevel, string> = { exact: "完全相同", "same-content": "内容一致", near: "高度相似" };
+const DUP_LEVEL_TONE: Record<DuplicateLevel, "bad" | "warn" | "muted"> = { exact: "bad", "same-content": "warn", near: "muted" };
+
+/** 差异三组里的一组：最多铺 10 条，其余折成 "+N 更多"（避免大包差异把面板淹掉）。 */
+function DiffGroup(props: { label: string; items: DuplicateFileDiff[] }) {
+  if (!props.items.length) return null;
+  const shown = props.items.slice(0, 10);
+  return (
+    <div>
+      <div className="k">{props.label} {props.items.length}</div>
+      {shown.map((x, i) => (
+        <div className="dup-file" key={props.label + i + x.path} title={x.path}>
+          <span className="p">{shortenPath(x.path, 64)}</span>
+          <span className="sz">{formatBytes(x.size)}</span>
+        </div>
+      ))}
+      {props.items.length > shown.length && <div className="hint">+{props.items.length - shown.length} 更多</div>}
+    </div>
+  );
+}
 
 export function ItemDetail(props: {
   itemId: number;
@@ -25,6 +47,8 @@ export function ItemDetail(props: {
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
   importedIds: number[];
   onMarkImported: (itemId: number, projectId: number) => void;
+  /** 打开另一个条目的详情（「疑似重复」里点「打开 #id」用）。 */
+  onOpenItem: (itemId: number) => void;
 }) {
   const { itemId } = props;
   const [detail, setDetail] = useState<ItemDetailWeb | null>(null);
@@ -69,6 +93,13 @@ export function ItemDetail(props: {
   const [unityErrors, setUnityErrors] = useState<string[]>([]);
   /** 套装 id → 成员条目（用来一键"并到本条"） */
   const [collMembers, setCollMembers] = useState<Record<number, CollectionMember[]>>({});
+  /**
+   * 详情页「疑似重复」。后端端点还没上线 / 请求失败时一律静默（不打断主流程）；
+   * 没有重复时整块不渲染，避免给正常素材加噪音。
+   */
+  const [dups, setDups] = useState<DuplicateMatch[]>([]);
+  const [dupBusy, setDupBusy] = useState(false);
+  const [dupOpen, setDupOpen] = useState<Set<number>>(new Set());
 
   const load = useCallback(() => {
     setLoading(true); setErr("");
@@ -79,6 +110,38 @@ export function ItemDetail(props: {
   }, [itemId]);
 
   useEffect(() => { setOrder(null); setLocalTags(null); setLocalTagNote(false); load(); }, [itemId, load]);
+
+  /** 拉一次本条的疑似重复；失败静默（空列表）。 */
+  const loadDups = useCallback(() => {
+    setDupBusy(true);
+    getItemDuplicates(itemId)
+      .then((r) => setDups(r.matches))
+      .catch(() => setDups([]))
+      .finally(() => setDupBusy(false));
+  }, [itemId]);
+  useEffect(() => { setDups([]); setDupOpen(new Set()); loadDups(); }, [itemId, loadDups]);
+
+  const toggleDup = (assetId: number) => setDupOpen((prev) => {
+    const n = new Set(prev);
+    if (n.has(assetId)) n.delete(assetId); else n.add(assetId);
+    return n;
+  });
+
+  /** 把某个疑似重复的条目并进本条（对方进回收站，可恢复）。 */
+  const doMergeDuplicate = (m: DuplicateMatch) => {
+    if (busy) return;
+    if (!window.confirm("把 #" + m.otherItemId + "「" + m.otherTitle + "」合并到本条？\n它的压缩包/图片/标签/模型会归到本条，#" + m.otherItemId + " 进回收站（可恢复）。")) return;
+    setBusy(true);
+    mergeItems(m.otherItemId, itemId)
+      .then(() => {
+        props.onToast("ok", "已把 #" + m.otherItemId + " 并入本条");
+        load();
+        loadDups();
+        props.onChanged();
+      })
+      .catch((e) => props.onToast("bad", describeError(e)))
+      .finally(() => setBusy(false));
+  };
   useEffect(() => {
     try {
       const raw = localStorage.getItem(orderKey(itemId));
@@ -585,6 +648,42 @@ export function ItemDetail(props: {
                 >添加</button>
               </div>
             </Section>
+
+            {/* 疑似重复：紧邻资产区上方；没有匹配时整块不渲染（不打扰正常素材） */}
+            {dups.length > 0 && (
+              <Section
+                title={<>⚠ 疑似重复 {dups.length}</>}
+                right={<button className="btn tiny" disabled={dupBusy} onClick={loadDups}>{dupBusy ? "检测中…" : "重新检测"}</button>}
+              >
+                {dups.map((m) => {
+                  const open = dupOpen.has(m.otherAssetId);
+                  return (
+                    <div className="dup-card" key={m.otherAssetId}>
+                      <div className="row wrap" style={{ gap: "6px", alignItems: "center" }}>
+                        <span>与《{m.otherTitle}》内容重复 <b>{(m.similarity * 100).toFixed(1)}%</b></span>
+                        <Badge tone={DUP_LEVEL_TONE[m.level]}>{DUP_LEVEL_LABEL[m.level]}</Badge>
+                        <span className="spacer" />
+                        <button className="btn tiny" onClick={() => toggleDup(m.otherAssetId)}>{open ? "▾ 收起差异" : "▸ 看差异"}</button>
+                        <button className="btn tiny" disabled={busy} title={"把 #" + m.otherItemId + " 合并到本条（对方进回收站，可恢复）"} onClick={() => doMergeDuplicate(m)}>合并到本条</button>
+                        <button className="btn tiny" title={"打开 #" + m.otherItemId + " 的详情"} onClick={() => props.onOpenItem(m.otherItemId)}>打开 #{m.otherItemId}</button>
+                      </div>
+                      <div className="hint">{m.reason}{m.otherVersionKey ? " · 版本 " + m.otherVersionKey : ""}</div>
+                      <div className="hint mono dup-path" title={m.otherPath}>{shortenPath(m.otherPath)}</div>
+                      {open && (
+                        <div className="dup-diff">
+                          <DiffGroup label="新增" items={m.diff.added} />
+                          <DiffGroup label="删除" items={m.diff.removed} />
+                          <DiffGroup label="修改" items={m.diff.changed} />
+                          {!m.diff.added.length && !m.diff.removed.length && !m.diff.changed.length && (
+                            <div className="hint">没有文件级差异（签名判定为整包一致）</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </Section>
+            )}
 
             <Section title={<>资产 {detail.assets.length}</>}>
               <div className="asset-list">

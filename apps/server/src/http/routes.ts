@@ -20,6 +20,7 @@ import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
 import { importBoothUrl } from "../services/booth";
 import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, baseName, sleep } from "../services/unity";
+import { findDuplicatesForItem, listDuplicateGroups, recomputeSignatures } from "../services/dedupe";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -768,6 +769,43 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await matchItem(repo, targetId, {});
       deps.log("merge: item " + sourceId + " -> " + targetId + " assets=" + r.movedAssets + " images=" + r.movedImages);
       return { ...r, target: repo.getItem(targetId) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  // ---------- 去重（智能查重）----------
+  /** 某条目的重复资产：matches 额外带 otherTitle/otherPath/otherVersionKey，前端可直接显示。 */
+  app.get("/api/items/:id/duplicates", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const q = req.query as any;
+      const rawMin = Number(q.min);
+      const min = Number.isFinite(rawMin) ? Math.min(1, Math.max(0, rawMin)) : 0.9;
+      const limit = Math.min(200, Math.max(1, toInt(q.limit, 20)));
+      const rescan = q.rescan === "1" || q.rescan === "true";
+      const matches = await findDuplicatesForItem(repo, id, { minSimilarity: min, limit, rescan });
+      return { itemId: id, min, matches };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 全库跨条目重复组（并查集合并；只报相似度 >= min 的组）。 */
+  app.get("/api/duplicates", async (req, reply) => {
+    try {
+      const q = req.query as any;
+      const rawMin = Number(q.min);
+      const min = Number.isFinite(rawMin) ? Math.min(1, Math.max(0, rawMin)) : 0.9;
+      const limit = Math.min(1000, Math.max(1, toInt(q.limit, 100)));
+      const recompute = q.recompute === "1" || q.recompute === "true";
+      const groups = await listDuplicateGroups(repo, { minSimilarity: min, limit, recompute });
+      return { min, groups };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 重算签名（只补缺失/stale 的；有 45s 预算，保证接口秒级返回）。 */
+  app.post("/api/duplicates/recompute", async (req, reply) => {
+    try {
+      const r = await recomputeSignatures(repo, { budgetMs: 45000 });
+      deps.log("duplicates recompute: scanned=" + r.scanned + " updated=" + r.updated + " remaining=" + r.remaining + " ms=" + r.ms);
+      return { scanned: r.scanned, updated: r.updated };
     } catch (e) { return fail(reply, e); }
   });
 

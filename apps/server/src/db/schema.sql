@@ -99,6 +99,21 @@ CREATE TABLE IF NOT EXISTS unitypackage_assets (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_upkg_asset_guid ON unitypackage_assets(asset_id, guid);
 CREATE INDEX IF NOT EXISTS ix_upkg_path ON unitypackage_assets(asset_path);
 
+-- 去重签名（智能查重）：每个资产一行，结构/GUID/文件哈希三路指纹 + 版本号
+CREATE TABLE IF NOT EXISTS asset_signatures (
+  asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+  file_sha TEXT,
+  struct_hash TEXT,
+  guid_hash TEXT,
+  entry_count INTEGER NOT NULL DEFAULT 0,
+  total_size INTEGER NOT NULL DEFAULT 0,
+  version_key TEXT,
+  computed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sig_struct ON asset_signatures(struct_hash);
+CREATE INDEX IF NOT EXISTS ix_sig_guid ON asset_signatures(guid_hash);
+CREATE INDEX IF NOT EXISTS ix_sig_sha ON asset_signatures(file_sha);
+
 CREATE TABLE IF NOT EXISTS avatars (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

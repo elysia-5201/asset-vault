@@ -126,5 +126,11 @@ export async function indexAsset(repo: Repo, media: MediaStore, assetId: number,
   } catch { repo.setAssetSha(assetId, null, "error"); }
 
   repo.touchAsset(assetId);
+  // 去重签名：只读已缓存的目录清单，失败（坏包/抽内层包超时）绝不能影响索引结果。
+  // 必须放在 touchAsset 之后：computed_at < last_verified_at 会被判 stale，每次都要重算。
+  try {
+    const { computeSignature } = await import("./dedupe");
+    await computeSignature(repo, assetId);
+  } catch { /* 签名失败不影响索引 */ }
   return res;
 }

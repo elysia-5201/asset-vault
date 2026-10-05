@@ -13,6 +13,7 @@ import { ItemCardView } from "./components/ItemCardView";
 import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
+import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { Spinner, ToastHost, useDebounced, type Toast } from "./components/ui";
 
 const IMPORTED_KEY = "av.importedItems";
@@ -50,6 +51,8 @@ export default function App() {
   const [selectedItemId, setSelectedItemId] = useState<number | null>(null);
   const [importedIds, setImportedIds] = useState<number[]>([]);
   const [sideTab, setSideTab] = useState<"import" | "jobs">("import");
+  /** 库级「查重」面板开关。 */
+  const [dupPanel, setDupPanel] = useState(false);
 
   useEffect(() => {
     try { const raw = localStorage.getItem(IMPORTED_KEY); if (raw) setImportedIds(JSON.parse(raw) as number[]); } catch { /* 忽略 */ }
@@ -182,6 +185,7 @@ export default function App() {
             </div>
           </span>
           <span className="spacer" />
+          <button className="btn tiny" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => setDupPanel(true)}>查重</button>
           {mode === "mock" && (
             <button className="btn tiny" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
           )}
@@ -239,10 +243,16 @@ export default function App() {
           : <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />}
       </div>
 
+      {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}
+      {dupPanel && (
+        <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
+      )}
+
       {selectedItemId !== null && (
         <ItemDetail
           itemId={selectedItemId} avatars={avatars} projects={projects} onClose={() => setSelectedItemId(null)}
           onChanged={loadItems} onToast={toast} importedIds={importedIds} onMarkImported={markImported}
+          onOpenItem={setSelectedItemId}
         />
       )}
 

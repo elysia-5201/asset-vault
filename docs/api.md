@@ -23,6 +23,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | POST | `/items/:id/avatars` `{avatarIds: number[], match?: AvatarMatch}` | 手工标注适配模型 |
 | DELETE | `/items/:id/avatars/:avatarId` | |
 | POST | `/items/:id/check-update` | 起 check_update 作业 → `{jobId}` |
+| GET | `/items/:id/duplicates?min=0.9&limit=20&rescan=1` | 该条目的重复资产 → `{itemId, min, matches: DuplicateMatch[]}`（见「去重」） |
 
 ## 资产 / 内容
 | 方法 | 路径 | 说明 |
@@ -32,6 +33,21 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | GET | `/assets/:id/unitypackage` | `{assets: UnityPackageAsset[]}`（不启动 Unity） |
 | GET | `/assets/:id/entry?path=` | 从压缩包内直读单个文件（图片/文本预览） |
 | POST | `/assets/:id/reindex` | 重列目录/重解析 → `{jobId}` |
+
+## 去重（智能查重）
+签名只读已缓存的压缩包目录（`archive_entries`）与 `.unitypackage` GUID 清单（`unitypackage_assets`），落进 `asset_signatures`（一行/资产）；索引成功时自动计算（失败静默，不影响索引结果）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/duplicates?min=0.9&limit=100&recompute=1` | 全库**跨条目**重复组 → `{min, groups: [{key, similarity, items: [{itemId, title, assetId, path, size, versionKey}]}]}`，按 similarity 降序、组内按 item id 升序 |
+| POST | `/duplicates/recompute` | 重算缺失/stale 的签名（45s 预算，超预算的下次再补）→ `{scanned, updated}` |
+
+**相似度口径（冻结）**：两边 SHA256 都非空且相等 → `similarity=1`、`level="exact"`、diff 全空；否则
+`simEntries = (same + 0.5×changed) / (same+changed+added+removed)`（路径先小写/正斜杠/NFC 归一，同路径重复时取 size 最大），
+`.unitypackage`（含压缩包内抽出的内层包）再算 `simGuids = |交集| / |并集|`，取两路最大值。
+`similarity===1` 且 diff 全空 → `same-content`（内容一致、文件名或压缩方式不同），其余达到阈值 → `near`。
+`diff` 的 added/removed/changed 每类最多 50 条，总数写在 `reason`（「新增 x / 删除 y / 修改 z」）。
+条目端点返回的 `DuplicateMatch` 额外带 `otherTitle`/`otherPath`/`otherVersionKey`，便于 UI 直接显示。
 
 ## 头像
 | 方法 | 路径 | 说明 |

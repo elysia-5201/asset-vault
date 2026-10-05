@@ -221,3 +221,20 @@ button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-colo
 @keyframes spin { to { transform: rotate(360deg); } }
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0; }
 .pre { font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-all; background: #0d1219; border: 1px solid var(--line-soft); border-radius: 7px; padding: 7px; max-height: 260px; overflow: auto; }
+
+/* ---------- 疑似重复 / 查重 ---------- */
+.dup-panel { width: min(880px, 100%); }
+.dup-body { padding: 12px; overflow: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.dup-group { border: 1px solid var(--line-soft); background: var(--bg-card); border-radius: 10px; padding: 8px 9px; display: flex; flex-direction: column; gap: 3px; }
+.dup-group-head { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.dup-item { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 3px 6px; font-size: 12px; color: var(--fg-dim); }
+.dup-item:hover { background: var(--bg-hi); border-color: var(--line); color: var(--fg); }
+.dup-item .t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-card { border: 1px solid var(--line); border-radius: 9px; background: #101720; padding: 7px 8px; display: flex; flex-direction: column; gap: 4px; }
+.dup-card + .dup-card { margin-top: 6px; }
+.dup-path { font-size: 10.5px; word-break: break-all; }
+.dup-diff { display: flex; flex-direction: column; gap: 5px; border-left: 2px solid var(--line); padding-left: 8px; margin-top: 3px; }
+.dup-diff .k { color: var(--fg-dim); font-size: 11px; }
+.dup-file { display: flex; align-items: baseline; gap: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim); }
+.dup-file .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-file .sz { flex: 0 0 auto; color: var(--fg-mute); }

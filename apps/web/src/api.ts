@@ -10,8 +10,11 @@ import type {
 } from "@core/contracts";
 import { mockHandle, mockMediaUrl, mockEntry, MockHttpError } from "./mock";
 import type {
-  AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BoothPeekResponse, HealthResponse,
-  ItemCardWeb, ItemDetailWeb, ItemQuery, ItemsResponse, JobIdResponse, JobsResponse, JobActionResponse,
+  AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BoothPeekResponse,
+  DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
+  DuplicateLevel, DuplicateMatch, HealthResponse,
+  ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, JobIdResponse, JobsResponse, JobActionResponse,
+  RecomputeResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse, ViewMode,
 } from "./types";
 
@@ -458,5 +461,90 @@ export async function listTags(): Promise<TagsResponse> {
   return { tags: pickArray<TagRow>(await request<unknown>("GET", "/tags"), "tags") };
 }
 export function getStats(): Promise<StatsResponse> { return request("GET", "/stats"); }
+
+// ---------------- 疑似重复 ----------------
+/**
+ * 后端契约（已冻结）：
+ *   GET  /items/:id/duplicates?min&limit → { itemId, min, matches }
+ *   GET  /duplicates?min&limit           → { min, groups }
+ *   POST /duplicates/recompute           → { scanned, updated }
+ * 后端可能还没上线（mock 模式下这些路由一律 404），故全部字段做归一化 + 调用方负责静默兜底。
+ */
+const DUP_LEVELS: DuplicateLevel[] = ["exact", "same-content", "near"];
+
+function dupLevel(x: unknown): DuplicateLevel {
+  return typeof x === "string" && (DUP_LEVELS as string[]).includes(x) ? (x as DuplicateLevel) : "near";
+}
+function dupStr(x: unknown): string { return typeof x === "string" ? x : ""; }
+function dupStrOrNull(x: unknown): string | null { return typeof x === "string" && x ? x : null; }
+
+function dupFiles(x: unknown): DuplicateFileDiff[] {
+  return arr<unknown>(x).map((e) => {
+    const er = rec(e);
+    return { path: dupStr(er.path), size: numOr(er.size, 0) };
+  });
+}
+function dupDiff(x: unknown): DuplicateDiff {
+  const r = rec(x);
+  return { added: dupFiles(r.added), removed: dupFiles(r.removed), changed: dupFiles(r.changed) };
+}
+function dupMatch(x: unknown): DuplicateMatch {
+  const r = rec(x);
+  return {
+    otherAssetId: numOr(r.otherAssetId, 0),
+    otherItemId: numOr(r.otherItemId, 0),
+    otherTitle: dupStr(r.otherTitle),
+    otherPath: dupStr(r.otherPath),
+    otherVersionKey: dupStrOrNull(r.otherVersionKey),
+    similarity: numOr(r.similarity, 0),
+    level: dupLevel(r.level),
+    reason: dupStr(r.reason),
+    diff: dupDiff(r.diff),
+  };
+}
+function dupGroupItem(x: unknown): DuplicateGroupItem {
+  const r = rec(x);
+  return {
+    itemId: numOr(r.itemId, 0),
+    title: dupStr(r.title),
+    assetId: numOr(r.assetId, 0),
+    path: dupStr(r.path),
+    size: numOr(r.size, 0),
+    versionKey: dupStrOrNull(r.versionKey),
+  };
+}
+
+/** 某个条目在库里的疑似重复（min 默认服务端 0.9）。 */
+export async function getItemDuplicates(itemId: number, min?: number): Promise<ItemDuplicatesResponse> {
+  const raw = await request<unknown>("GET", "/items/" + itemId + "/duplicates" + queryString({ min }));
+  const r = rec(raw);
+  return {
+    itemId: numOr(r.itemId, itemId),
+    min: numOr(r.min, min ?? 0.9),
+    matches: pickArray<unknown>(raw, "matches").map(dupMatch),
+  };
+}
+
+/** 库级重复组（跨条目的疑似重复聚类）。 */
+export async function getDuplicateGroups(min?: number, limit = 100): Promise<DuplicateGroupsResponse> {
+  const raw = await request<unknown>("GET", "/duplicates" + queryString({ min, limit }));
+  const r = rec(raw);
+  const groups: DuplicateGroup[] = pickArray<unknown>(raw, "groups").map((g) => {
+    const gr = rec(g);
+    return {
+      key: dupStr(gr.key),
+      similarity: numOr(gr.similarity, 0),
+      items: pickArray<unknown>(g, "items").map(dupGroupItem),
+    };
+  });
+  return { min: numOr(r.min, min ?? 0.9), groups };
+}
+
+/** 重算全部资产的重复签名（可能很慢，给 120s 超时）。 */
+export async function recomputeSignatures(): Promise<RecomputeResponse> {
+  const raw = await request<unknown>("POST", "/duplicates/recompute", undefined, { timeoutMs: 120000 });
+  const r = rec(raw);
+  return { scanned: numOr(r.scanned, 0), updated: numOr(r.updated, 0) };
+}
 
 export type { ArchiveEntry, AssetRow, BoothItemMeta, ContainerKind, ItemStatus, JobRow, LibraryRootRow, RootMode, SourceSite, TagRow };

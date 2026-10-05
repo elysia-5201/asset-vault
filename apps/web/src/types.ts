@@ -174,3 +174,63 @@ export interface ItemQuery {
   limit?: number;
   offset?: number;
 }
+
+// ---------------- 疑似重复（/api/duplicates*，后端契约已冻结） ----------------
+/** exact=完全相同 / same-content=内容一致 / near=高度相似 */
+export type DuplicateLevel = "exact" | "same-content" | "near";
+
+/** 文件级差异里的一条（路径 + 字节数）。 */
+export interface DuplicateFileDiff {
+  path: string;
+  size: number;
+}
+export interface DuplicateDiff {
+  added: DuplicateFileDiff[];
+  removed: DuplicateFileDiff[];
+  changed: DuplicateFileDiff[];
+}
+
+/** GET /items/:id/duplicates 的一条匹配。 */
+export interface DuplicateMatch {
+  otherAssetId: number;
+  otherItemId: number;
+  otherTitle: string;
+  otherPath: string;
+  otherVersionKey: string | null;
+  /** 0..1，四位小数 */
+  similarity: number;
+  level: DuplicateLevel;
+  /** 中文一句话，已含"新增 2 / 删除 0 / 修改 1" */
+  reason: string;
+  diff: DuplicateDiff;
+}
+export interface ItemDuplicatesResponse {
+  itemId: number;
+  min: number;
+  matches: DuplicateMatch[];
+}
+
+/** GET /duplicates 的库级重复组。 */
+export interface DuplicateGroupItem {
+  itemId: number;
+  title: string;
+  assetId: number;
+  path: string;
+  size: number;
+  versionKey: string | null;
+}
+export interface DuplicateGroup {
+  key: string;
+  similarity: number;
+  items: DuplicateGroupItem[];
+}
+export interface DuplicateGroupsResponse {
+  min: number;
+  groups: DuplicateGroup[];
+}
+
+/** POST /duplicates/recompute */
+export interface RecomputeResponse {
+  scanned: number;
+  updated: number;
+}
