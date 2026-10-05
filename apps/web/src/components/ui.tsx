@@ -17,6 +17,22 @@ export function Section(props: { title: ReactNode; right?: ReactNode; children: 
 
 export function Spinner() { return <span className="spin" aria-label="加载中" />; }
 
+/** 可折叠区块：默认收起时只占一行（标题 + 条数），点开才铺开内容。 */
+export function Collapsible(props: { label: ReactNode; count?: number; defaultOpen?: boolean; children: ReactNode }) {
+  const [open, setOpen] = useState(props.defaultOpen ?? false);
+  return (
+    <div>
+      <div className="row" style={{ gap: "6px", alignItems: "center" }}>
+        <button className="btn tiny" onClick={() => setOpen((v) => !v)} title={open ? "收起" : "展开"}>
+          {open ? "▾" : "▸"}{props.count !== undefined ? " " + props.count + " 条" : ""}
+        </button>
+        <span className="hint">{props.label}</span>
+      </div>
+      {open && <div style={{ marginTop: "4px" }}>{props.children}</div>}
+    </div>
+  );
+}
+
 /**
  * 证据来源一行：默认只显示"哪几类证据、各多少条"，点开才看前几条。
  * 起因：一条 avatar 的 evidence 里可能有 100+ 条 unitypackage 路径，原样铺开会把面板淹掉。
@@ -26,7 +42,7 @@ export function EvidenceLine(props: { name: string; source?: string | null; evid
   const { groups } = useMemo(() => parseEvidence(props.evidence), [props.evidence]);
   const total = groups.reduce((n, g) => n + g.items.length, 0);
   // 证据很少时直接铺一行文字，别为了 1 条证据给一排标签 + 展开按钮
-  const inline = total > 0 && total <= 2 && groups.every((g) => g.items.every((t) => t.length <= 60));
+  const inline = total > 0 && total <= 2 && groups.every((g) => g.items.every((t) => t.length <= 200));
   return (
     <div className="evidence">
       <div className="row wrap" style={{ gap: "6px", alignItems: "center" }}>
@@ -34,7 +50,7 @@ export function EvidenceLine(props: { name: string; source?: string | null; evid
         {props.prefix ? <span className="hint" title="entry_prefix">prefix={shortenPath(props.prefix, 40)}</span> : null}
         <span className="hint">source={props.source ?? "—"}</span>
         {props.confidence !== undefined && props.confidence !== null ? <span className="hint">conf {props.confidence.toFixed(2)}</span> : null}
-        {inline && <span className="hint">{groups.map((g) => g.key + ": " + g.items.join("、")).join(" · ")}</span>}
+        {inline && <span className="hint" style={{ wordBreak: "break-all" }}>{groups.map((g) => g.key + ": " + shortenPath(g.items.join("、"), 96)).join(" · ")}</span>}
         <span className="spacer" />
         {!inline && groups.map((g) => (
           <span className="tag-chip" key={g.key} title={g.items.slice(0, 3).map((t) => shortenPath(t, 160)).join("\n")}>{g.key} × {g.items.length}</span>

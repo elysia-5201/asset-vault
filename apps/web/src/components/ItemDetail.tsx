@@ -10,7 +10,7 @@ import {
 import type { AvatarCard, ItemDetailWeb } from "../types";
 import { formatBytes, formatDate, formatYen } from "../util";
 import { ArchiveView } from "./ArchiveView";
-import { Badge, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
+import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
 export interface ProjectLite { id: number; name: string; path: string }
 
@@ -552,12 +552,15 @@ export function ItemDetail(props: {
                 ))}
                 {!detail.avatars.length && <span className="hint">未标注适配模型</span>}
               </div>
-              <div className="asset-list">
-                {detail.avatars.map((a) => (
-                  <EvidenceLine key={"ev" + a.id} name={a.name} source={a.source} evidence={a.evidence} confidence={a.confidence} />
-                ))}
-                {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
-              </div>
+              {/* 模型多的时候这一列会很长：默认收起，只占一行。 */}
+              <Collapsible label="适配模型证据（点开看每个模型的证据来源）" count={detail.avatars.length} defaultOpen={detail.avatars.length <= 3}>
+                <div className="asset-list">
+                  {detail.avatars.map((a) => (
+                    <EvidenceLine key={"ev" + a.id} name={a.name} source={a.source} evidence={a.evidence} confidence={a.confidence} />
+                  ))}
+                  {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
+                </div>
+              </Collapsible>
               {weakAvatars.length > 0 && (
                 <div className="notice" style={{ marginTop: "6px" }}>
                   {weakAvatars.length} 个适配模型（{weakAvatars.map((a) => "@" + a.name).join("、")}）只有商品页证据 —— 标题/标签/描述里有，

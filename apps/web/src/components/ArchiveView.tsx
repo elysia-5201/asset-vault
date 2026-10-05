@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ArchiveEntry, AssetRow, UnityPackageAsset } from "@core/contracts";
 import { getAsset, getAssetTree, getUnityPackage, readEntry, reindexAsset, describeError, type EntryPreview } from "../api";
 import { buildTree, extOf, filterTree, formatBytes, isImageish, isTextish, type TreeNode } from "../util";
-import { Badge, EvidenceLine, Section } from "./ui";
+import { Badge, Collapsible, EvidenceLine, Section } from "./ui";
 
 /** 压缩包里解析出来的 .unitypackage 资产多带一个"来自哪个包"。 */
 type UpAssetRow = UnityPackageAsset & { package?: string };
@@ -177,12 +177,13 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
       <div className="evidence" style={{ marginBottom: "6px" }} title="assets.path">{asset.path}</div>
       {assetAvatars.length > 0 && (
         <div style={{ marginBottom: "6px" }}>
-          <div className="hint">该资产的适配模型证据（GET /assets/:id → avatars）</div>
-          {assetAvatars.map((x, i) => (
-            <EvidenceLine
-              key={i} name={"avatar#" + x.avatar_id} prefix={x.entry_prefix} confidence={x.confidence} evidence={x.evidence} source={null}
-            />
-          ))}
+          <Collapsible label="该资产的适配模型证据（GET /assets/:id → avatars）" count={assetAvatars.length} defaultOpen={assetAvatars.length <= 3}>
+            {assetAvatars.map((x, i) => (
+              <EvidenceLine
+                key={i} name={"avatar#" + x.avatar_id} prefix={x.entry_prefix} confidence={x.confidence} evidence={x.evidence} source={null}
+              />
+            ))}
+          </Collapsible>
         </div>
       )}
       <div className="seg" style={{ marginBottom: "6px" }}>
