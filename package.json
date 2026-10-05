@@ -9,6 +9,7 @@
     "dev:web": "vite --config apps/web/vite.config.ts",
     "build:web": "vite build --config apps/web/vite.config.ts",
     "test": "node scripts/test.mjs",
+    "demo:library": "node scripts/make-demo-library.mjs",
     "typecheck": "tsc --noEmit",
     "desktop:bundle": "node apps/desktop/build.mjs",
     "desktop:dev": "node apps/desktop/build.mjs && electron .",

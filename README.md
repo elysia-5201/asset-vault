@@ -1,6 +1,11 @@
 # AssetVault · 资源库
 
-> 把散落在各个下载目录里的 BOOTH / Unity /VRChat素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
+[![Tests](https://img.shields.io/badge/tests-195%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+
+> 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
 每条素材会记下**来源商品**、**多张缩略图**、**关联的压缩包与 unitypackage**、**适配哪些 avatar**，
 并回答三个每天都在问的问题：**这个素材是给哪个模型的 / 我导入过没 / 上游更新了没**。
@@ -37,10 +42,23 @@
 
 ## 🎨 预览
 
-界面是三段式：**左侧头像轨 / 中间卡片网格 / 右侧详情抽屉**；详情里依次是缩略图管理、包内目录与 unitypackage 资产、适配模型与证据、导入 Unity、作业面板。
+**卡片网格 + 头像轨**：左边点模型名就按适配关系筛素材；卡片直接给缩略图、适配模型、套装与「已导入」徽章。
 
-> 本仓库**暂未提交截图**：作者的素材库以 R18 内容为主，直接截图放进公开仓库不合适。
-> 想先看一眼：按下面「快速开始」跑起来即可；或者翻 `docs/verification/`（验收证据，含接口/状态机的原始输出与可复现哈希）。
+![卡片网格与头像轨](docs/images/grid.webp)
+
+**详情抽屉**：包内目录 / unitypackage 资产（压缩包里的包也解析，按类型一键筛选）、适配模型与证据、导入 Unity、作业面板。
+
+![详情抽屉：unitypackage 资产与适配模型证据](docs/images/detail-unitypackage.webp)
+
+> 截图来自 `scripts/make-demo-library.mjs` 生成的**脱敏演示库**（全合成素材 + 占位图），可复现：
+>
+> ```bash
+> node scripts/make-demo-library.mjs /tmp/av-demo          # 造 6 个合成素材包
+> ASSETVAULT_DATA=/tmp/av-demo-data PORT=7399 node --import tsx apps/server/src/main.ts
+> # 浏览器开 http://127.0.0.1:7399 → 添加库根 /tmp/av-demo → 扫描
+> ```
+>
+> 作者自己的素材库以 R18 为主，所以 README 一律用合成样库截图；验收证据（接口/状态机原始输出与哈希）在 `docs/verification/`。
 
 ---
 
@@ -119,7 +137,36 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - **合并**：确认后把来源条目并进目标（压缩包 / 图片 / 标签 / 模型关联 / 更新历史全过去，来源进回收站可恢复）；
 - **删除整个套装**：徽章旁的 🗑 只删分组，不动条目。
 
-### 6. HTTP API
+### 6. Windows 部署（源码在 WSL、服务跑 Windows 原生）
+
+> 桌面便携版一般直接用 `npm run desktop:dist` 的产物；这一节是「没有 GUI / 只跑服务」的部署路径。
+
+| 项 | 值 |
+|---|---|
+| 程序目录 | `%APP_DIR%`（示例：`E:\tool\asset-vault`） |
+| 数据目录 | `%APP_DIR%\data`（`vault.db` + `media\` 缩略图） |
+| 访问地址 | <http://127.0.0.1:7317>（Windows 浏览器可开；WSL 里同样可达，mirrored 网络） |
+| 启动 / 停止 | `start-assetvault.cmd` / `stop-assetvault.cmd`（按命令行精确匹配 node 进程） |
+| Node | Windows 侧 Node 22+；`better-sqlite3` 走自带 `prebuilds/win32-x64.node`，**不需要构建工具链** |
+
+```bash
+# 1) 同步源码 + 数据（robocopy，排除 node_modules / logs / data）
+%SystemRoot%/System32/cmd.exe /c "copy /y \\wsl.localhost\<distro>\<repo>\scripts\win-deploy.cmd %TEMP%\ && %TEMP%\win-deploy.cmd"
+# 2) 若改了依赖
+%SystemRoot%/System32/cmd.exe /c "cd /d %APP_DIR% && npm install --no-audit --no-fund"
+# 3) 重启
+%APP_DIR%\stop-assetvault.cmd && %APP_DIR%\start-assetvault.cmd
+```
+
+迁库时有**两件必做**的事（脚本已固化：`scripts/win-migrate-paths.mjs`、`scripts/win-fix-roots.mjs`）：
+
+- **路径语义改写**：DB 里存的是 Linux 路径 → `/mnt/<盘>/` 改成 `<盘>:\`、仓库路径改成 `%APP_DIR%\`；
+  并且必须用**同一个 `normalizePath`** 重算 `path_norm`，否则补扫时会被判成新文件。
+- **root 收敛**：`library_roots` 要指向真实目录（例如 `E:\game\vrchatcache`）。
+
+> 开发沙箱里 `/mnt/e` 这类 Windows 盘是**只读**的，所以所有 Windows 侧写入都通过 `cmd.exe` / PowerShell 走 Windows 进程完成。
+
+### 7. HTTP API
 
 完整契约见 `docs/api.md`（含 Unity 桥、套装、合并、导入等端点）；健康检查 `GET /api/health`。
 
@@ -254,8 +301,9 @@ Issue 里请附：操作系统 / Node 版本 / 复现步骤 / `logs/server.log` 
 
 ## 📄 License
 
-本仓库**当前没有 LICENSE 文件**（默认保留所有权利）。如果你想拿去做二次开发，
-说一声我加上 **MIT**；有别的偏好（Apache-2.0 / GPL-3.0）也可以。
+[MIT](LICENSE) © elysia-5201
+
+你可以自由使用、修改、分发（包括商用），只需保留版权与许可声明。
 
 ---
 
