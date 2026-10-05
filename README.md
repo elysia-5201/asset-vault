@@ -50,6 +50,10 @@
 
 ![详情抽屉：unitypackage 资产与适配模型证据](docs/images/detail-unitypackage.webp)
 
+**导入到 Unity 工程**：探测当前打开的那个编辑器（mcp-for-unity），列出条目里所有 `.unitypackage`（压缩包里的也算），按当前工程的 avatar 自动预选，`AssetDatabase.ImportPackage` 真导入 + 回读控制台报错。
+
+![导入到 Unity 工程](docs/images/unity-import.webp)
+
 > 截图来自 `scripts/make-demo-library.mjs` 生成的**脱敏演示库**（全合成素材 + 占位图），可复现：
 >
 > ```bash
