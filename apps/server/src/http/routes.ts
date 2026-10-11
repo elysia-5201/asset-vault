@@ -1036,6 +1036,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     unityMcpCandidates: UNITY_MCP_URLS,
     /** 检查更新的仓库覆盖（owner/repo）；空 = 用内置默认仓库 */
     updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
+    /** token 只回"有没有配"，不回值本身 */
+    updateTokenSet: !!(repo.getSetting(UPDATE_TOKEN_KEY) ?? "").trim(),
   }));
   app.put("/api/settings", async (req, reply) => {
     try {
@@ -1051,10 +1053,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         if (v && !REPO_SLUG_RE.test(v)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "updateRepo 形状应为 owner/repo" } });
         repo.setSetting(UPDATE_REPO_KEY, v);
       }
+      // GitHub token（可选，提高匿名 60 次/小时的额度）：空串 = 清掉。**只进不出**，回包里只给"有没有"。
+      if (typeof b.updateToken === "string") repo.setSetting(UPDATE_TOKEN_KEY, b.updateToken.trim());
       return {
         downloadRoot: downloadRootOf(repo, deps.dataDir),
         unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
         updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
+        updateTokenSet: !!(repo.getSetting(UPDATE_TOKEN_KEY) ?? "").trim(),
       };
     } catch (e) { return fail(reply, e); }
   });
