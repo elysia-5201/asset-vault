@@ -235,6 +235,36 @@ export interface RecomputeResponse {
   updated: number;
 }
 
+// ---------------- 检查更新（GET /api/update-check?force=1） ----------------
+/**
+ * 应用自身版本的更新检查结果。契约：**永远 200**，失败也是 `ok:false`（绝不 500）。
+ * ok=false 时只有 error/current/checkedAt 有意义。
+ */
+export interface UpdateCheckResponse {
+  ok: boolean;
+  /** 当前运行版本（服务端 deps.version，正常就是 package.json version） */
+  current: string;
+  /** 服务端完成本次检查/读缓存的时间（ISO） */
+  checkedAt: string;
+  /** ok=true：Release tag 去掉 v 前缀后的版本 */
+  latest?: string;
+  hasUpdate?: boolean;
+  /** ISO 或 null */
+  publishedAt?: string | null;
+  /** Release 页面链接 */
+  url?: string;
+  /** Release body 前 2000 字 */
+  notes?: string;
+  /** 便携包文件名（挑不到就是 null） */
+  assetName?: string | null;
+  /** 便携包字节数（挑不到就是 null） */
+  assetSize?: number | null;
+  /** 本次是否来自 6h 缓存 */
+  fromCache?: boolean;
+  /** ok=false 时的中文一行错误 */
+  error?: string;
+}
+
 // ---------------- 疑似同商品（/api/items/:id/related） ----------------
 /** same-product = 认成同一商品（产品名片段完全一致）；likely = 疑似（片段高度重合）。 */
 export type RelatedLevel = "same-product" | "likely";
@@ -258,3 +288,49 @@ export interface ItemRelatedResponse {
   min: number;
   matches: RelatedMatch[];
 }
+
+
+// ---------------- 工程"实际引用"（/api/items/:id/usage、/api/projects/:id/*usage） ----------------
+/**
+ * 某个工程里**真的在用**这个条目的哪些文件。
+ * 与 project_imports（"登记导入"）不是一回事：这里由 project_refs 的 GUID 求交得到，
+ * 没有扫描数据时 projects 为空数组（不是错误）。
+ */
+export interface ProjectRefUsage {
+  projectId: number;
+  name: string;
+  path: string;
+  /** 命中的文件数 */
+  files: number;
+  /** 命中的路径（最多 20 条，按 path 排序） */
+  paths: string[];
+}
+export interface ItemUsageResponse {
+  itemId: number;
+  projects: ProjectRefUsage[];
+}
+/** GET /projects/:id/usage 里的一条：这个工程真的用到了哪个条目。 */
+export interface ProjectUsageItem {
+  itemId: number;
+  title: string;
+  files: number;
+  paths: string[];
+}
+export interface ProjectUsageResponse {
+  projectId: number;
+  name: string;
+  items: ProjectUsageItem[];
+}
+/** POST /projects/:id/scan-usage 的结果（扫描可能跑几十秒，remaining=true 表示预算用尽还有资产没查）。 */
+export interface ScanUsageResponse {
+  projectId: number;
+  scannedFiles: number;
+  guidCount: number;
+  matchedGuids: number;
+  matchedItems: number;
+  matchedAssets: number;
+  truncated: boolean;
+  remaining: boolean;
+  ms: number;
+}
+

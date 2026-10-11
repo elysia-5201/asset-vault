@@ -98,13 +98,32 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | DELETE | `/roots/:id` | |
 | GET/POST | `/tags`，POST `{name, namespace?, color?}` | |
 | GET/POST | `/projects`，POST `{name, path}` | Unity 工程 |
-| POST | `/projects/:id/imports` `{itemId, assetId?}` | 记录"已导入" |
+| POST | `/projects/:id/imports` `{itemId, assetId?}` | 记录"已导入"（**登记**，不代表工程里真的有） |
+| POST | `/projects/:id/scan-usage` `{budgetMs?}` | 扫工程 Assets/ 的 GUID 与素材库求交，整表替换 `project_refs`（见「工程实际引用」） |
+| GET | `/items/:id/usage` | 这个条目**被哪些工程真的用到** → `{itemId, projects:[{projectId,name,path,files,paths}]}` |
+| GET | `/projects/:id/usage` | 这个工程**真的用到**了哪些素材 → `{projectId, name, items:[{itemId,title,files,paths}]}`（按 files 降序） |
 | GET | `/media/:imageId?w=` | 缩略图/原图字节（sharp 生成缓存） |
 | GET | `/stats` | `{items, assets, bytes, avatars, byCategory[], byAvatar[]}` |
 | GET | `/export/items.json` | 全量导出 |
+| GET | `/update-check?force=1` | 检查应用更新（见「检查更新」） |
 | GET | `/unity/status` | Unity 桥探测（连不上也是 200） |
 | GET | `/unity/packages?itemId=` | 可导入的 .unitypackage 清单 |
 | POST | `/unity/import` `{itemId, keys?}` | **真导入**到当前打开的 Unity 工程 |
+
+## 检查更新
+
+`GET /update-check?force=1` —— 拿本机版本（deps.version）和 GitHub Releases 的最新 Release 比。**永远 200**：失败也是
+`{ok:false, error, current, checkedAt}`，绝不 500（离线可用性是硬要求）。
+
+成功 → `{ok:true, current:"0.1.0", latest:"0.2.0", hasUpdate:true, publishedAt:"...", url:"https://github.com/<owner>/<repo>/releases/tag/v0.2.0", notes:"release body 前 2000 字", assetName:"AssetVault-v0.2.0-win-x64-portable.zip", assetSize:12345678, checkedAt:"...", fromCache:false}`；
+失败 → `{ok:false, error:"...", current, checkedAt}`。
+
+- 数据源 `https://api.github.com/repos/<owner>/<repo>/releases/latest`；仓库默认 `elysia-5201/asset-vault`，
+  settings 键 `update_repo`（形状 `owner/repo`，走 `PUT /settings {updateRepo}`）可覆盖；settings 键 `update_token` 存在时带 `Authorization: Bearer`（默认不需要 token）。
+- 资产挑选：优先名字含 `portable` 的，其次第一个；挑不到则 `assetName/assetSize` 为 `null`。
+- 版本比较见 `packages/core/src/version.ts`（`v` 前缀、`1.2`/`1.2.3`、预发布 < 正式）。
+- 缓存：成功结果写 settings `update_last_check`（JSON），**6 小时内**不重复请求；`force=1` 绕过；`update_repo` 变化时缓存失效。失败不缓存。
+- 请求超时 8s。
 
 ## Unity 编辑器（把素材**真的**导进当前打开的工程）
 
@@ -122,6 +141,26 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 - 压缩包内的包会先"落地"到 `<dataDir>/unity-staging/<assetId>/`，再交给 Unity（`AssetDatabase.ImportPackage` 只吃磁盘上的文件）。
 - 当前工程会自动登记进 `projects`（`unity_version` 由编辑器上报）并写 `project_imports`。
 - WSL 里跑服务也能用：路径会自动翻译成 `/mnt/c/...`→`C:\...`、其余→`\\wsl.localhost\<distro>\...`。
+
+## 工程实际引用（素材是不是**真的**被工程用到）
+
+`project_imports` 只是"我们登记过一笔"；`project_refs` 才是**证据**：拿两侧 GUID 求交。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/projects/:id/scan-usage` `{budgetMs?}` | 扫 `<project.path>/Assets` → 与素材库 GUID 求交 → **整表替换**该工程的 `project_refs`。返回 `{projectId, scannedFiles, guidCount, matchedGuids, matchedItems, matchedAssets, truncated, remaining, ms}`。工程不存在 → 404 |
+| GET | `/items/:id/usage` | `{itemId, projects:[{projectId, name, path, files, paths}]}`；`paths` 最多 20 条（按路径排序），没扫过 → `projects: []`（不是 404） |
+| GET | `/projects/:id/usage` | `{projectId, name, items:[{itemId, title, files, paths}]}`，按 `files` 降序 |
+
+口径与取舍（冻结）：
+- **工程侧**：递归扫 `Assets/`（跳过 Library/Temp/obj/Logs/.git/.svn/node_modules，深度 ≤12，文件数 ≤200k，单文件读取 ≤1MB），
+  从每个 `*.meta` 的 `guid: <32 位 hex>` 取 GUID（`packages/core/src/unitymeta.ts`）→ 去掉 `.meta` 后缀即资源路径；命中的是**路径**不是"导入记录"。
+- **素材侧**：`.unitypackage` 直读 `unitypackage_assets`；zip/7z/rar 走与"导入 Unity"同一条链
+  （`listUnityPackageCandidates` → `stageUnityPackage` → `listUnityPackage`），单包 15s 超时、每资产最多 3 个内层包、内层包 >256MB 跳过。
+- **缓存**：guid 索引按 `assetId:size:mtime` 内存缓存（上限 64 条），**空结果不缓存**（偶发读失败不该被钉死）。
+- **预算**：默认 45s（`budgetMs` 可覆盖，最小 1s）。超预算提前返回且 `remaining:true`；先查"DB 里已有 GUID 清单"的资产（不解析），
+  再按体积从小到大解析压缩包 —— 预算内尽量多覆盖，大包下次接着扫。
+- **替换语义**：每次扫描**先删该工程旧行再插**。`truncated`/`remaining` 为 true 说明这次没看全，重扫一次会补齐（有缓存，第二次更快）。
 
 ## 响应包裹形状（实测固定，前端请按此解析）
 

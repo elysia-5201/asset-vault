@@ -48,6 +48,10 @@
     "directories": {
       "output": "dist-desktop"
     },
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
     "files": [
       "apps/desktop/main.mjs",
       "apps/desktop/build/**",
@@ -56,7 +60,18 @@
       "packages/core/src/**",
       "config/**",
       "package.json",
-      "!**/*.map"
+      "!**/*.map",
+      "!**/*.bak",
+      "!**/node_modules/better-sqlite3/deps/**",
+      "!**/node_modules/better-sqlite3/src/**",
+      "!**/node_modules/better-sqlite3/build/**",
+      "!**/node_modules/better-sqlite3/prebuilds/linux*.node",
+      "!**/node_modules/better-sqlite3/prebuilds/darwin*.node",
+      "!**/node_modules/better-sqlite3/prebuilds/win32-arm64.node",
+      "!**/node_modules/7zip-bin/linux/**",
+      "!**/node_modules/7zip-bin/mac/**",
+      "!**/node_modules/7zip-bin/win/arm64/**",
+      "!**/node_modules/7zip-bin/win/ia32/**"
     ],
     "asarUnpack": [
       "**/node_modules/better-sqlite3/**",

@@ -195,6 +195,20 @@ CREATE TABLE IF NOT EXISTS project_imports (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_proj_item_asset ON project_imports(project_id, item_id, IFNULL(asset_id, 0));
 
+-- 工程**实际引用**（project_imports 是"登记导入"，不代表工程里真的有）
+-- 一行 = 一个 GUID 同时出现在某素材包里 + 该工程 Assets/ 下；由 POST /projects/:id/scan-usage 整表替换。
+CREATE TABLE IF NOT EXISTS project_refs (
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+  guid TEXT NOT NULL,
+  file_path TEXT,
+  scanned_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, item_id, guid)
+);
+CREATE INDEX IF NOT EXISTS ix_pref_project ON project_refs(project_id);
+CREATE INDEX IF NOT EXISTS ix_pref_item ON project_refs(item_id);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,

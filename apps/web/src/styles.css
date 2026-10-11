@@ -238,3 +238,13 @@ button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-colo
 .dup-file { display: flex; align-items: baseline; gap: 6px; font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim); }
 .dup-file .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dup-file .sz { flex: 0 0 auto; color: var(--fg-mute); }
+
+/* ---------- 检查更新 ---------- */
+/* 顶栏按钮不换行（品牌行窄，「检查更新」会被折成两行） */
+.brand .btn { white-space: nowrap; }
+
+.update-panel { width: min(620px, 100%); align-self: center; height: auto; max-height: 100%; }
+.update-body { padding: 12px; overflow: auto; display: flex; flex-direction: column; gap: 9px; }
+.update-vers { display: flex; align-items: center; gap: 9px; font-size: 15px; }
+.update-vers .update-arrow { color: var(--fg-mute); }
+.update-vers .update-latest { color: var(--ok); font-weight: 700; }

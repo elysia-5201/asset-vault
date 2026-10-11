@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch, JobRow, LibraryRootRow, TagRow } from "@core/contracts";
 import {
-  apiMode, describeError, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
+  apiMode, checkAppUpdate, describeError, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
   onModeChange, patchItem, recordImport, retryConnect, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
-import type { AvatarCard, HealthResponse, ItemCardWeb, ViewMode } from "./types";
-import { parseAtQuery, resolveAvatarNames } from "./util";
+import type { AvatarCard, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
+import { formatBytes, formatDate, parseAtQuery, resolveAvatarNames } from "./util";
 import { AvatarRail } from "./components/AvatarRail";
 import { SearchBar, type FilterState } from "./components/SearchBar";
 import { ItemCardView } from "./components/ItemCardView";
@@ -53,6 +53,9 @@ export default function App() {
   const [sideTab, setSideTab] = useState<"import" | "jobs">("import");
   /** 库级「查重」面板开关。 */
   const [dupPanel, setDupPanel] = useState(false);
+  /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
 
   useEffect(() => {
     try { const raw = localStorage.getItem(IMPORTED_KEY); if (raw) setImportedIds(JSON.parse(raw) as number[]); } catch { /* 忽略 */ }
@@ -82,6 +85,30 @@ export default function App() {
   }, []);
 
   useEffect(() => { loadAvatars(); loadMeta(); loadJobs(); }, [mode, loadAvatars, loadMeta, loadJobs]);
+
+  // 启动后**静默**检查一次更新：有更新才弹面板，失败/已是最新都不打扰（离线可用性优先）。
+  // 依赖 mode：内置 mock 模式下后端不可达，等切回 live 再试。
+  useEffect(() => {
+    if (mode !== "live") return;
+    let alive = true;
+    checkAppUpdate(false)
+      .then((r) => { if (alive && r.ok && r.hasUpdate) setUpdateInfo(r); })
+      .catch(() => { /* 静默 */ });
+    return () => { alive = false; };
+  }, [mode]);
+
+  const doCheckUpdate = useCallback(() => {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    checkAppUpdate(true)
+      .then((r) => {
+        if (!r.ok) { toast("bad", "检查更新失败：" + (r.error ?? "未知原因")); return; }
+        if (r.hasUpdate) { setUpdateInfo(r); return; }
+        toast("ok", "已是最新（v" + r.current + "）");
+      })
+      .catch((e) => toast("bad", "检查更新失败：" + describeError(e)))
+      .finally(() => setUpdateBusy(false));
+  }, [updateBusy, toast]);
 
   const parsed = useMemo(() => parseAtQuery(debounced), [debounced]);
   const resolved = useMemo(() => resolveAvatarNames(parsed.avatars, avatars), [parsed, avatars]);
@@ -186,6 +213,9 @@ export default function App() {
           </span>
           <span className="spacer" />
           <button className="btn tiny" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => setDupPanel(true)}>查重</button>
+          <button className="btn tiny" disabled={updateBusy} title="检查应用更新（GET /api/update-check?force=1，查 GitHub Releases）" onClick={doCheckUpdate}>
+            {updateBusy ? "检查中…" : "检查更新"}
+          </button>
           {mode === "mock" && (
             <button className="btn tiny" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
           )}
@@ -242,6 +272,43 @@ export default function App() {
           ? <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} />
           : <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />}
       </div>
+
+      {/* 有更新才弹的居中面板：当前版本 → 最新版本 + Release 链接 + notes 前 500 字 + 资产文件名/大小 */}
+      {updateInfo && (
+        <div className="backdrop" onClick={() => setUpdateInfo(null)}>
+          <div className="drawer update-panel" role="dialog" aria-label="发现新版本" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head">
+              <h3>发现新版本</h3>
+              {updateInfo.fromCache && <span className="badge muted" title="6 小时内已检查过，本次直接读缓存">缓存</span>}
+              <span className="spacer" />
+              <button className="btn" onClick={() => setUpdateInfo(null)}>关闭</button>
+            </div>
+            <div className="update-body">
+              <div className="update-vers">
+                <span className="mono">v{updateInfo.current}</span>
+                <span className="update-arrow">→</span>
+                <span className="mono update-latest">v{updateInfo.latest}</span>
+              </div>
+              <div className="hint">
+                {updateInfo.publishedAt ? "发布于 " + formatDate(updateInfo.publishedAt) : "发布时间未知"}
+                {updateInfo.assetName ? " · 资产 " + updateInfo.assetName + (updateInfo.assetSize ? "（" + formatBytes(updateInfo.assetSize) + "）" : "") : ""}
+              </div>
+              {updateInfo.notes ? (
+                <div className="pre">{updateInfo.notes.slice(0, 500)}</div>
+              ) : (
+                <div className="hint">这个 Release 没有写说明。</div>
+              )}
+              <div className="row">
+                {updateInfo.url && (
+                  <a className="btn tiny" href={updateInfo.url} target="_blank" rel="noreferrer">打开 Release 页面</a>
+                )}
+                <span className="spacer" />
+                <button className="btn tiny" disabled={updateBusy} onClick={doCheckUpdate}>{updateBusy ? "检查中…" : "再检查一次"}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}
       {dupPanel && (

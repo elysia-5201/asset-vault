@@ -4,10 +4,10 @@ import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
   deleteCollection, getCollection, getItem, getItemDuplicates, getRelatedItems, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
-  unityImport, unityPackages, unityStatus,
+  itemUsage, scanProjectUsage, unityImport, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
-import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, RelatedMatch } from "../types";
+import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
@@ -91,6 +91,10 @@ export function ItemDetail(props: {
   const [unityNote, setUnityNote] = useState("");
   const [unityPickNote, setUnityPickNote] = useState("");
   const [unityErrors, setUnityErrors] = useState<string[]>([]);
+  /** 这个条目在各工程里"真的被用到"的文件（GUID 求交；未扫描/旧后端 → 空数组，静默不报错） */
+  const [usage, setUsage] = useState<ProjectRefUsage[] | null>(null);
+  const [usageOpen, setUsageOpen] = useState<number | null>(null);
+  const [usageBusy, setUsageBusy] = useState(0);
   /** 套装 id → 成员条目（用来一键"并到本条"） */
   const [collMembers, setCollMembers] = useState<Record<number, CollectionMember[]>>({});
   /**
@@ -101,18 +105,22 @@ export function ItemDetail(props: {
   const [dupBusy, setDupBusy] = useState(false);
   const [dupOpen, setDupOpen] = useState<Set<number>>(new Set());
   /**
-   * 详情页「疑似同商品」（模型包 / 材质包 / DLC 分开打包）。端点不存在（mock/旧版）或请求失败时静默；
-   * 没有匹配时整个提示不渲染。
+   * 详情页「疑似同商品」（模型包 / 材质包 / DLC 分开打包）—— **手动查**，不自动列。
+   * 原因：自动列出非常容易误报（卖家把"支持的全部 base"打成一堆 tag，标签一相同就命中；
+   * 实测一个条目的 8 条建议里 7 条是标签命中）。所以默认严格（min=0.75，只认"两侧标题共有产品名"），
+   * 勾「更宽松」才降到 0.6（含标签命中）并给结果标「弱」。null = 还没查过。
    */
-  const [related, setRelated] = useState<RelatedMatch[]>([]);
+  const [related, setRelated] = useState<RelatedMatch[] | null>(null);
+  const [relatedLoose, setRelatedLoose] = useState(false);
+  const [relatedBusy, setRelatedBusy] = useState(false);
 
-  const loadRelated = useCallback(() => {
-    setRelated([]);
-    getRelatedItems(itemId)
+  const findRelated = useCallback((loose: boolean) => {
+    setRelatedBusy(true);
+    getRelatedItems(itemId, loose ? 0.6 : 0.75)
       .then((r) => setRelated(r.matches))
-      .catch(() => setRelated([]));
+      .catch(() => setRelated([]))
+      .finally(() => setRelatedBusy(false));
   }, [itemId]);
-  useEffect(() => { loadRelated(); }, [itemId, loadRelated]);
 
   /** 把某条「疑似同商品」与本条归入同一套装（保留各自条目）；套装名优先用输入框，其次共有产品名。 */
   const doRelateCollect = (m: RelatedMatch) => {
@@ -128,7 +136,7 @@ export function ItemDetail(props: {
     mergeItems(m.itemId, itemId)
       .then(() => {
         props.onToast("ok", "已把 #" + m.itemId + " 并入本条");
-        setRelated((prev) => prev.filter((x) => x.itemId !== m.itemId));
+        setRelated((prev) => (prev ?? []).filter((x) => x.itemId !== m.itemId));
         load();
         props.onChanged();
       })
@@ -311,6 +319,32 @@ export function ItemDetail(props: {
 
   useEffect(() => { void loadUnity(); }, [loadUnity]);
 
+  /**
+   * 拉这个条目的"实际引用"（工程里真的在用哪些文件）。
+   * 接口 404/失败一律静默：旧后端没有 /items/:id/usage，不能因此弹错或崩。
+   */
+  const loadUsage = useCallback(() => {
+    itemUsage(itemId)
+      .then((r) => setUsage(r.projects))
+      .catch(() => setUsage((prev) => prev ?? []));
+  }, [itemId]);
+  useEffect(() => { loadUsage(); }, [loadUsage]);
+
+  /** 扫某个工程的引用（会写 project_refs、可能跑几十秒），完成后刷新本条的 usage。 */
+  const doScanUsage = (p: ProjectLite) => {
+    if (usageBusy) return;
+    setUsageBusy(p.id);
+    scanProjectUsage(p.id)
+      .then((r) => {
+        props.onToast("ok", "「" + p.name + "」扫到 " + r.scannedFiles + " 个文件 / " + r.guidCount + " 个 GUID：命中 "
+          + r.matchedItems + " 个素材（" + r.matchedGuids + " 个 GUID / " + r.matchedAssets + " 个资产）"
+          + (r.remaining ? "；预算用尽还有资产没查完，可再扫一次" : "；已扫完"));
+        loadUsage();
+      })
+      .catch((e) => props.onToast("bad", "扫描工程引用失败：" + describeError(e)))
+      .finally(() => setUsageBusy(0));
+  };
+
   /** 套装成员（用于"把套装里的其他条目并到本条"）；套装 id 变了才重拉。 */
   const collIds = (detail?.collections ?? []).map((c) => c.id).join(",");
   useEffect(() => {
@@ -431,12 +465,32 @@ export function ItemDetail(props: {
                   </span>
                 ))}
               </div>
-              {/* 疑似同商品：模型包 / 材质包 / DLC 分开打包时把它们认出来（没有匹配就整段不渲染）。
+              {/* 疑似同商品：**手动触发**。自动列出太容易误报（标签命中），所以默认严格、按需查。
                   同商品 ≠ 重复内容：这里只提示，归组（加入套装）或并入由用户点按钮决定。 */}
-              {related.length > 0 && (
+              <div className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "4px" }}>
+                <button
+                  className="btn tiny"
+                  disabled={relatedBusy}
+                  title="按标题 / 包内文件名里的产品名找「同一商品的不同打包」（模型包 + 材质包 / DLC）"
+                  onClick={() => findRelated(relatedLoose)}
+                >{relatedBusy ? "查找中…" : related === null ? "🔍 查找同商品" : "🔍 重新查找"}</button>
+                <label className="row" style={{ gap: "4px", alignItems: "center", cursor: "pointer" }} title="连「只在标签里出现过」的也一起列出来——这类很容易误报（卖家常把支持的全部 base 打上标签）">
+                  <input
+                    type="checkbox"
+                    checked={relatedLoose}
+                    onChange={(e) => { const v = e.target.checked; setRelatedLoose(v); if (related !== null) findRelated(v); }}
+                  />
+                  <span className="hint">更宽松（含标签命中，易误报）</span>
+                </label>
+                {related !== null && !relatedBusy && (
+                  <span className="hint">{related.length ? "找到 " + related.length + " 条" : "严格模式下没找到；可勾「更宽松」再试"}</span>
+                )}
+              </div>
+              {related !== null && related.length > 0 && (
                 <div style={{ marginTop: "4px" }}>
                   {related.map((m) => (
                     <div key={m.itemId} className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "2px" }}>
+                      {m.score < 0.75 && <span className="badge warn" title={"相似度 " + (m.score * 100).toFixed(0) + "%"}>弱</span>}
                       <span className="hint">疑似同商品（模型包 / 材质包）：《#{m.itemId} {m.title}》 共有「{m.shared[0] ?? m.reason}」</span>
                       <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 与本条归入同一个套装（保留各自条目）"} onClick={() => doRelateCollect(m)}>加入套装</button>
                       <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 并进本条（对方进回收站，可恢复）"} onClick={() => doRelateMerge(m)}>并入本条</button>
@@ -633,12 +687,38 @@ export function ItemDetail(props: {
               )}
               <div className="hr" />
               <div className="row wrap">
-                {props.projects.map((p) => (
-                  <button key={p.id} className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>仅登记：已导入 → {p.name}</button>
-                ))}
+                {props.projects.map((p) => {
+                  const u = usage ? usage.find((x) => x.projectId === p.id) ?? null : null;
+                  return (
+                    <span key={p.id} className="row" style={{ gap: "4px", alignItems: "center" }}>
+                      <button className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>仅登记：已导入 → {p.name}</button>
+                      {u && u.files > 0 ? (
+                        <button
+                          className="btn tiny"
+                          onClick={() => setUsageOpen(usageOpen === p.id ? null : p.id)}
+                          title={"工程里真的在用（GUID 求交命中 " + u.files + " 个文件）：" + u.paths.slice(0, 10).join(" / ")}
+                        >项目里真的在用：{u.name || p.name}（{u.files} 个文件）</button>
+                      ) : usage ? (
+                        <span className="hint">未扫描</span>
+                      ) : null}
+                      <button className="btn tiny" disabled={usageBusy !== 0} onClick={() => doScanUsage(p)}>
+                        {usageBusy === p.id ? "扫描中…（最多 45s）" : "扫描工程引用"}
+                      </button>
+                    </span>
+                  );
+                })}
                 {!props.projects.length && <span className="hint">无已登记工程</span>}
               </div>
-              <div className="hint" style={{ marginTop: "4px" }}>上面是"真的导进 Unity"；下面这排只写本地登记（POST /projects/:id/imports），不动 Unity。</div>
+              {usageOpen !== null && (() => {
+                const u = usage ? usage.find((x) => x.projectId === usageOpen) : null;
+                if (!u || !u.paths.length) return null;
+                return (
+                  <div className="hint mono" style={{ marginTop: "4px", wordBreak: "break-all", fontSize: "10px" }}>
+                    {u.name || "#" + u.projectId} 实际引用（前 {Math.min(5, u.paths.length)}/{u.files}）：{u.paths.slice(0, 5).join(" ｜ ")}
+                  </div>
+                );
+              })()}
+              <div className="hint" style={{ marginTop: "4px" }}>上面是"真的导进 Unity"；下面这排只写本地登记（POST /projects/:id/imports），不动 Unity；「项目里真的在用」是拿工程 Assets/ 下 .meta 的 GUID 与素材包 GUID 求交（POST /projects/:id/scan-usage）。</div>
             </Section>
           </div>
 

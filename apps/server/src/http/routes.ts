@@ -23,7 +23,9 @@ import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../servi
 import { importBoothUrl } from "../services/booth";
 import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, baseName, sleep } from "../services/unity";
 import { findDuplicatesForItem, listDuplicateGroups, recomputeSignatures } from "../services/dedupe";
+import { itemUsage, projectUsage, scanProjectUsage } from "../services/projectusage";
 import { relateItems } from "../../../../packages/core/src/related";
+import { compareVersions, parseVersion, stripVersionPrefix } from "../../../../packages/core/src/version";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -57,6 +59,104 @@ function fail(reply: FastifyReply, e: unknown): FastifyReply {
   return reply.status(status).send({ error: { code, message: String(err?.message ?? err) } });
 }
 let deps_log: (m: string) => void = () => {};
+
+// ---------- 检查更新（本机版本 vs GitHub Releases 最新 Release）----------
+const DEFAULT_UPDATE_REPO = "elysia-5201/asset-vault";
+const UPDATE_REPO_KEY = "update_repo";
+const UPDATE_TOKEN_KEY = "update_token";
+const UPDATE_CACHE_KEY = "update_last_check";
+/** 成功结果缓存 6 小时（force=1 绕过）；**失败不缓存** —— 离线可用性是硬要求。 */
+const UPDATE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_TIMEOUT_MS = 8000;
+const UPDATE_NOTES_LIMIT = 2000;
+const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+interface UpdateCacheEntry { repo: string; checkedAt: string; payload: Record<string, unknown> }
+
+/** settings.update_repo → owner/repo（缺省用内置仓库）；形状不合法返回 ""。 */
+function updateRepoSlug(repo: Repo): string {
+  const raw = (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim();
+  const slug = raw || DEFAULT_UPDATE_REPO;
+  return REPO_SLUG_RE.test(slug) ? slug : "";
+}
+
+/** 读缓存；形状坏了当没有（不抛）。 */
+function readUpdateCache(repo: Repo): UpdateCacheEntry | null {
+  try {
+    const raw = repo.getSetting(UPDATE_CACHE_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw) as UpdateCacheEntry;
+    if (!j || typeof j.repo !== "string" || typeof j.checkedAt !== "string" || !j.payload) return null;
+    return j;
+  } catch { return null; }
+}
+
+/** 抓 GitHub Releases API 的最新 Release（8s 超时）。异常一律抛 Error，由调用方转 ok:false。 */
+async function fetchLatestRelease(slug: string, token: string): Promise<any> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), UPDATE_TIMEOUT_MS);
+  try {
+    const headers: Record<string, string> = { "user-agent": "AssetVault-UpdateCheck", accept: "application/vnd.github+json" };
+    if (token) headers.authorization = "Bearer " + token;
+    const res = await fetch("https://api.github.com/repos/" + slug + "/releases/latest", { headers, signal: ac.signal, redirect: "follow" });
+    if (!res.ok) {
+      if (res.status === 404) throw new Error("仓库或 Release 不存在：" + slug + "（还没发布过 Release？）");
+      if (res.status === 403 || res.status === 429) throw new Error("GitHub API 限流（HTTP " + res.status + "）：稍后重试，或配置 settings." + UPDATE_TOKEN_KEY);
+      throw new Error("GitHub API HTTP " + res.status);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 检查更新：**永不抛错、永不 500**。
+ * ok:true  → { current, latest, hasUpdate, publishedAt, url, notes, assetName, assetSize, checkedAt, fromCache }
+ * ok:false → { error, current, checkedAt }
+ */
+async function runUpdateCheck(repo: Repo, current: string, force: boolean): Promise<Record<string, unknown>> {
+  const checkedAt = new Date().toISOString();
+  const failed = (error: string): Record<string, unknown> => ({ ok: false, error, current, checkedAt });
+  try {
+    if (!parseVersion(current)) return failed("当前应用版本号无法解析：" + String(current));
+    const slug = updateRepoSlug(repo);
+    if (!slug) return failed("settings." + UPDATE_REPO_KEY + " 形状不合法（应为 owner/repo）：" + (repo.getSetting(UPDATE_REPO_KEY) ?? ""));
+
+    const cached = readUpdateCache(repo);
+    if (!force && cached && cached.repo === slug) {
+      const age = Date.now() - Date.parse(cached.checkedAt);
+      if (Number.isFinite(age) && age >= 0 && age < UPDATE_CACHE_TTL_MS) {
+        return { ...cached.payload, fromCache: true, checkedAt: cached.checkedAt };
+      }
+    }
+
+    const rel = await fetchLatestRelease(slug, (repo.getSetting(UPDATE_TOKEN_KEY) ?? "").trim());
+    const tag = String(rel?.tag_name ?? "").trim();
+    if (!parseVersion(tag)) return failed("Release tag 无法解析为版本号：" + (tag || "(空)"));
+    const latest = stripVersionPrefix(tag);
+    const assets: any[] = Array.isArray(rel?.assets) ? rel.assets : [];
+    // 资产优先挑 portable 包；没有就取第一个
+    const asset = assets.find((a) => /portable/i.test(String(a?.name ?? ""))) ?? assets[0] ?? null;
+    const payload: Record<string, unknown> = {
+      ok: true,
+      current,
+      latest,
+      hasUpdate: compareVersions(latest, current) > 0,
+      publishedAt: typeof rel?.published_at === "string" ? rel.published_at : null,
+      url: typeof rel?.html_url === "string" && rel.html_url ? rel.html_url : "https://github.com/" + slug + "/releases/tag/" + tag,
+      notes: (typeof rel?.body === "string" ? rel.body : "").slice(0, UPDATE_NOTES_LIMIT),
+      assetName: asset ? String(asset.name ?? "") : null,
+      assetSize: asset && Number.isFinite(Number(asset.size)) ? Number(asset.size) : null,
+      checkedAt,
+      fromCache: false,
+    };
+    try { repo.setSetting(UPDATE_CACHE_KEY, JSON.stringify({ repo: slug, checkedAt, payload })); } catch { /* 缓存写失败不影响本次结果 */ }
+    return payload;
+  } catch (e) {
+    return failed(String((e as any)?.message ?? e));
+  }
+}
 
 export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
@@ -598,6 +698,32 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return { ok: true };
     } catch (e) { return fail(reply, e); }
   });
+  // ---------- 工程"实际引用"（登记导入 ≠ 工程里真的有）----------
+  /** 扫工程 Assets/ 的 GUID 与素材库 GUID 求交，整表替换 project_refs。可能要跑几十秒（预算默认 45s）。 */
+  app.post("/api/projects/:id/scan-usage", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const budgetMs = b?.budgetMs !== undefined ? toInt(b.budgetMs, 0) : 0;
+      return await scanProjectUsage(repo, toInt((req.params as any).id, 0), budgetMs > 0 ? { budgetMs } : {});
+    } catch (e) { return fail(reply, e); }
+  });
+  /** 这个条目被哪些工程**真的用到**（没扫过 → projects 为空数组，不是错误）。 */
+  app.get("/api/items/:id/usage", async (req, reply) => {
+    try {
+      const itemId = toInt((req.params as any).id, 0);
+      if (!itemId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "id 非法" } });
+      return { itemId, projects: itemUsage(repo, itemId) };
+    } catch (e) { return fail(reply, e); }
+  });
+  /** 这个工程**真的用到**了哪些素材（按命中文件数降序）。 */
+  app.get("/api/projects/:id/usage", async (req, reply) => {
+    try {
+      const projectId = toInt((req.params as any).id, 0);
+      const p = (repo.listProjects() as any[]).find((x) => Number(x.id) === projectId);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "工程不存在" } });
+      return { projectId, name: String(p.name ?? ""), items: projectUsage(repo, projectId) };
+    } catch (e) { return fail(reply, e); }
+  });
 
   /**
    * unitypackage 里的资产路径 → {已落地的包文件, guid}。
@@ -908,6 +1034,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     watchPaths: listWatches(repo),
     unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
     unityMcpCandidates: UNITY_MCP_URLS,
+    /** 检查更新的仓库覆盖（owner/repo）；空 = 用内置默认仓库 */
+    updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
   }));
   app.put("/api/settings", async (req, reply) => {
     try {
@@ -917,8 +1045,31 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         repo.setSetting("download_root", b.downloadRoot.trim());
       }
       if (typeof b.unityMcpUrl === "string") repo.setSetting("unity_mcp_url", b.unityMcpUrl.trim());
-      return { downloadRoot: downloadRootOf(repo, deps.dataDir), unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim() };
+      // 检查更新的仓库覆盖：空串 = 清掉（回到内置默认）；形状非法直接 400，别让脏值悄悄留库
+      if (typeof b.updateRepo === "string") {
+        const v = b.updateRepo.trim();
+        if (v && !REPO_SLUG_RE.test(v)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "updateRepo 形状应为 owner/repo" } });
+        repo.setSetting(UPDATE_REPO_KEY, v);
+      }
+      return {
+        downloadRoot: downloadRootOf(repo, deps.dataDir),
+        unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
+        updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
+      };
     } catch (e) { return fail(reply, e); }
+  });
+
+  // ---------- 检查更新 ----------
+  /**
+   * 契约（冻结）：永远 200。
+   * 成功 → {ok:true, current, latest, hasUpdate, publishedAt, url, notes, assetName, assetSize, checkedAt, fromCache}
+   * 失败 → {ok:false, error, current, checkedAt}（联网失败/限流/tag 解析不了都走这里，**绝不 500**）
+   * ?force=1 绕过 6h 缓存；仓库地址（settings.update_repo）变化时缓存自动失效。
+   */
+  app.get("/api/update-check", async (req) => {
+    const q = (req.query ?? {}) as any;
+    const force = q.force === "1" || q.force === "true" || q.force === 1 || q.force === true;
+    return runUpdateCheck(repo, deps.version, force);
   });
 
   // ---------- BOOTH 下载（协议接管 / 手动粘贴下载链接）----------

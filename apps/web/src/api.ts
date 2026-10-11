@@ -13,9 +13,10 @@ import type {
   AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BoothPeekResponse,
   DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
   DuplicateLevel, DuplicateMatch, HealthResponse,
-  ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, JobIdResponse, JobsResponse, JobActionResponse,
-  RecomputeResponse, RelatedLevel, RelatedMatch,
-  RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse, ViewMode,
+  ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
+  RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
+  RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse,
+  UpdateCheckResponse, ViewMode,
 } from "./types";
 
 export const API_BASE = "/api";
@@ -322,6 +323,45 @@ export async function matchAvatars(id: number): Promise<JobIdResponse> {
   return jobIdResponse(await request<unknown>("POST", "/items/" + id + "/match-avatars"));
 }
 
+// ---------------- 检查更新 ----------------
+/**
+ * 检查应用更新（GET /api/update-check?force=1）。
+ * 契约：**永远 200**，失败也是 {ok:false,error,current,checkedAt}；这里再做一层形状归一化。
+ * 内置 mock 模式下后端不可达 → 直接返回 ok:false 的降级对象（不抛，按钮只 toast 一行）。
+ */
+export async function checkAppUpdate(force = false): Promise<UpdateCheckResponse> {
+  const nowIso = (): string => new Date().toISOString();
+  if (mode === "mock") {
+    return { ok: false, error: "内置 mock 数据模式：后端不可达，暂时无法检查更新", current: "?", checkedAt: nowIso() };
+  }
+  try {
+    const raw = rec(await request<unknown>("GET", "/update-check" + queryString({ force: force ? 1 : undefined })));
+    if (raw.ok === false) {
+      return {
+        ok: false,
+        error: typeof raw.error === "string" && raw.error ? raw.error : "检查更新失败（服务端没给出原因）",
+        current: typeof raw.current === "string" ? raw.current : "?",
+        checkedAt: typeof raw.checkedAt === "string" ? raw.checkedAt : nowIso(),
+      };
+    }
+    return {
+      ok: true,
+      current: typeof raw.current === "string" ? raw.current : "?",
+      checkedAt: typeof raw.checkedAt === "string" ? raw.checkedAt : nowIso(),
+      latest: typeof raw.latest === "string" ? raw.latest : undefined,
+      hasUpdate: raw.hasUpdate === true,
+      publishedAt: typeof raw.publishedAt === "string" ? raw.publishedAt : null,
+      url: typeof raw.url === "string" ? raw.url : undefined,
+      notes: typeof raw.notes === "string" ? raw.notes : "",
+      assetName: typeof raw.assetName === "string" ? raw.assetName : null,
+      assetSize: Number.isFinite(Number(raw.assetSize)) ? Number(raw.assetSize) : null,
+      fromCache: raw.fromCache === true,
+    };
+  } catch (e) {
+    return { ok: false, error: describeError(e), current: "?", checkedAt: nowIso() };
+  }
+}
+
 // ---------------- 头像 ----------------
 export async function listAvatars(q?: { q?: string; ownedOnly?: boolean }): Promise<AvatarsResponse> {
   const raw = await request<unknown>("GET", "/avatars" + queryString({ q: q?.q, ownedOnly: q?.ownedOnly ? 1 : undefined }));
@@ -451,6 +491,44 @@ export async function listProjects(): Promise<{ projects: ProjectRow[] }> {
 }
 export function recordImport(projectId: number, itemId: number, assetId?: number): Promise<unknown> {
   return request("POST", "/projects/" + projectId + "/imports", { itemId, assetId });
+}
+
+/**
+ * 这个条目被哪些工程**真的用到**（GUID 求交，不是 project_imports 的登记）。
+ * 后端没有这个端点（旧版）或还没扫过 → 返回空数组，调用方静默（不弹错、不崩）。
+ * 形状一律经 rec/arr/numOr 归一化：裸数组、{projects:[]}、缺字段都吃。
+ */
+export async function itemUsage(itemId: number): Promise<ItemUsageResponse> {
+  const raw = await request<unknown>("GET", "/items/" + itemId + "/usage", undefined, { timeoutMs: 15000 });
+  const r = rec(raw);
+  const projects = arr<Record<string, unknown>>(r.projects).map((p) => ({
+    projectId: numOr(p.projectId, 0),
+    name: typeof p.name === "string" ? p.name : "",
+    path: typeof p.path === "string" ? p.path : "",
+    files: numOr(p.files, 0),
+    paths: arr<unknown>(p.paths).map((x) => String(x)),
+  }));
+  return { itemId: numOr(r.itemId, itemId), projects };
+}
+
+/**
+ * 扫这个工程 Assets/ 的 GUID 并与素材库求交（会写 project_refs；后端可能要跑几十秒 → 120s 超时）。
+ * 未实现的旧后端 → 404 ApiError，调用方自己兜住。
+ */
+export async function scanProjectUsage(projectId: number): Promise<ScanUsageResponse> {
+  const raw = await request<unknown>("POST", "/projects/" + projectId + "/scan-usage", undefined, { timeoutMs: 120000 });
+  const r = rec(raw);
+  return {
+    projectId: numOr(r.projectId, projectId),
+    scannedFiles: numOr(r.scannedFiles, 0),
+    guidCount: numOr(r.guidCount, 0),
+    matchedGuids: numOr(r.matchedGuids, 0),
+    matchedItems: numOr(r.matchedItems, 0),
+    matchedAssets: numOr(r.matchedAssets, 0),
+    truncated: r.truncated === true,
+    remaining: r.remaining === true,
+    ms: numOr(r.ms, 0),
+  };
 }
 
 // ---------------- 其它 ----------------
