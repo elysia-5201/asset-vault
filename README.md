@@ -1,3 +1,4 @@
+事先声明本项目目前仅由我本人需求进行构建，完全是许愿式编程，不喜欢可以绕道走，有想法欢迎提，谢谢配合。
 # AssetVault · 资源库
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
