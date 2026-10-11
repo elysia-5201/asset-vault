@@ -299,6 +299,10 @@ button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-colo
   display: flex; align-items: center; gap: 5px; overflow-x: auto; overflow-y: hidden;
   padding: 1px 1px 3px; scrollbar-width: thin;
 }
+/* 展开态：换行 + 竖向滚动（标签可能上百个，别把筛选区顶开） */
+.cat-bar.tag-open { flex-wrap: wrap; max-height: 148px; overflow-y: auto; overflow-x: hidden; align-items: center; }
+.tag-q { flex: 1 1 180px; min-width: 120px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg-hi); color: var(--fg); font-size: 12px; }
+.cat-chip.tag-more { border-style: dashed; color: var(--fg-dim); }
 .cat-bar::-webkit-scrollbar { height: 6px; }
 .cat-bar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
 .cat-bar-label { flex: 0 0 auto; color: var(--fg-mute); font-size: 11px; margin-right: 1px; }

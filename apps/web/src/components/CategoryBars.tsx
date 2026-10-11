@@ -6,6 +6,7 @@
  * - 二级栏：随所选一级动态渲染，首项「全部<一级名>」；无子分类的一级（如「未分类」）**不占位**。
  * - 键盘：Tab 聚焦 + ←/→ 在同类 chip 间移动焦点并选中（分类栏是单选语义），焦点环见 styles.css 的 :focus-visible。
  */
+import { useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { CategoryNode, TagRow } from "@core/contracts";
 import { UNCATEGORIZED_ID, UNCATEGORIZED_LABEL } from "@core/categories/taxonomy";
@@ -109,7 +110,13 @@ export function CategoryBars(props: {
   );
 }
 
-/** 标签多选栏：颜色点 + 多选 + ANY/ALL（v3 §4/§5；旧的单值 tag 下拉仍保留在筛选网格里）。 */
+/**
+ * 标签多选栏：颜色点 + 多选 + ANY/ALL（v3 §4/§5；旧的单值 tag 下拉仍保留在筛选网格里）。
+ *
+ * 真实库的标签可能成百上千（BOOTH 话题标签会被一并收进来，实测 596 个），**不能全铺出来**，
+ * 否则标签栏会把整个筛选区冲爆。所以：已选中的标签永远显示；其余按使用次数排序，默认只给前 12 个，
+ * 剩下的折叠进「更多标签（+N）」——展开后可横向换行 + 竖向滚动，并提供搜索框。
+ */
 export function TagFilterBar(props: {
   tags: (TagRow | TagListRow)[];
   selected: string[];
@@ -118,33 +125,58 @@ export function TagFilterBar(props: {
   onMatch: (m: "any" | "all") => void;
   onClear: () => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
   if (!props.tags.length) return null;
+  const LIMIT = 12;
   const sel = new Set(props.selected);
+  const byUse = [...props.tags].sort((a, b) =>
+    ((b as TagListRow).itemCount ?? 0) - ((a as TagListRow).itemCount ?? 0) || a.name.localeCompare(b.name));
+  const selectedTags = byUse.filter((t) => sel.has(t.name));
+  const rest = byUse.filter((t) => !sel.has(t.name));
+  const needle = q.trim().toLowerCase();
+  const shown = open ? (needle ? rest.filter((t) => t.name.toLowerCase().includes(needle)) : rest) : rest.slice(0, LIMIT);
+  const more = rest.length - shown.length;
+  const chip = (t: TagRow | TagListRow) => {
+    const on = sel.has(t.name);
+    const n = (t as TagListRow).itemCount;
+    return (
+      <button
+        key={t.id}
+        data-chip=""
+        type="button"
+        className={"cat-chip tag-cat-chip" + (on ? " on" : "")}
+        aria-pressed={on}
+        title={"标签「" + t.name + "」" + (t.namespace ? "（namespace=" + t.namespace + "）" : "") + (typeof n === "number" ? " · " + n + " 条" : "")}
+        onClick={() => props.onToggle(t.name)}
+        onKeyDown={chipKeyNav}
+      >
+        <span className="tag-dot" style={{ background: t.color ?? "var(--fg-mute)" }} />
+        {t.name}
+        {typeof n === "number" && <span className="cat-chip-n">{n}</span>}
+      </button>
+    );
+  };
   return (
     <div className="tag-bar">
       <span className="cat-bar-label">标签</span>
-      <div className="cat-bar" role="group" aria-label="标签多选">
-        {props.tags.map((t) => {
-          const on = sel.has(t.name);
-          const n = (t as TagListRow).itemCount;
-          return (
-            <button
-              key={t.id}
-              data-chip=""
-              type="button"
-              className={"cat-chip tag-cat-chip" + (on ? " on" : "")}
-              aria-pressed={on}
-              title={"标签「" + t.name + "」" + (t.namespace ? "（namespace=" + t.namespace + "）" : "") + (typeof n === "number" ? " · " + n + " 条" : "")}
-              onClick={() => props.onToggle(t.name)}
-              onKeyDown={chipKeyNav}
-            >
-              <span className="tag-dot" style={{ background: t.color ?? "var(--fg-mute)" }} />
-              {t.name}
-              {typeof n === "number" && <span className="cat-chip-n">{n}</span>}
-            </button>
-          );
-        })}
+      <div className={"cat-bar" + (open ? " tag-open" : "")} role="group" aria-label="标签多选">
+        {selectedTags.map(chip)}
+        {shown.map(chip)}
+        {!open && more > 0 && (
+          <button type="button" className="cat-chip tag-more" onClick={() => setOpen(true)}
+            title={"还有 " + more + " 个标签未显示（按使用次数排序，点开可搜索）"}>
+            更多标签（+{more}）
+          </button>
+        )}
+        {open && needle && shown.length === 0 && <span className="hint">没有匹配「{q}」的标签</span>}
       </div>
+      {open && (
+        <span className="row" style={{ gap: "6px", marginTop: "6px", alignItems: "center" }}>
+          <input className="tag-q" value={q} onChange={(e) => setQ(e.target.value)} placeholder={"在 " + rest.length + " 个标签里搜索…"} />
+          <button type="button" className="btn tiny" onClick={() => { setOpen(false); setQ(""); }}>收起</button>
+        </span>
+      )}
       {props.selected.length > 1 && (
         <span className="seg" title="多标签语义：命中任一标签 / 必须同时具有全部标签">
           <button className={props.match === "any" ? "on" : ""} onClick={() => props.onMatch("any")}>ANY</button>
