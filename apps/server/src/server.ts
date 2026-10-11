@@ -11,6 +11,7 @@ import { JobRunner } from "./jobs/runner";
 import { InboxWatcher } from "./services/watcher";
 import { registerRoutes } from "./http/routes";
 import { BoothClient } from "../../../packages/core/src/source/booth";
+import { DEFAULT_TAGS, TAGS_SEED_VERSION } from "../../../packages/core/src/categories/default-tags";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -63,6 +64,8 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   const db = openDatabase(dbPath, opts.schemaFile);
   const repo = new Repo(db);
   const seeded = seedAvatars(repo, opts.seedFile);
+  // v3 §4-2：默认标签**只播种一次**（settings.tags_seed_version）——用户删掉的不会被复活。
+  const seededTags = repo.seedDefaultTags(DEFAULT_TAGS, TAGS_SEED_VERSION);
   const media = new MediaStore(mediaDir);
   const booth = new BoothClient({ minIntervalMs: 700 });
   const recovered = repo.recoverInFlight();
@@ -96,6 +99,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     runner.start(400);
     watcher.sync();
     log("AssetVault up on http://" + host + ":" + port + " (db=" + dbPath + ", seeded=" + seeded + ", recovered=" + recovered + ")");
+    if (seededTags > 0) log("default tags seeded: " + seededTags + " (v" + TAGS_SEED_VERSION + ")");
     if (process.env.ASSETVAULT_VERBOSE) console.log("AssetVault up on http://" + host + ":" + port);
     return {
       app, repo, media, booth, runner, watcher, dataDir, port, url: "http://" + host + ":" + port, log,
@@ -109,7 +113,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     };
   }
 
-  log("AssetVault embedded mode (db=" + dbPath + ", seeded=" + seeded + ")");
+  log("AssetVault embedded mode (db=" + dbPath + ", seeded=" + seeded + ", tagsSeeded=" + seededTags + ")");
   return {
     app: null, repo, media, booth, runner, watcher, dataDir, port: 0, url: "", log,
     close: async () => { runner.stop(); try { await watcher.close(); } catch { /* noop */ } try { db.close(); } catch { /* noop */ } logStream.end(); },

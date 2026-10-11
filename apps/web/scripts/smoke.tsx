@@ -9,6 +9,7 @@ import { mockHandle, MockHttpError } from "../src/mock";
 import { ItemCardView } from "../src/components/ItemCardView";
 import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
+import { CategoryManager } from "../src/components/CategoryManager";
 
 type Fail = string;
 const fails: Fail[] = [];
@@ -132,18 +133,18 @@ expect(req("GET", "/items?pendingCategory=1").body.total === cats.body.stats.pen
 const catItems = req("GET", "/items?catIds=clothing");
 expect(catItems.body.total > 0, "catIds=clothing 过滤命中 " + catItems.body.total + " 条");
 expect(catItems.body.items.every((i: any) => i.category && (i.category.categoryId === "clothing" || i.category.subCategoryId === "clothing.tops")), "catIds 过滤结果都真的属于 clothing");
-const catOne = req("GET", "/items?catIds=hair.texture");
-expect(catOne.body.total === 1 && catOne.body.items[0].id === 3, "子分类 catIds=hair.texture 命中 1 条（已停用的分类仍能按归属筛出）");
+const catOne = req("GET", "/items?catIds=hair.set");
+expect(catOne.body.total === 1 && catOne.body.items[0].id === 2, "子分类 catIds=hair.set 命中 1 条（已停用的分类仍能按归属筛出）");
 const un = req("GET", "/items?uncategorized=1");
 expect(un.body.total > 0 && un.body.items.every((i: any) => i.category === null), "uncategorized=1 → 全部 category=null（" + un.body.total + " 条）");
 const pend = req("GET", "/items?pendingCategory=1");
 expect(pend.body.total > 0 && pend.body.items.every((i: any) => i.suggestion !== null), "pendingCategory=1 → 都有 suggestion（" + pend.body.total + " 条）");
 
-const set1 = req("POST", "/items/9/category", { categoryId: "shaders", subCategoryId: "shaders.shader" });
-expect(set1.body.item.cat_id === "shaders" && set1.body.item.cat_sub_id === "shaders.shader" && set1.body.item.cat_source === "manual", "POST /items/:id/category 写入归属（source=manual）");
+const set1 = req("POST", "/items/9/category", { categoryId: "shaders", subCategoryId: "shaders.general" });
+expect(set1.body.item.cat_id === "shaders" && set1.body.item.cat_sub_id === "shaders.general" && set1.body.item.cat_source === "manual", "POST /items/:id/category 写入归属（source=manual）");
 const badCat = (() => { try { req("POST", "/items/9/category", { categoryId: "__nope__" }); return null; } catch (e) { return e as MockHttpError; } })();
 expect(badCat !== null && badCat.status === 400, "非法 categoryId → 400（不静默）");
-const mismatch = req("POST", "/items/9/category", { categoryId: "clothing", subCategoryId: "shaders.shader" });
+const mismatch = req("POST", "/items/9/category", { categoryId: "clothing", subCategoryId: "shaders.general" });
 expect(mismatch.body.item.cat_id === "clothing" && mismatch.body.item.cat_sub_id === null, "子分类不属于主分类 → 自动清空子分类");
 const clear = req("POST", "/items/9/category", { categoryId: null });
 expect(clear.body.item.cat_id === null && clear.body.item.cat_source === null, "categoryId=null → 清除归属（回到未分类）");
@@ -162,7 +163,7 @@ const rl = req("POST", "/categories/reclassify", { itemIds: [9], apply: false })
 has(rl.body, ["scanned", "applied", "suggested", "cleared", "skipped", "protected", "results"], "POST /categories/reclassify 结果形状");
 expect(rl.body.scanned === 1 && rl.body.results[0].itemId === 9, "reclassify(apply=false) 只对指定条目出建议（applied=" + rl.body.applied + " suggested=" + rl.body.suggested + "）");
 
-const batch = req("POST", "/items/category/batch", { itemIds: [9, 10], categoryId: "shaders", subCategoryId: "shaders.shader", mode: "set" });
+const batch = req("POST", "/items/category/batch", { itemIds: [9, 10], categoryId: "shaders", subCategoryId: "shaders.general", mode: "set" });
 has(batch.body, ["updated", "failed", "requested"], "POST /items/category/batch → {updated,failed,requested}");
 expect(batch.body.updated === 2 && batch.body.failed.length === 0, "批量设置分类 2 条成功");
 const batchFail = req("POST", "/items/category/batch", { itemIds: [9, 99999], mode: "clear_sub" });
@@ -186,6 +187,86 @@ const delTop = (() => { try { req("DELETE", "/categories/clothing"); return null
 expect(delTop !== null && delTop.status === 409, "删除有子分类的主分类 → 409 CONFLICT");
 const miss = (() => { try { req("GET", "/categories/__nope__"); return null; } catch (e) { return e as MockHttpError; } })();
 expect(miss !== null && miss.status === 404, "未知分类 → 404");
+
+// ---- ③b v3 端点：筛选 / 计数 / 影响面 / 移动 / 合并 / 删除转移 / 标签 CRUD ----
+const counts = req("GET", "/categories/counts");
+has(counts.body, ["all", "uncategorized", "tops", "subs"], "GET /categories/counts → {all,uncategorized,tops,subs}");
+expect(counts.body.all === req("GET", "/items?limit=999").body.total, "counts.all 与不带分类条件的 /items total 一致（" + counts.body.all + "）");
+expect(counts.body.tops.clothing === req("GET", "/items?catIds=clothing").body.total, "counts.tops.clothing 与 catIds=clothing 一致");
+expect(counts.body.subs["clothing.tops"] === req("GET", "/items?catIds=clothing.tops").body.total, "counts.subs[clothing.tops] 与 catIds=clothing.tops 一致");
+expect(typeof counts.body.tops.uncategorized === "number" && counts.body.tops.uncategorized === counts.body.uncategorized, "counts.tops.uncategorized 与 counts.uncategorized 同源");
+// 计数随其它筛选变化（分类条件本身不参与）
+const fOnly = req("GET", "/categories/counts?favoriteOnly=1");
+const favTotal = req("GET", "/items?favoriteOnly=1&limit=999").body.total;
+expect(fOnly.body.all === favTotal && fOnly.body.all < counts.body.all, "counts 随其它筛选变化（favoriteOnly=1 → " + fOnly.body.all + " < " + counts.body.all + "）");
+const qOnly = req("GET", "/categories/counts?q=" + encodeURIComponent("セーラー"));
+expect(qOnly.body.all === req("GET", "/items?q=" + encodeURIComponent("セーラー")).body.total, "counts 支持关键词筛选（q=セーラー → " + qOnly.body.all + "）");
+
+const impact = req("GET", "/categories/clothing/impact");
+has(impact.body, ["items", "subs", "suggestions"], "GET /categories/:id/impact → {items,subs,suggestions}");
+expect(impact.body.items === req("GET", "/items?catIds=clothing&limit=999").body.total, "impact.items 与 catIds=clothing 的 total 一致（" + impact.body.items + "）");
+expect(impact.body.subs === cats.body.categories.find((t: any) => t.id === "clothing").children.length, "impact.subs = 子分类数");
+const impact404 = (() => { try { req("GET", "/categories/__nope__/impact"); return null; } catch (e) { return e as MockHttpError; } })();
+expect(impact404 !== null && impact404.status === 404, "未知分类 impact → 404");
+
+// 移动子分类（ID 不变）
+const beforeMove = cats.body.categories.find((t: any) => t.id === "other").children.map((c: any) => c.id);
+const moved = req("POST", "/categories/other.unclassed/move", { parentId: "textures" });
+expect(moved.body.category.parentId === "textures" && moved.body.category.id === "other.unclassed", "POST /categories/:id/move 换父且 ID 不变");
+expect(req("GET", "/categories").body.categories.find((t: any) => t.id === "textures").children.some((c: any) => c.id === "other.unclassed"), "移动后出现在新父分类的子列表里");
+const movedBack = req("POST", "/categories/other.unclassed/move", { parentId: "other" });
+expect(movedBack.body.category.parentId === "other" && beforeMove.includes("other.unclassed"), "移回原父分类（ID 仍是 other.unclassed）");
+const moveBad = (() => { try { req("POST", "/categories/clothing/move", { parentId: "other" }); return null; } catch (e) { return e as MockHttpError; } })();
+expect(moveBad !== null && moveBad.status === 400, "一级分类不能移动 → 400");
+
+// 删除：转移目标生效，系统分类 409，素材不丢
+const beforeUncat = req("GET", "/items?uncategorized=1&limit=999").body.total;
+const mk = req("POST", "/categories", { name: "__smoke_del", parentId: "clothing" });
+const mkId = String(mk.body.category.id);
+req("POST", "/items/9/category", { categoryId: "clothing", subCategoryId: mkId });
+const delImpact = req("GET", "/categories/" + encodeURIComponent(mkId) + "/impact");
+expect(delImpact.body.items === 1, "删除前影响面统计到 1 条素材（" + delImpact.body.items + "）");
+const delOk = req("DELETE", "/categories/" + encodeURIComponent(mkId) + "?transferTo=none");
+expect(delOk.body.movedSubs === 1 && delOk.body.moved === 0 && delOk.body.deleted === 1, "DELETE 子分类 ?transferTo=none → 该子分类下的素材整条回未分类并删分类（movedSubs=" + delOk.body.movedSubs + " moved=" + delOk.body.moved + "）");
+expect(req("GET", "/items?uncategorized=1&limit=999").body.total === beforeUncat + 1, "被删分类的素材回到未分类（不删素材）");
+const sysDel = (() => { try { req("DELETE", "/categories/clothing?transferTo=none"); return null; } catch (e) { return e as MockHttpError; } })();
+expect(sysDel !== null && sysDel.status === 409, "删除系统分类 → 409 CONFLICT");
+
+// 合并：同级、非系统源；素材迁到目标
+const mkA = req("POST", "/categories", { name: "__smoke_merge_a", parentId: "textures" });
+const mkB = req("POST", "/categories", { name: "__smoke_merge_b", parentId: "textures" });
+const idA = String(mkA.body.category.id); const idB = String(mkB.body.category.id);
+req("POST", "/items/10/category", { categoryId: "textures", subCategoryId: idA });
+const merged = req("POST", "/categories/" + encodeURIComponent(idA) + "/merge", { intoId: idB });
+expect(merged.body.moved === 1 && merged.body.deleted === 1, "POST /categories/:id/merge 迁移素材并删除源（moved=" + merged.body.moved + "）");
+expect(req("GET", "/categories").body.categories.flatMap((t: any) => t.children ?? []).some((c: any) => c.id === idA) === false, "合并后源分类不再出现");
+const mergeSys = (() => { try { req("POST", "/categories/clothing/merge", { intoId: "makeup" }); return null; } catch (e) { return e as MockHttpError; } })();
+expect(mergeSys !== null && mergeSys.status === 409, "系统分类作为合并源 → 409");
+req("DELETE", "/categories/" + encodeURIComponent(idB) + "?transferTo=none");
+
+// 标签 CRUD（v3 §4）
+const tagList = req("GET", "/tags");
+has(tagList.body.tags[0], ["id", "name", "namespace", "color", "sort", "itemCount"], "GET /tags 含 color/sort/itemCount");
+const tagNew = req("POST", "/tags", { name: "__smoke_tag_v3", color: "#ff00aa" });
+expect(tagNew.status === 201 && tagNew.body.tag.color === "#ff00aa", "POST /tags → 201 {tag}（含颜色）");
+const tagDup = req("POST", "/tags", { name: "__smoke_tag_v3" });
+expect(tagDup.status === 200 && tagDup.body.tag.id === tagNew.body.tag.id, "POST /tags 同名幂等：返回已存在的那个，不重复创建（status=" + tagDup.status + "）");
+req("POST", "/items/1/tags", { tags: ["__smoke_tag_v3"] });
+const tagPatched = req("PATCH", "/tags/" + tagNew.body.tag.id, { name: "__smoke_tag_v3b", color: "#00ff00" });
+expect(tagPatched.body.tag.name === "__smoke_tag_v3b" && tagPatched.body.tag.color === "#00ff00", "PATCH /tags/:id 改名改色");
+expect((req("GET", "/items/1").body.tags as string[]).includes("__smoke_tag_v3b"), "改名后素材关联跟随（按 id 关联，不丢）");
+const tagDel = req("DELETE", "/tags/" + tagNew.body.tag.id);
+expect(tagDel.body.removed === 1, "DELETE /tags/:id → {removed:" + tagDel.body.removed + "}（只删关联，不删素材）");
+expect(req("GET", "/items/1").body.item.title.length > 0 && (req("GET", "/items/1").body.tags as string[]).includes("__smoke_tag_v3b") === false, "删除标签后素材仍在，只是关联没了");
+const tagBad = (() => { try { req("POST", "/tags", { name: "__smoke_tag_bad", color: "red" }); return null; } catch (e) { return e as MockHttpError; } })();
+expect(tagBad !== null && tagBad.status === 400, "非法颜色 → 400");
+
+// 组合筛选：标签 ANY/ALL + 收藏 + 分类叠加
+const tagAny = req("GET", "/items?tags=" + encodeURIComponent("衣装") + "," + encodeURIComponent("無料"));
+const tagAll = req("GET", "/items?tags=" + encodeURIComponent("衣装") + "," + encodeURIComponent("無料") + "&tagsMatch=all");
+expect(tagAny.body.total > tagAll.body.total && tagAll.body.total >= 0, "tags ANY/ALL：all 是 any 的子集（any=" + tagAny.body.total + " all=" + tagAll.body.total + "）");
+const combo = req("GET", "/items?catIds=clothing&tags=" + encodeURIComponent("衣装") + "&favoriteOnly=1");
+expect(combo.body.items.every((i: any) => i.favorite === 1 && (i.category?.categoryId === "clothing")), "组合筛选（分类+标签+收藏）结果同时满足全部条件（" + combo.body.total + " 条）");
 
 // ---- ④ 分类 UI 的真实数据 SSR 渲染（App 的 SSR 阶段 categories 还是空数组，这里带上数据单独渲染） ----
 const render = (label: string, el: ReturnType<typeof createElement>): string => {
@@ -217,17 +298,41 @@ expect(cardPick.includes("card sel") && cardPick.includes('type="checkbox"') && 
 const cardNoPick = mkCard({ category: null, suggestion: null });
 expect(!cardNoPick.includes('class="pick'), "卡片：非选择模式不渲染复选框（不复用整卡点击）");
 
-const baseFilters = { site: "", status: "", container: "", tag: "", imported: "any", sort: "updated", catIds: [] as string[], catMatch: "any" as const, uncategorized: false, pendingCategory: false };
+const baseFilters = { site: "", status: "", container: "", tag: "", imported: "any", sort: "updated", catTop: "", catSub: "", pendingCategory: false, tags: [] as string[], tagsMatch: "any" as const, favoriteOnly: false };
+const catCounts = req("GET", "/categories/counts").body;
+const tagRows = req("GET", "/tags").body.tags;
 const sbProps = {
-  text: "", onText: () => {}, atAvatars: [], unresolved: [], onRemoveAt: () => {}, tags: [], loading: false, total: 9,
-  filters: baseFilters, onFilters: () => {}, categories: cats.body.categories, catStats: cats.body.stats, catErr: "",
+  text: "", onText: () => {}, atAvatars: [], unresolved: [], onRemoveAt: () => {}, tags: tagRows, loading: false, total: 9,
+  filters: baseFilters, onFilters: () => {}, categories: cats.body.categories, catCounts, countsScope: "filtered" as const, catErr: "",
 };
 const sb = render("SearchBar(categories)", createElement(SearchBar, sbProps as any));
-expect(sb.includes("服装") && sb.includes("未分类") && sb.includes("待确认") && sb.includes("cat-filter"), "筛选：分类树 chip + 未分类/待确认 + 计数渲染");
-const sbActive = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, catIds: ["clothing"] } } as any));
-expect(sbActive.includes("清除分类筛选") && sbActive.includes("tag-chip on"), "筛选：选中分类后出现「清除分类筛选」与 .on 态");
-const sbErr = renderToString(createElement(SearchBar, { ...sbProps, categories: [], catStats: null, catErr: "加载分类失败：后端未提供分类接口（NOT_FOUND：mock 未实现）" } as any));
+expect(sb.includes("服饰") && sb.includes("未分类") && sb.includes("待确认") && sb.includes("cat-chip"), "一级分类栏：一级 chip 渲染（服饰/未分类/待确认）");
+expect(sb.includes("cat-chip-n") && sb.includes(String(catCounts.tops.clothing)), "一级分类栏显示当前筛选下的数量（clothing=" + catCounts.tops.clothing + "）");
+const sbTop = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, catTop: "clothing" } } as any));
+expect(sbTop.includes("全部服饰") && sbTop.includes("cat-bar-sub") && sbTop.includes("上衣"), "二级分类栏：切一级后出现「全部服饰」+ 子分类（上衣）");
+expect(sbTop.includes("清除分类筛选") && sbTop.includes("cat-chip on"), "筛选：选中分类后出现「清除分类筛选」与 .on（紫色）态");
+const sbUncat = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, catTop: "uncategorized" } } as any));
+expect(!sbUncat.includes("cat-bar-sub"), "无子分类的一级（未分类）不渲染二级分类栏（不占位）");
+const sbTagMulti = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, tags: ["衣装", "無料"], tagsMatch: "all" } } as any));
+expect(sbTagMulti.includes("tag-dot") && sbTagMulti.includes("清除标签（") && sbTagMulti.includes("seg"), "标签栏：颜色点 + 多选 + ANY/ALL + 清除按钮");
+const sbErr = renderToString(createElement(SearchBar, { ...sbProps, categories: [], catCounts: null, catErr: "加载分类失败：后端未提供分类接口（NOT_FOUND：mock 未实现）" } as any));
 expect(sbErr.includes("后端未提供分类接口"), "筛选：分类接口 404 时显式提示（不静默）");
+
+// 卡片：标签最多 3 个 + “+N”
+const cardTags = mkCard({ category: null, suggestion: null, tags: ["a", "b", "c", "d"] }, { tagColors: { a: "#111111" } });
+const exactTagChips = (cardTags.match(/class="card-tag"/g) ?? []).length;
+expect(exactTagChips === 3 && cardTags.includes("card-tag more") && cardTags.includes(">+1<"), "卡片：标签最多显示 3 个（实际 " + exactTagChips + "），其余“+N”");
+expect(cardTags.includes("tag-dot") && cardTags.includes("#111111"), "卡片：标签带颜色点（从 GET /api/tags 的 color 来）");
+const cardTitle = mkCard({ title: "很长的标题".repeat(20), category: null, suggestion: null });
+expect(cardTitle.includes('title="' + "很长的标题".repeat(20) + '"'), "卡片：标题截断但 title 属性带完整标题");
+
+// 分类管理浮层 / 标签管理（SSR 无 useEffect，只验证结构不抛错）
+const mgr = render("CategoryManager", createElement(CategoryManager, {
+  categories: cats.body.categories, catStats: cats.body.stats, catErr: "", tags: tagRows,
+  onClose: () => {}, onToast: () => {}, onChanged: () => {},
+} as any));
+expect(mgr.includes("分类管理") && mgr.includes("新增一级") && mgr.includes("标签"), "分类管理浮层：左树 + 新增一级 + 标签页签渲染");
+expect(mgr.includes("mark") && mgr.includes("系统") && mgr.includes("未分类"), "分类管理：系统标记（builtin）+ 未分类入口渲染");
 
 const editor = render("CategoryEditor", createElement(CategoryEditor, { detail: req("GET", "/items/6").body, onToast: () => {}, onSaved: () => {} } as any));
 expect(editor.includes("主分类") === false && editor.includes("载入分类树"), "详情页分类编辑区：SSR 阶段（未跑 useEffect）渲染载入态而非报错");

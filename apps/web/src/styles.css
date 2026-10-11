@@ -48,7 +48,11 @@ a { color: var(--accent); }
 .brand { display: flex; align-items: center; gap: 9px; padding: 12px; border-bottom: 1px solid var(--line); }
 .brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), var(--violet)); display: grid; place-items: center; font-weight: 800; font-size: 13px; color: #08111c; }
 .brand .t { font-weight: 700; letter-spacing: .02em; }
-.brand .s { font-size: 11px; color: var(--fg-mute); }
+.brand .s { font-size: 11px; color: var(--fg-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 左栏品牌区里还挂着工具按钮（查重/分类管理/批量分类/检查更新）：按钮多了会把"后端·条目数"压成 0 宽
+   （文字按字换行、品牌区被撑到 200px+ 高）。这里让按钮换行到第二行，文字块占满第一行并省略号。 */
+.brand { flex-wrap: wrap; row-gap: 8px; }
+.brand > span[style] { flex: 1 1 150px; min-width: 0; }
 
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; border-radius: 999px; font-size: 11px; line-height: 1.6; border: 1px solid var(--line); background: var(--bg-hi); color: var(--fg-dim); white-space: nowrap; }
 .badge.ok { color: var(--ok); border-color: rgba(67,192,122,.45); background: rgba(67,192,122,.12); }
@@ -286,3 +290,81 @@ button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-colo
 .cat-ev .v { color: var(--fg-dim); word-break: break-all; flex: 1 1 auto; }
 .cat-ev .g { color: var(--ok); flex: 0 0 auto; }
 .cat-suggest { border-color: rgba(224,165,46,.4); background: rgba(224,165,46,.10); color: var(--fg); }
+
+/* ---------- 分类体系 v3：一级/二级分类栏 + 标签多选栏 ---------- */
+.cat-bars { display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed var(--line-soft); padding-top: 6px; }
+.cat-bars.busy { opacity: .78; }
+/* 横向滚动，不挤压卡片网格：chip 一律 flex:0 0 auto，容器自己滚动 */
+.cat-bar {
+  display: flex; align-items: center; gap: 5px; overflow-x: auto; overflow-y: hidden;
+  padding: 1px 1px 3px; scrollbar-width: thin;
+}
+.cat-bar::-webkit-scrollbar { height: 6px; }
+.cat-bar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.cat-bar-label { flex: 0 0 auto; color: var(--fg-mute); font-size: 11px; margin-right: 1px; }
+.cat-bar-sub .cat-bar-label { color: var(--fg-dim); }
+.cat-chip {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-size: 11.5px; line-height: 1.5; padding: 2px 9px; border-radius: 999px;
+  background: var(--bg-hi); border: 1px solid var(--line); color: var(--fg-dim);
+}
+.cat-chip:hover { color: var(--fg); border-color: #3a4757; }
+/* 选中用紫色强调（中性底 + 紫边/紫字），与 --accent 的蓝色体系区分开 */
+.cat-chip.on {
+  color: #e6dcff; background: rgba(169,123,255,.16); border-color: rgba(169,123,255,.6);
+  box-shadow: inset 0 0 0 1px rgba(169,123,255,.22);
+}
+.cat-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button.cat-chip:disabled { opacity: .45; cursor: not-allowed; }
+.cat-chip-n { font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); }
+.cat-chip.on .cat-chip-n { color: #cfc0ff; }
+.cat-bar-err { margin-top: 2px; }
+
+.tag-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; border-top: 1px dashed var(--line-soft); padding-top: 6px; }
+.tag-bar .cat-bar { flex: 1 1 380px; min-width: 0; }
+.tag-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 1px rgba(255,255,255,.14) inset; }
+.tag-cat-chip { padding-left: 7px; }
+.chk-cell { justify-content: flex-end; }
+
+/* ---------- 卡片：标签（最多 3 + “+N”）---------- */
+.card-tag {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; line-height: 1.6;
+  padding: 0 6px; border-radius: 999px; background: #131a23; border: 1px solid var(--line-soft);
+  color: var(--fg-dim); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-tag.more { color: var(--fg-mute); font-family: var(--mono); }
+
+/* ---------- 分类管理浮层 ---------- */
+.cat-manager { width: min(1000px, 100%); }
+.cat-manager-list { display: flex; flex-direction: column; gap: 2px; }
+.cat-mgr-row {
+  display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; padding: 5px 8px;
+  border-radius: 8px; border: 1px solid transparent; background: transparent; color: var(--fg-dim); font-size: 12px;
+}
+.cat-mgr-row:hover { background: var(--bg-hi); color: var(--fg); }
+.cat-mgr-row.on { border-color: var(--violet); background: rgba(169,123,255,.12); color: var(--fg); }
+.cat-mgr-row.sub { padding-left: 14px; }
+.cat-mgr-row .n { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
+.cat-mgr-row .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-mgr-row .nm.link { background: transparent; border: 0; color: inherit; text-align: left; padding: 0; cursor: pointer; }
+.cat-mgr-row.on .nm.link { color: #e6dcff; }
+.cat-mgr-row .mark {
+  flex: 0 0 auto; font-size: 10px; padding: 0 5px; border-radius: 999px;
+  border: 1px solid rgba(169,123,255,.5); color: var(--violet); background: rgba(169,123,255,.1);
+}
+.cat-mgr-row .mark.off { border-color: rgba(224,165,46,.5); color: var(--warn); background: rgba(224,165,46,.1); }
+.cat-mgr-row .spacer { flex: 1; }
+.cat-danger { border: 1px dashed rgba(232,98,79,.4); border-radius: 9px; padding: 7px 9px; background: rgba(232,98,79,.05); }
+.cat-confirm { border: 1px solid rgba(224,165,46,.45); background: rgba(224,165,46,.08); border-radius: 9px; padding: 8px 10px; display: flex; flex-direction: column; gap: 5px; }
+.tag-mgr-row { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 8px; border: 1px solid transparent; }
+.tag-mgr-row:hover { background: var(--bg-hi); }
+.tag-mgr-row input[type=text] { max-width: 220px; }
+.tag-mgr-row .n { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
+.tag-mgr-row .mark { font-size: 10px; padding: 0 5px; border-radius: 999px; border: 1px solid var(--line); color: var(--fg-mute); }
+input[type=color] { background: #0f141b; border: 1px solid var(--line); border-radius: 6px; height: 26px; cursor: pointer; }
+
+/* 窄屏：分类栏与标签栏换行，管理浮层单列（样式集中在风格里，不靠组件内联） */
+@media (max-width: 1100px) {
+  .tag-bar { align-items: flex-start; }
+  .cat-bar { padding-bottom: 5px; }
+}

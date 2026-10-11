@@ -8,7 +8,7 @@
  *  - `applyCategoryEvidence()` **永不抛错**：分类是锦上添花，异常绝不阻断扫库/导入/入库/元数据更新主流程。
  */
 import {
-  DEFAULT_CATEGORY_THRESHOLDS, evidenceToJson, recommendCategory,
+  DEFAULT_CATEGORY_THRESHOLDS, evidenceToJson, fold, recommendCategory,
   type CategoryEvidenceInput, type CategoryRecommendation, type CategoryThresholds,
 } from "../../../../packages/core/src/categories/classify";
 import type { CategoryLevel } from "../../../../packages/core/src/categories/taxonomy";
@@ -271,4 +271,53 @@ export function reclassifyCategories(repo: Repo, opts: ReclassifyOptions = {}): 
       + " cleared=" + out.cleared + " protected=" + out.protected + " skipped=" + out.skipped);
   } catch { /* log 自己也不许抛 */ }
   return out;
+}
+
+// ---------- 建议标签（v3 §7：只建议，绝不自动写 item_tags）----------
+
+export interface SuggestedTag { name: string; reason: string }
+
+/**
+ * 建议标签规则：只给「标签表里已存在、且该条目还没有」的默认标签提建议。
+ * 关键词只在**已有证据**（标题/日文标题/描述/备注/文件名/包内路径）里找，命中即建议 —— 不落库、不写 item_tags。
+ * 关键词刻意取得保守（宁可漏、不要误报）：标签建议是给人看的，噪音预算很低。
+ */
+const TAG_SUGGEST_RULES: readonly { name: string; keywords: readonly string[] }[] = [
+  { name: "PhysBones", keywords: ["physbone", "phys bone", "揺れもの", "揺れモノ", "ゆれもの"] },
+  { name: "Modular Avatar", keywords: ["modular avatar", "modularavatar", "modular-avatar", "ndmf", "マージャブル"] },
+  { name: "Quest 兼容", keywords: ["vrcquesttools", "quest対応", "quest 対応", "quest版", "oculus quest", "quest standalone"] },
+  { name: "免费", keywords: ["無料", "フリー素材", "free素材", "free asset"] },
+  { name: "哥特风", keywords: ["ゴシック", "gothic", "ゴスロリ"] },
+  { name: "可爱风", keywords: ["かわいい", "可愛", "cute", "kawaii", "ファンシー"] },
+];
+
+/**
+ * 该条目的**建议标签**（只读派生，契约 §7：仅建议，绝不自动写入 item_tags）。
+ *  - 安全忽略：规则指向的标签不在标签表里（用户删掉了 / 还没播种）→ 跳过，不复活、不报错。
+ *  - 已有该标签的条目不再建议（去噪）。
+ *  - **永不抛**：任何异常 → 返回 []（标签建议不许阻断详情页）。
+ */
+export function suggestTagsFor(repo: Repo, itemId: number, limit = 6): SuggestedTag[] {
+  try {
+    const detail = repo.getItem(itemId);
+    if (!detail) return [];
+    const ev = collectEvidence(repo, itemId);
+    const hay = [
+      ev.title, ev.titleJa, ev.description, ev.notes,
+      ...(ev.fileNames ?? []), ...(ev.archivePaths ?? []), ...(ev.unitypackagePaths ?? []),
+    ].filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => fold(s));
+    if (hay.length === 0) return [];
+    const has = new Set(detail.tags.map((t) => (t.includes(":") ? t.slice(t.indexOf(":") + 1) : t)));
+    const known = new Set((repo.listTags() as any[]).map((t: any) => String(t.name)));
+    const out: SuggestedTag[] = [];
+    for (const rule of TAG_SUGGEST_RULES) {
+      if (out.length >= limit) break;
+      if (has.has(rule.name) || !known.has(rule.name)) continue;
+      const hit = rule.keywords.find((kw) => hay.some((h) => h.includes(fold(kw))));
+      if (hit) out.push({ name: rule.name, reason: "证据含「" + hit + "」" });
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }

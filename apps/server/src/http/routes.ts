@@ -11,7 +11,7 @@ import { walkCandidates, registerAssets } from "../services/scan";
 import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
-import type { Repo } from "../db/repo";
+import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
 import { listWatches, setWatches } from "../services/watcher";
@@ -27,7 +27,7 @@ import { itemUsage, projectUsage, scanProjectUsage } from "../services/projectus
 import { relateItems } from "../../../../packages/core/src/related";
 import { compareVersions, parseVersion, stripVersionPrefix } from "../../../../packages/core/src/version";
 import { evidenceToJson } from "../../../../packages/core/src/categories/classify";
-import { applyCategoryEvidence, getCategoryConfig, recommendForItem, reclassifyCategories, setCategoryConfig } from "../services/categories";
+import { applyCategoryEvidence, getCategoryConfig, recommendForItem, reclassifyCategories, setCategoryConfig, suggestTagsFor } from "../services/categories";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -68,6 +68,45 @@ function fail(reply: FastifyReply, e: unknown): FastifyReply {
   return reply.status(status).send({ error: { code, message: String(err?.message ?? err) } });
 }
 let deps_log: (m: string) => void = () => {};
+
+const isTrue = (v: unknown): boolean => v === true || v === 1 || v === "1" || v === "true";
+
+/** 逗号分隔 / 重复键都接受（`?tags=a,b` 与 `&tags=a&tags=b` 等价）。 */
+const csvParam = (v: unknown): string[] =>
+  (v === undefined || v === null ? [] : (Array.isArray(v) ? v : [v]))
+    .flatMap((s) => String(s ?? "").split(","))
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+/**
+ * query → ItemQuery：/api/items 与 /api/categories/counts **共用同一个解析器**，
+ * 保证「counts.all == items.total」这条自洽性不会因为两处参数漂移而破。
+ * v3 新增：tags 多选（tagsMatch=any|all）、favoriteOnly；旧的单个 tag= 保持兼容（同时给出时按 AND 叠加）。
+ */
+function parseItemQuery(q: any): ItemQuery {
+  return {
+    q: q.q,
+    avatarIds: String(q.avatar ?? "").split(",").map((s) => toInt(s, NaN)).filter((n) => Number.isFinite(n)),
+    avatarMatch: q.avatarMatch === "all" ? "all" : "any",
+    ownedOnly: isTrue(q.ownedOnly),
+    site: q.site, status: q.status, tag: q.tag, container: q.container,
+    imported: q.imported === "1" || q.imported === "true" ? true : q.imported === "0" || q.imported === "false" ? false : undefined,
+    collectionId: q.collection ? toInt(q.collection, 0) || undefined : undefined,
+    categoryIds: csvParam(q.catIds), categoryMatch: q.catMatch === "all" ? "all" : "any",
+    uncategorized: isTrue(q.uncategorized),
+    pendingCategory: isTrue(q.pendingCategory),
+    tagNames: csvParam(q.tags), tagMatch: q.tagsMatch === "all" ? "all" : "any",
+    favoriteOnly: isTrue(q.favoriteOnly),
+    sort: q.sort === "title" || q.sort === "size" ? q.sort : "updated",
+    limit: toInt(q.limit, 60), offset: toInt(q.offset, 0),
+  };
+}
+
+/** 按 id 取标签行（含 color/sort/itemCount）；取不到给一个形状完整的兜底（绝不 500）。 */
+function tagById(repo: Repo, id: number): any {
+  const row = (repo.listTags() as any[]).find((t: any) => Number(t.id) === Number(id));
+  return row ?? { id, name: "", namespace: null, color: null, sort: 0, itemCount: 0 };
+}
 
 // ---------- 检查更新（本机版本 vs GitHub Releases 最新 Release）----------
 const DEFAULT_UPDATE_REPO = "elysia-5201/asset-vault";
@@ -199,22 +238,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   // ---------- items ----------
   app.get("/api/items", async (req, reply) => {
     try {
-      const q = req.query as any;
-      const avatarIds = String(q.avatar ?? "").split(",").map((s) => toInt(s, NaN)).filter((n) => Number.isFinite(n));
-      // 分类筛选（docs/categories.md §4）：catIds 支持逗号分隔与重复键两种写法
-      const rawCat = q.catIds === undefined || q.catIds === null ? [] : (Array.isArray(q.catIds) ? q.catIds : [q.catIds]);
-      const categoryIds = (rawCat as any[]).flatMap((s) => String(s ?? "").split(",")).map((s) => s.trim()).filter(Boolean);
-      return repo.listItems({
-        q: q.q, avatarIds, avatarMatch: q.avatarMatch === "all" ? "all" : "any", ownedOnly: q.ownedOnly === "1" || q.ownedOnly === "true",
-        site: q.site, status: q.status, tag: q.tag, container: q.container,
-        imported: q.imported === "1" || q.imported === "true" ? true : q.imported === "0" || q.imported === "false" ? false : undefined,
-        collectionId: q.collection ? toInt(q.collection, 0) || undefined : undefined,
-        categoryIds, categoryMatch: q.catMatch === "all" ? "all" : "any",
-        uncategorized: q.uncategorized === "1" || q.uncategorized === "true",
-        pendingCategory: q.pendingCategory === "1" || q.pendingCategory === "true",
-        sort: q.sort === "title" || q.sort === "size" ? q.sort : "updated",
-        limit: toInt(q.limit, 60), offset: toInt(q.offset, 0),
-      });
+      // 参数解析统一走 parseItemQuery（与 /api/categories/counts 同一口径）：
+      // 关键词/分类(catIds+catMatch)/标签(tags+tagsMatch，或旧的 tag=)/收藏/未分类/待确认/来源/状态/容器/已导入/头像 全部落到真实 SQL。
+      return repo.listItems(parseItemQuery(req.query as any));
     } catch (e) { return fail(reply, e); }
   });
 
@@ -222,7 +248,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const d = repo.getItem(toInt((req.params as any).id, 0));
       if (!d) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
-      return { ...d, updates: repo.listUpdates(d.id) };
+      // suggestedTags：自动分类的「建议标签」（契约 §7）——**只读派生**，绝不写 item_tags。本函数永不抛（失败返回 []）。
+      return { ...d, updates: repo.listUpdates(d.id), suggestedTags: suggestTagsFor(repo, d.id) };
     } catch (e) { return fail(reply, e); }
   });
 
@@ -706,10 +733,44 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.delete("/api/roots/:id", async (req, reply) => {
     try { repo.removeRoot(toInt((req.params as any).id, 0)); return { ok: true }; } catch (e) { return fail(reply, e); }
   });
-  app.get("/api/tags", async () => ({ tags: repo.listTags() }));
+  // ---------- 标签（v3 §4：CRUD；身份 = (namespace, name)，颜色不是身份）----------
+  /** 全部标签（含 color/sort/itemCount）；按 namespace → sort → name 排序（默认标签有显式 sort）。 */
+  app.get("/api/tags", async () => ({
+    tags: (repo.listTags() as any[]).slice().sort((a, b) =>
+      String(a.namespace ?? "").localeCompare(String(b.namespace ?? ""))
+      || (Number(a.sort ?? 0) - Number(b.sort ?? 0))
+      || String(a.name).localeCompare(String(b.name))),
+  }));
+  /**
+   * 建标签，**幂等**：同名（同 namespace）直接返回已存在的那条，绝不重复创建（契约 §4）。
+   * 已存在 → 200；新建 → 201。响应体固定 `{ tag }`（另带 id 兼容旧调用方）。
+   */
   app.post("/api/tags", async (req, reply) => {
-    try { const b = (req.body ?? {}) as any; return { id: repo.ensureTag(String(b.name), b.namespace ?? null, b.color ?? null) }; }
-    catch (e) { return fail(reply, e); }
+    try {
+      const b = (req.body ?? {}) as any;
+      const name = String(b?.name ?? "").trim();
+      if (!name) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "name 必填" } });
+      const namespace = b?.namespace === undefined || b?.namespace === null ? null : String(b.namespace);
+      const existed = (repo.listTags() as any[]).find((t: any) => String(t.name) === name && (t.namespace ?? null) === namespace);
+      if (existed) return reply.status(200).send({ tag: existed, id: existed.id });
+      const id = repo.ensureTag(name, namespace, b?.color === undefined || b?.color === null ? null : String(b.color));
+      return reply.status(201).send({ tag: tagById(repo, id), id });
+    } catch (e) { return fail(reply, e); }
+  });
+  /** 改名/改色：按 id 关联，素材上的标签自动跟随；改成已存在的名字 → 409。 */
+  app.patch("/api/tags/:id", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const patch: { name?: string; color?: string | null; sort?: number } = {};
+      if (b?.name !== undefined) patch.name = String(b.name);
+      if (b?.color !== undefined) patch.color = b.color === null ? null : String(b.color);
+      if (b?.sort !== undefined) patch.sort = toInt(b.sort, 0);
+      return { tag: repo.updateTag(toInt((req.params as any).id, 0), patch) };
+    } catch (e) { return fail(reply, e); }
+  });
+  /** 删标签：同时清掉 item_tags 关联（不删素材、不删文件）。 */
+  app.delete("/api/tags/:id", async (req, reply) => {
+    try { return repo.deleteTag(toInt((req.params as any).id, 0)); } catch (e) { return fail(reply, e); }
   });
   app.get("/api/projects", async () => ({ projects: repo.listProjects() }));
   app.post("/api/projects", async (req, reply) => {
@@ -926,12 +987,24 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     } catch (e) { return fail(reply, e); }
   });
 
-  // ---------- 物品分类（v2；契约 docs/categories.md §4/§5/§6）----------
+  // ---------- 物品分类（v3；契约 docs/categories-v3.md §4/§5/§6）----------
   /** 分类树（含 itemCount）+ 统计 + 阈值配置。 */
   app.get("/api/categories", async (req, reply) => {
     try {
       return { categories: repo.listCategories(), stats: repo.categoryStats(), config: getCategoryConfig(repo) };
     } catch (e) { return fail(reply, e); }
+  });
+
+  // ⚠️ 路由顺序：静态段 /api/categories/counts 必须注册在 /api/categories/:id* 之前，
+  // 否则 "counts" 会被当成 :id（分类管理端点下面的 PATCH/DELETE/impact 同理，全部注册在建分类之前/之后都行，
+  // 但静态段一律先来 —— 这是本文件的约定）。
+  /**
+   * 当前筛选下的分类计数（契约 §5）：**与 /api/items 完全相同的筛选参数**，一次 GROUP BY 算出（不是每个分类查一次）。
+   * 返回 { all, uncategorized, tops: {id:count}, subs: {id:count} }；分类筛选参数本身不参与计数（repo 层已剔除）。
+   * 恒等式：counts.all === GET /api/items（同一 query）.total。
+   */
+  app.get("/api/categories/counts", async (req, reply) => {
+    try { return repo.categoryCounts(parseItemQuery(req.query as any)); } catch (e) { return fail(reply, e); }
   });
 
   app.post("/api/categories", async (req, reply) => {
@@ -956,15 +1029,57 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (b?.name !== undefined) patch.name = String(b.name);
       if (b?.parentId !== undefined) patch.parentId = b.parentId === null ? null : String(b.parentId);
       if (b?.sort !== undefined) patch.sort = toInt(b.sort, 0);
-      if (b?.enabled !== undefined) patch.enabled = b.enabled === true || b.enabled === 1 || b.enabled === "1" || b.enabled === "true";
+      if (b?.enabled !== undefined) patch.enabled = isTrue(b.enabled);
+      // v3 §2-3：系统分类（builtin）不可删除、**不可停用**（repo 层只管删除，这里补上停用这一半）。
+      if (patch.enabled === false) {
+        const cur = repo.categoryDefs().find((d) => d.id === id);
+        if (!cur) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "分类不存在: " + id } });
+        if (cur.builtin) return reply.status(409).send({ error: { code: "CONFLICT", message: "系统分类不能停用: " + id } });
+      }
       return { category: repo.updateCategory(id, patch) };
     } catch (e) { return fail(reply, e); }
   });
 
+  /** 删除/合并前的影响面：{items, direct, subs, suggestions, children}（UI 二次确认要显示的数字）。 */
+  app.get("/api/categories/:id/impact", async (req, reply) => {
+    try { return repo.categoryImpact(String((req.params as any).id ?? "")); } catch (e) { return fail(reply, e); }
+  });
+
+  /** 子分类换父（ID 不变，契约 §6.2）→ { category }。 */
+  app.post("/api/categories/:id/move", async (req, reply) => {
+    try {
+      const id = String((req.params as any).id ?? "");
+      const b = (req.body ?? {}) as any;
+      const parentId = b?.parentId === undefined || b?.parentId === null ? "" : String(b.parentId).trim();
+      if (!parentId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "parentId 必填（目标一级分类）" } });
+      return { category: repo.moveCategory(id, parentId) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 合并分类：素材与建议先迁到 intoId 再删源（事务，绝不删素材）→ { moved, deleted }。系统分类不能作为源（409）。 */
+  app.post("/api/categories/:id/merge", async (req, reply) => {
+    try {
+      const id = String((req.params as any).id ?? "");
+      const b = (req.body ?? {}) as any;
+      const intoId = b?.intoId === undefined || b?.intoId === null ? "" : String(b.intoId).trim();
+      if (!intoId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "intoId 必填（合并目标）" } });
+      const r = repo.mergeCategories(id, intoId);
+      return { moved: r.moved, deleted: r.deleted, movedSuggestions: r.movedSuggestions };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /**
+   * 删除分类：素材先转移到 transferTo（分类 ID / none / 缺省 = 未分类）再删行，事务内完成，**绝不删素材**。
+   * 系统分类 → 409（repo 层）；分类不存在 → 404。
+   */
   app.delete("/api/categories/:id", async (req, reply) => {
     try {
-      const r = repo.deleteCategory(String((req.params as any).id ?? ""));
-      return { moved: r.moved, movedSubs: r.movedSubs };
+      const id = String((req.params as any).id ?? "");
+      const raw = (req.query as any)?.transferTo;
+      const transferTo = raw === undefined || raw === null || String(raw).trim() === "" || String(raw).trim().toLowerCase() === "none"
+        ? null : String(raw).trim();
+      const r = repo.deleteCategory(id, { transferTo });
+      return { moved: r.moved, movedSubs: r.movedSubs, deleted: r.deleted, movedSuggestions: r.movedSuggestions };
     } catch (e) { return fail(reply, e); }
   });
 

@@ -16,6 +16,8 @@ export function ItemCardView(props: {
   selectMode?: boolean;
   selected?: boolean;
   onToggleSelect?: (id: number) => void;
+  /** 标签名 → 颜色（GET /api/tags 的 color）；缺省时用中性灰点 */
+  tagColors?: Record<string, string>;
 }) {
   const { item } = props;
   const [urls, setUrls] = useState<string[]>(() => imageCache.get(item.id) ?? (item.coverUrl ? [item.coverUrl] : []));
@@ -111,7 +113,8 @@ export function ItemCardView(props: {
         )}
       </div>
       <div className="card-body">
-        <div className="card-title">{item.title}</div>
+        {/* 标题截断（.card-title 两行 clamp）+ 完整标题可见（title 属性 / 悬停原生 tooltip） */}
+        <div className="card-title" title={item.title}>{item.title}</div>
         <div className="card-meta">
           <span>{SITE_LABEL[item.sourceSite]}</span>
           <span>· {item.imageCount} 图 / {item.assetCount} 资产</span>
@@ -130,6 +133,17 @@ export function ItemCardView(props: {
             >
               建议 {item.suggestion.subCategoryName ?? item.suggestion.categoryName}
             </button>
+          )}
+          {(item.tags ?? []).slice(0, 3).map((t) => (
+            <span className="card-tag" key={"tag-" + t} title={"标签：" + t}>
+              <span className="tag-dot" style={{ background: props.tagColors?.[t] ?? "var(--fg-mute)" }} />
+              {t}
+            </span>
+          ))}
+          {(item.tags?.length ?? 0) > 3 && (
+            <span className="card-tag more" title={"还有 " + (item.tags.length - 3) + " 个标签：" + item.tags.slice(3).join("、")}>
+              {"+" + (item.tags.length - 3)}
+            </span>
           )}
           {item.avatars.slice(0, 3).map((a) => <Badge key={a.id} tone="violet" title={a.evidence ?? "无证据字段"}>@{a.name}</Badge>)}
           {item.avatars.length > 3 && <Badge tone="muted">+{item.avatars.length - 3}</Badge>}

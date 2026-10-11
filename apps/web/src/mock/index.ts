@@ -14,7 +14,8 @@ import {
 } from "./seed";
 import {
   NO_CAT, assignmentOf, catById, catChildren, catMatches, catTops, categoryConfig,
-  categoryDefs, recommendFor, setItemCategory, statsOf, suggestionOf, treeOf,
+  categoryDefs, countsOf, deleteInMock, impactOf, mergeInMock, moveCategoryTo,
+  recommendFor, setItemCategory, statsOf, suggestionOf, treeOf,
 } from "./categories";
 
 export class MockHttpError extends Error {
@@ -113,11 +114,20 @@ function detailOf(item: ItemRow) {
 // ---------- 查询 ----------
 function num(v: string | null): number | null { if (v === null || v === "") return null; const n = Number(v); return Number.isFinite(n) ? n : null; }
 
-function listItems(q: URLSearchParams) {
+/**
+ * 与 /api/items 相同的筛选（**分类条件可关**：GET /api/categories/counts 的口径要求分类本身不参与，
+ * 否则每个分类的计数都会退化成"只算被选中的那个"）。
+ * @param withCategory false = 不应用 catIds/catMatch/uncategorized/pendingCategory
+ */
+function filterItems(q: URLSearchParams, withCategory = true): ItemRow[] {
   const text = (q.get("q") ?? "").trim().toLowerCase();
   const site = q.get("site") ?? "";
   const status = q.get("status") ?? "";
   const tag = q.get("tag") ?? "";
+  // 标签多选（v3 §4）：tags=a,b&tagsMatch=any|all；旧单值 tag 与新参数并存（都过滤，AND 关系）
+  const tagList = (q.getAll("tags").join(",") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const tagsMatch: "any" | "all" = q.get("tagsMatch") === "all" ? "all" : "any";
+  const favoriteOnly = q.get("favoriteOnly") === "1" || q.get("favoriteOnly") === "true";
   const container = q.get("container") ?? "";
   const ownedOnly = q.get("ownedOnly") === "1" || q.get("ownedOnly") === "true";
   const avatarIds = (q.getAll("avatar").join(",") || "").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
@@ -128,15 +138,21 @@ function listItems(q: URLSearchParams) {
   const uncategorized = q.get("uncategorized") === "1" || q.get("uncategorized") === "true";
   const pendingCategory = q.get("pendingCategory") === "1" || q.get("pendingCategory") === "true";
   const sort = q.get("sort") ?? "updated";
-  const limit = num(q.get("limit")) ?? 100;
-  const offset = num(q.get("offset")) ?? 0;
 
   let rows = items.filter((i) => (status ? i.status === status : i.status !== "trashed"));
   if (site) rows = rows.filter((i) => i.source_site === site);
   if (tag) rows = rows.filter((i) => (itemTags.get(i.id) ?? []).includes(tag));
-  if (catIds.length) rows = rows.filter((i) => catMatches(i, catIds, catMatch));
-  if (uncategorized) rows = rows.filter((i) => !i.cat_id);
-  if (pendingCategory) rows = rows.filter((i) => i.cat_suggest_id !== null);
+  if (tagList.length) rows = rows.filter((i) => {
+    const own = itemTags.get(i.id) ?? [];
+    return tagsMatch === "all" ? tagList.every((t) => own.includes(t)) : tagList.some((t) => own.includes(t));
+  });
+  if (favoriteOnly) rows = rows.filter((i) => i.favorite === 1);
+  if (withCategory) {
+    if (catIds.length) rows = rows.filter((i) => catMatches(i, catIds, catMatch));
+    // 未分类 = cat_id 为空 **或** 指向系统分类「未分类」（v3 §1：两者是同一集合）
+    if (uncategorized) rows = rows.filter((i) => !i.cat_id || i.cat_id === "uncategorized");
+    if (pendingCategory) rows = rows.filter((i) => i.cat_suggest_id !== null);
+  }
   if (text) {
     rows = rows.filter((i) => [i.title, i.shop_name, i.author, i.category_name, i.description, i.notes, i.source_item_id]
       .some((f) => (f ?? "").toLowerCase().includes(text)));
@@ -162,7 +178,13 @@ function listItems(q: URLSearchParams) {
     const size = (i: ItemRow) => assets.filter((a) => a.item_id === i.id).reduce((n, a) => n + a.size, 0);
     rows = [...rows].sort((a, b) => size(b) - size(a));
   } else rows = [...rows].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+  return rows;
+}
 
+function listItems(q: URLSearchParams) {
+  const rows = filterItems(q);
+  const limit = num(q.get("limit")) ?? 100;
+  const offset = num(q.get("offset")) ?? 0;
   const total = rows.length;
   return { total, items: rows.slice(offset, offset + limit).map(cardOf) };
 }
@@ -470,6 +492,8 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
   }
 
   if (seg[0] === "categories") {
+    // categories/* 的行为函数（mock/categories.ts）抛的就是带 code/status 的 Error，这里统一译成 MockHttpError
+    try {
     if (seg.length === 1 && M === "GET") {
       return {
         status: 200,
@@ -562,7 +586,20 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
         body: { scanned: results.length, applied, suggested, cleared, skipped, protected: protectedN, results },
       };
     }
+    // GET /api/categories/counts?<与 /api/items 相同的筛选参数>（分类条件本身不参与计数）
+    if (seg.length === 2 && seg[1] === "counts" && M === "GET") return { status: 200, body: countsOf(filterItems(query, false)) };
     const cid = decodeURIComponent(seg[1] ?? "");
+    if (seg.length === 3 && seg[2] === "impact" && M === "GET") return { status: 200, body: impactOf(items, cid) };
+    if (seg.length === 3 && seg[2] === "move" && M === "POST") {
+      const parentId = String(b.parentId ?? "");
+      if (!parentId) fail("INVALID_INPUT", "parentId 必填");
+      return { status: 200, body: { category: moveCategoryTo(cid, parentId) } };
+    }
+    if (seg.length === 3 && seg[2] === "merge" && M === "POST") {
+      const intoId = String(b.intoId ?? "");
+      if (!intoId) fail("INVALID_INPUT", "intoId 必填");
+      return { status: 200, body: mergeInMock(items, cid, intoId, now) };
+    }
     const def = catById(cid);
     if (!def) fail("NOT_FOUND", "分类不存在：" + cid, 404);
     if (seg.length === 2 && M === "PATCH") {
@@ -594,22 +631,15 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
       const node = { ...def, itemCount: items.filter((i) => i.status !== "trashed" && (i.cat_id === def.id || i.cat_sub_id === def.id)).length };
       return { status: 200, body: { category: node } };
     }
+    // DELETE /api/categories/:id?transferTo=<id|none>：素材先转移再删（系统分类 / 有子分类 → 409）
     if (seg.length === 2 && M === "DELETE") {
-      const kids = catChildren(def.id);
-      if (kids.length) fail("CONFLICT", "该分类下有 " + kids.length + " 个子分类，先移走或删除它们", 409);
-      const hit = items.filter((i) => (def.parentId === null ? i.cat_id === def.id : i.cat_sub_id === def.id));
-      for (const row of hit) {
-        if (def.parentId === null) {
-          row.cat_id = null; row.cat_sub_id = null; row.cat_source = null; row.cat_confidence = null;
-          row.cat_reason = null; row.cat_evidence = null; row.cat_assigned_at = null;
-        } else {
-          row.cat_sub_id = null;
-        }
-        row.updated_at = now;
-      }
-      const at = categoryDefs.findIndex((d) => d.id === def.id);
-      if (at >= 0) categoryDefs.splice(at, 1);
-      return { status: 200, body: { moved: def.parentId === null ? hit.length : 0, movedSubs: def.parentId === null ? 0 : hit.length } };
+      const r = deleteInMock(items, def.id, query.get("transferTo"), now);
+      return { status: 200, body: { moved: r.moved, movedSubs: r.movedSubs, movedSuggestions: r.movedSuggestions, deleted: r.deleted } };
+    }
+    } catch (e) {
+      if (e instanceof MockHttpError) throw e;
+      const err = e as { code?: AppErrorCode; status?: number; message?: string };
+      fail((err?.code ?? "INVALID_INPUT") as AppErrorCode, err?.message ?? String(e), err?.status ?? 400);
     }
   }
 
@@ -766,14 +796,54 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
     }
   }
   if (seg[0] === "tags") {
-    if (M === "GET") return { status: 200, body: { tags } };
-    if (M === "POST") {
+    // v3 §4：GET 补 color/sort/itemCount；POST 同名幂等（绝不重复创建）；PATCH 改名后素材关联跟随；DELETE 只删关联
+    const tagCount = (name: string): number => items.filter((i) => (itemTags.get(i.id) ?? []).includes(name)).length;
+    const tagView = (t: (typeof tags)[number]) => ({ ...t, itemCount: tagCount(t.name) });
+    const readColor = (v: unknown): string | null => {
+      if (v === undefined || v === null || v === "") return null;
+      const s = String(v).trim();
+      if (/^#[0-9a-f]{3}$/i.test(s) || /^#[0-9a-f]{6}$/i.test(s)) return s;
+      fail("INVALID_INPUT", "color 形状应为 #rgb 或 #rrggbb：" + s);
+    };
+    if (seg.length === 1 && M === "GET") return { status: 200, body: { tags: tags.map(tagView) } };
+    if (seg.length === 1 && M === "POST") {
       const name = String(b.name ?? "").trim();
       if (!name) fail("INVALID_INPUT", "name 不能为空");
-      if (tags.some((t) => t.name === name)) fail("CONFLICT", "标签已存在：" + name, 409);
-      const row = { id: Math.max(0, ...tags.map((t) => t.id)) + 1, name, namespace: (b.namespace as string) ?? null, color: (b.color as string) ?? null, sort: tags.length + 1 };
+      const ns = b.namespace === undefined || b.namespace === null || b.namespace === "" ? null : String(b.namespace);
+      const color = readColor(b.color);
+      const exist = tags.find((t) => t.name === name && (t.namespace ?? null) === ns);
+      if (exist) return { status: 200, body: { tag: tagView(exist) } };  // 幂等：同名（同 namespace）直接返回已存在的
+      const row = { id: Math.max(0, ...tags.map((t) => t.id)) + 1, name, namespace: ns, color, sort: tags.length + 1 };
       tags.push(row);
-      return { status: 201, body: row };
+      return { status: 201, body: { tag: tagView(row) } };
+    }
+    const tid = Number(seg[1]);
+    const tag = tags.find((t) => t.id === tid);
+    if (!tag) fail("NOT_FOUND", "标签不存在：" + seg[1], 404);
+    if (seg.length === 2 && M === "PATCH") {
+      if (b.name !== undefined) {
+        const nm = String(b.name).trim();
+        if (!nm) fail("INVALID_INPUT", "name 不能为空");
+        const dup = tags.find((t) => t.id !== tag.id && t.name === nm && (t.namespace ?? null) === (tag.namespace ?? null));
+        if (dup) fail("CONFLICT", "已存在同名标签：" + nm, 409);
+        const old = tag.name;
+        tag.name = nm;
+        // 关联按名字存在 itemTags 里：改名时同步改写，素材关联不丢
+        for (const [iid, list] of itemTags) itemTags.set(iid, list.map((x) => (x === old ? nm : x)));
+      }
+      if (b.color !== undefined) tag.color = readColor(b.color);
+      if (b.namespace !== undefined) tag.namespace = b.namespace === null || b.namespace === "" ? null : String(b.namespace);
+      return { status: 200, body: { tag: tagView(tag) } };
+    }
+    if (seg.length === 2 && M === "DELETE") {
+      let removed = 0;
+      for (const [iid, list] of itemTags) {
+        const next = list.filter((x) => x !== tag.name);
+        if (next.length !== list.length) { removed += list.length - next.length; itemTags.set(iid, next); }
+      }
+      const at = tags.findIndex((t) => t.id === tag.id);
+      tags.splice(at, 1);
+      return { status: 200, body: { removed } };  // 只删关联与标签本身，不删素材、不删文件
     }
   }
   if (seg[0] === "projects") {

@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AvatarMatch, CategoryNode, JobRow, LibraryRootRow, TagRow } from "@core/contracts";
 import {
-  apiMode, categoryApiMessage, checkAppUpdate, describeError, getCategories, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
+  apiMode, categoryApiMessage, checkAppUpdate, describeError, getCategories, getCategoryCounts, getHealth,
+  listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
   onModeChange, patchItem, recordImport, retryConnect, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
-import type { AvatarCard, CategoryStats, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
+import type { AvatarCard, CategoryCounts, CategoryStats, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
 import { formatBytes, formatDate, parseAtQuery, resolveAvatarNames } from "./util";
 import { AvatarRail } from "./components/AvatarRail";
-import { SearchBar, type FilterState } from "./components/SearchBar";
+import { CategoryManager } from "./components/CategoryManager";
+import { EMPTY_FILTERS, SearchBar, type FilterState } from "./components/SearchBar";
 import { ItemCardView } from "./components/ItemCardView";
 import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
@@ -48,14 +50,15 @@ export default function App() {
   const [selectedAvatarIds, setSelectedAvatarIds] = useState<number[]>([]);
   const [avatarMatch, setAvatarMatch] = useState<AvatarMatch>("any");
   const [ownedOnly, setOwnedOnly] = useState(false);
-  const [filters, setFilters] = useState<FilterState>({
-    site: "", status: "", container: "", tag: "", imported: "any", sort: "updated",
-    catIds: [], catMatch: "any", uncategorized: false, pendingCategory: false,
-  });
+  const [filters, setFilters] = useState<FilterState>({ ...EMPTY_FILTERS });
   /** 分类树 + 统计（供筛选区与管理页用）；catErr 非空时显式提示后端未提供分类接口 */
   const [categories, setCategories] = useState<CategoryNode[]>([]);
   const [catStats, setCatStats] = useState<CategoryStats | null>(null);
   const [catErr, setCatErr] = useState("");
+  /** **当前筛选下**的分类计数（GET /api/categories/counts）；null = 端点不可用 → 退回树上的全局 itemCount */
+  const [catCounts, setCatCounts] = useState<CategoryCounts | null>(null);
+  /** 分类管理浮层 */
+  const [managerOpen, setManagerOpen] = useState(false);
   /** 批量分类：选择模式（独立复选框，不复用整卡点击） */
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
@@ -127,6 +130,13 @@ export default function App() {
       .finally(() => setUpdateBusy(false));
   }, [updateBusy, toast]);
 
+  /** 卡片标签的颜色点：GET /api/tags 的 color 按名字索引（颜色不是身份，改名后自动跟随） */
+  const tagColors = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const t of tags) if (t.color) m[t.name] = t.color;
+    return m;
+  }, [tags]);
+
   const parsed = useMemo(() => parseAtQuery(debounced), [debounced]);
   const resolved = useMemo(() => resolveAvatarNames(parsed.avatars, avatars), [parsed, avatars]);
   const effAvatarIds = useMemo(() => {
@@ -135,26 +145,56 @@ export default function App() {
     return [...s];
   }, [selectedAvatarIds, resolved.ids]);
 
+  /**
+   * 分类栏 → 查询参数：选一级 = 命中它（含其下所有子分类）；选二级 = 命中该子分类；
+   * 系统分类「未分类」= uncategorized=1（cat_id 为空，与旧语义等价）。
+   */
+  const catQuery = useMemo(() => {
+    const top = filters.catTop;
+    if (!top || top === "uncategorized") {
+      return { categoryIds: undefined as string[] | undefined, uncategorized: top === "uncategorized" };
+    }
+    return { categoryIds: [filters.catSub || top], uncategorized: false };
+  }, [filters.catTop, filters.catSub]);
+
+  /** 除分类以外的全部筛选（/api/items 与 /api/categories/counts 共用这一份口径）。 */
+  const commonQuery = useMemo(() => ({
+    q: parsed.q || undefined,
+    avatar: effAvatarIds.length ? effAvatarIds : undefined,
+    avatarMatch, ownedOnly,
+    site: filters.site, status: filters.status, tag: filters.tag || undefined,
+    container: filters.container,
+    tags: filters.tags.length ? filters.tags : undefined,
+    tagsMatch: filters.tagsMatch,
+    favoriteOnly: filters.favoriteOnly || undefined,
+    imported: (filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0) as 1 | 0 | undefined,
+  }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.tag, filters.container, filters.tags.join(","), filters.tagsMatch, filters.favoriteOnly, filters.imported]);
+
   const loadItems = useCallback(() => {
     setItemsLoading(true); setItemsErr("");
     listItems({
-      q: parsed.q || undefined, avatar: effAvatarIds.length ? effAvatarIds : undefined,
-      avatarMatch, ownedOnly, site: filters.site, status: filters.status, tag: filters.tag || undefined,
-      container: filters.container,
-      imported: filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0,
-      // 分类筛选：拼进真实查询，与关键词/@头像/标签/收藏/拥有状态等条件叠加
-      categoryIds: filters.catIds.length ? filters.catIds : undefined,
-      categoryMatch: filters.catMatch,
-      uncategorized: filters.uncategorized || undefined,
+      ...commonQuery,
+      // 组合筛选：分类 + 关键词 + 标签(ANY/ALL) + avatar(ANY/ALL) + 来源 + 状态 + 容器 + 已导入 + 收藏
+      categoryIds: catQuery.categoryIds,
+      uncategorized: catQuery.uncategorized || undefined,
       pendingCategory: filters.pendingCategory || undefined,
       sort: filters.sort, limit: 120,
     })
       .then((r) => { setItems(r.items); setTotal(r.total); })
       .catch((e) => setItemsErr(describeError(e)))
       .finally(() => setItemsLoading(false));
-  }, [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters]);
+  }, [commonQuery, catQuery, filters.pendingCategory, filters.sort]);
 
   useEffect(() => { loadItems(); }, [loadItems]);
+
+  // 分类计数：随**其它**筛选变化（分类选择本身不参与，否则只会剩被选中的那个分类）。
+  // 端点不可用（旧后端 / 404）时静默退回树上的全局 itemCount，并在分类栏标注来源。
+  const loadCounts = useCallback(() => {
+    getCategoryCounts(commonQuery)
+      .then(setCatCounts)
+      .catch(() => setCatCounts(null));
+  }, [commonQuery]);
+  useEffect(() => { loadCounts(); }, [loadCounts, mode]);
 
   useEffect(() => {
     if (!jobsAuto) return;
@@ -244,6 +284,11 @@ export default function App() {
           <button className="btn tiny" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => setDupPanel(true)}>查重</button>
           <button
             className="btn tiny"
+            title="分类管理：一级/二级分类的新增、改名、排序、移动、启停、删除、合并，以及标签管理"
+            onClick={() => setManagerOpen(true)}
+          >分类管理</button>
+          <button
+            className="btn tiny"
             title="批量分类：在列表卡片上加复选框，可批量设置主/子分类、移除子分类、重新生成建议"
             onClick={() => { setSelectMode((v) => !v); setSelectedIds([]); }}
           >{selectMode ? "退出选择" : "批量分类"}</button>
@@ -266,8 +311,9 @@ export default function App() {
         <SearchBar
           text={text} onText={setText} filters={filters} onFilters={setFilters}
           atAvatars={parsed.avatars} unresolved={resolved.unresolved} onRemoveAt={removeAtName}
-          tags={tags.map((t) => t.name)} loading={itemsLoading} total={total}
-          categories={categories} catStats={catStats} catErr={catErr}
+          tags={tags} loading={itemsLoading} total={total}
+          categories={categories} catCounts={catCounts}
+          countsScope={catCounts ? "filtered" : "global"} catErr={catErr}
         />
         {selectMode && (
           <CategoryBatchBar
@@ -296,6 +342,7 @@ export default function App() {
                 key={it.id} item={it} onOpen={setSelectedItemId} onToggleFavorite={toggleFavorite}
                 imported={importedIds.includes(it.id) || filters.imported === "yes"}
                 selectMode={selectMode} selected={selectedIds.includes(it.id)} onToggleSelect={toggleSelect}
+                tagColors={tagColors}
               />
             ))}
           </div>
@@ -356,6 +403,15 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {managerOpen && (
+        <CategoryManager
+          categories={categories} catStats={catStats} catErr={catErr} tags={tags}
+          onClose={() => setManagerOpen(false)}
+          onToast={toast}
+          onChanged={() => { loadCategories(); loadItems(); loadCounts(); loadMeta(); }}
+        />
       )}
 
       {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}

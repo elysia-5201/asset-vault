@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import { now, uid, ftsPhrase } from "../util";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { normKey, type AssetRow, type AvatarAliasRow, type AvatarKind, type AvatarMatch, type AvatarRow, type CategoryAssignment, type CategoryNode, type CategoryRefSource, type CategorySuggestion, type ImageOrigin, type ImageRole, type ImageRow, type ItemCard, type ItemDetail, type ItemRow, type ItemStatus, type JobEvent, type JobKind, type JobRow, type JobState, type RootMode, type SourceSite, type UpdateKind } from "../../../../packages/core/src/contracts";
-import type { CategoryDef } from "../../../../packages/core/src/categories/taxonomy";
+import { UNCATEGORIZED_ID, type CategoryDef } from "../../../../packages/core/src/categories/taxonomy";
 import { resolveTransition } from "../../../../packages/core/src/contracts";
 
 export interface ItemQuery {
@@ -15,6 +15,10 @@ export interface ItemQuery {
   uncategorized?: boolean;
   /** 只看有自动推荐待确认的条目 */
   pendingCategory?: boolean;
+  /** 标签多选（与 avatar 的 ANY/ALL 同语义）；旧的单个 tag= 仍兼容 */
+  tagNames?: string[]; tagMatch?: "any" | "all";
+  /** 收藏 */
+  favoriteOnly?: boolean;
 }
 export interface AvatarCard extends AvatarRow { itemCount: number; aliases: string[]; ownedBool: boolean }
 export interface StatsShape {
@@ -77,7 +81,19 @@ export class Repo {
         params.push(...catIds, ...catIds);
       }
     }
-    if (q.uncategorized) w.push("i.cat_id IS NULL");
+    // 未分类 = cat_id 为空 **或** 指向系统分类「未分类」（v3）；两者是同一集合
+    if (q.uncategorized) w.push("(i.cat_id IS NULL OR i.cat_id = 'uncategorized')");
+    const tagNames = (q.tagNames ?? []).map((s) => String(s).trim()).filter(Boolean);
+    if (tagNames.length > 0) {
+      const ph = tagNames.map(() => "?").join(",");
+      if ((q.tagMatch ?? "any") === "all") {
+        w.push(`(SELECT COUNT(DISTINCT t.name) FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name IN (${ph})) = ${tagNames.length}`);
+      } else {
+        w.push(`EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name IN (${ph}))`);
+      }
+      params.push(...tagNames);
+    }
+    if (q.favoriteOnly) w.push("i.favorite = 1");
     if (q.pendingCategory) w.push("i.cat_suggest_id IS NOT NULL");
     return { sql: w.length ? " WHERE " + w.join(" AND ") : "", params };
   }
@@ -623,7 +639,8 @@ export class Repo {
 
   categoryAssignment(r: any): CategoryAssignment | null {
     const id = (r?.cat_id ?? null) as string | null;
-    if (!id) return null;
+    // 「未分类」是系统分类，不是一条归属：UI 上要显示灰 chip「未分类」，所以这里返回 null
+    if (!id || id === UNCATEGORIZED_ID) return null;
     const defs = this.categoryDefs();
     const cat = defs.find((d) => d.id === id) ?? null;
     const sub = r.cat_sub_id ? defs.find((d) => d.id === r.cat_sub_id) ?? null : null;
@@ -686,15 +703,18 @@ export class Repo {
     if (patch.sort !== undefined) { sets.push("sort = ?"); params.push(patch.sort); }
     if (patch.enabled !== undefined) { sets.push("enabled = ?"); params.push(patch.enabled ? 1 : 0); }
     if (patch.parentId !== undefined && patch.parentId !== cur.parentId) {
-      // 只允许在两层结构内移动：主分类不能变成子分类（它自己下面还有子分类时会被 DB RESTRICT 拒绝）
-      if (patch.parentId !== null) {
-        if (cur.parentId !== null) throw Object.assign(new Error("子分类不能再改父分类（避免三层结构）"), { code: "INVALID_INPUT", status: 400 });
-        if (!defs.some((d) => d.id === patch.parentId)) throw Object.assign(new Error("父分类不存在: " + patch.parentId), { code: "INVALID_INPUT", status: 400 });
-        const kids = defs.filter((d) => d.parentId === id).length;
-        if (kids > 0) throw Object.assign(new Error("该主分类下还有 " + kids + " 个子分类，不能移动"), { code: "CONFLICT", status: 409 });
-      } else if (cur.parentId !== null) {
-        throw Object.assign(new Error("子分类不能提升为主分类（ID 含父前缀）"), { code: "INVALID_INPUT", status: 400 });
+      // v3 §6.2：允许把**子分类移动到另一个一级分类**下（ID 不变；ID 是稳定标识，不随位置变化）。
+      // 主分类不能变成子分类（它的 ID 是一级的），有子分类的分类不能移动。
+      if (patch.parentId === null) {
+        throw Object.assign(new Error("不支持把分类提升为一级分类（ID 已固定，请新建一级分类再合并）"), { code: "INVALID_INPUT", status: 400 });
       }
+      const target = defs.find((d) => d.id === patch.parentId);
+      if (!target) throw Object.assign(new Error("父分类不存在: " + patch.parentId), { code: "INVALID_INPUT", status: 400 });
+      if (target.parentId !== null) throw Object.assign(new Error("目标必须是主分类（结构固定两层）: " + patch.parentId), { code: "INVALID_INPUT", status: 400 });
+      // 顺序有意：先报"还有子分类"（409），再报"一级骨架不能下挂"（400）——两者都拦，但先给更具体的冲突
+      const kids = defs.filter((d) => d.parentId === id).length;
+      if (kids > 0) throw Object.assign(new Error("该分类下还有 " + kids + " 个子分类，不能移动"), { code: "CONFLICT", status: 409 });
+      if (cur.parentId === null) throw Object.assign(new Error("一级分类不能挂到别的分类下（请新建普通子分类，或把子分类移动到目标一级下）"), { code: "INVALID_INPUT", status: 400 });
       sets.push("parent_id = ?"); params.push(patch.parentId);
     }
     if (sets.length === 0) return this.listCategories().flatMap((n) => [n, ...(n.children ?? [])]).find((n) => n.id === id)!;
@@ -706,7 +726,7 @@ export class Repo {
   }
 
   /** 删除分类：其下素材退回未分类（不删素材）。有子分类时拒绝（先处理子分类）。 */
-  deleteCategory(id: string): { moved: number; movedSubs: number } {
+  deleteCategory(id: string, opts: { transferTo?: string | null } = {}): { moved: number; movedSubs: number; movedSuggestions: number; deleted: number } {
     const defs = this.categoryDefs();
     const self = defs.find((d) => d.id === id);
     if (!self) throw Object.assign(new Error("分类不存在: " + id), { code: "NOT_FOUND", status: 404 });
@@ -715,17 +735,41 @@ export class Repo {
     if (self.builtin) throw Object.assign(new Error("内置分类不能删除，请改用停用（enabled=false）"), { code: "CONFLICT", status: 409 });
     const kids = defs.filter((d) => d.parentId === id).length;
     if (kids > 0) throw Object.assign(new Error(`该分类下还有 ${kids} 个子分类，请先删除或移动`), { code: "CONFLICT", status: 409 });
+    // 转移目标：指定分类（一级或子级）或未分类（缺省）。
+    // 绝不删除素材、不碰磁盘文件、不动来源/导入/回收站等任何其它关系（v3 §6.3）。
+    const transferTo = opts.transferTo ?? null;
+    let tTop: string | null = null; let tSub: string | null = null;
+    if (transferTo) {
+      const target = this.categoryDefs().find((d) => d.id === transferTo);
+      if (!target) throw Object.assign(new Error("转移目标不存在: " + transferTo), { code: "INVALID_INPUT", status: 400 });
+      if (target.parentId === null) tTop = target.id === UNCATEGORIZED_ID ? null : target.id;
+      else { tTop = target.parentId; tSub = target.id; }
+    }
+    // 显式指定「未分类」作为转移目标 → 素材整条降级（清主分类 + 子分类），语义与文案一致
+    const explicitUncat = transferTo !== null && tTop === null && tSub === null;
+    const clearAll = "UPDATE items SET cat_id=NULL, cat_sub_id=NULL, cat_source=NULL, cat_confidence=NULL, cat_reason=NULL, cat_evidence=NULL, cat_assigned_at=NULL, updated_at=? WHERE ";
     const tx = this.db.transaction(() => {
-      // 子分类被删：只清 cat_sub_id（主分类仍在，语义降级为"主分类"而不是"未分类"）
-      const movedSubs = this.db.prepare("UPDATE items SET cat_sub_id=NULL, updated_at=? WHERE cat_sub_id=?").run(now(), id).changes;
-      // 指向它的待确认建议要把子分类摘掉（否则 UI 会显示一个已不存在的 ID）
-      this.db.prepare("UPDATE items SET cat_suggest_sub_id=NULL WHERE cat_suggest_sub_id=?").run(id);
-      const moved = this.db.prepare(`UPDATE items SET cat_id=NULL, cat_sub_id=NULL, cat_source=NULL, cat_confidence=NULL, cat_reason=NULL,
-        cat_evidence=NULL, cat_assigned_at=NULL, cat_suggest_id=NULL, cat_suggest_sub_id=NULL, cat_suggest_confidence=NULL,
-        cat_suggest_reason=NULL, cat_suggest_evidence=NULL, cat_suggest_at=NULL, updated_at=? WHERE cat_id=?`).run(now(), id).changes;
-      this.db.prepare("DELETE FROM categories WHERE id=?").run(id);
-      this.logAudit("category.delete", "category", id, defs.find((d) => d.id === id) ?? null, { moved, movedSubs });
-      return { moved, movedSubs };
+      const t = now();
+      // 子分类被删：素材改指转移目标（或清空子分类，主分类仍在）
+      // 未给 transferTo：只清子分类，主分类保留（默认语义）
+      // 给了 transferTo：**cat_id 与 cat_sub_id 一起写**，避免"子分类属于 A、主分类还是 B"的不自洽
+      const movedSubs = transferTo === null
+        ? this.db.prepare("UPDATE items SET cat_sub_id=NULL, updated_at=? WHERE cat_sub_id=?").run(t, id).changes
+        : explicitUncat
+          ? this.db.prepare(clearAll + "cat_sub_id=?").run(t, id).changes
+          : this.db.prepare("UPDATE items SET cat_id=?, cat_sub_id=?, cat_source='manual', cat_assigned_at=?, updated_at=? WHERE cat_sub_id=?").run(tTop, tSub, t, t, id).changes;
+      // 一级分类被删：素材改指转移目标（或整体回未分类）
+      const moved = (tTop === null && tSub === null)
+        ? this.db.prepare(clearAll + "cat_id=?").run(t, id).changes
+        : this.db.prepare("UPDATE items SET cat_id=?, cat_sub_id=?, cat_source='manual', cat_assigned_at=?, updated_at=? WHERE cat_id=?").run(tTop, tSub, t, t, id).changes;
+      // 指向它的待确认建议：目标存在则改指目标，否则清掉（不留悬空 ID）
+      const movedSuggestions = tTop === null
+        ? this.db.prepare(`UPDATE items SET cat_suggest_id=NULL, cat_suggest_sub_id=NULL, cat_suggest_confidence=NULL, cat_suggest_reason=NULL,
+            cat_suggest_evidence=NULL, cat_suggest_at=NULL WHERE cat_suggest_id=? OR cat_suggest_sub_id=?`).run(id, id).changes
+        : this.db.prepare("UPDATE items SET cat_suggest_id=?, cat_suggest_sub_id=? WHERE cat_suggest_id=? OR cat_suggest_sub_id=?").run(tTop, tSub, id, id).changes;
+      const deleted = this.db.prepare("DELETE FROM categories WHERE id=?").run(id).changes;
+      this.logAudit("category.delete", "category", id, defs.find((d) => d.id === id) ?? null, { moved, movedSubs, movedSuggestions, transferTo });
+      return { moved, movedSubs, movedSuggestions, deleted };
     });
     const r = tx();
     this.invalidateCategories();
@@ -814,14 +858,15 @@ export class Repo {
         directSub.set(r.sub, { count: s.count + rec.count, owned: s.owned + rec.owned, favorite: s.favorite + rec.favorite });
       }
     }
+    const uncategorizedCount = one("SELECT COUNT(*) v FROM items WHERE status<>'trashed' AND (cat_id IS NULL OR cat_id = 'uncategorized')");
     const counts = defs.map((d) => {
       const direct = d.parentId === null ? directTop.get(d.id) : directSub.get(d.id);
-      const c = direct?.count ?? 0;
+      const c = d.id === UNCATEGORIZED_ID ? uncategorizedCount : (direct?.count ?? 0);
       return { id: d.id, name: d.name, parentId: d.parentId, count: c, topCount: c, owned: direct?.owned ?? 0, favorite: direct?.favorite ?? 0 };
     });
     return {
       counts,
-      uncategorized: one("SELECT COUNT(*) v FROM items WHERE status<>'trashed' AND cat_id IS NULL"),
+      uncategorized: uncategorizedCount,
       pending: one("SELECT COUNT(*) v FROM items WHERE status<>'trashed' AND cat_suggest_id IS NOT NULL"),
       total: one("SELECT COUNT(*) v FROM items WHERE status<>'trashed'"),
       missingFiles: one("SELECT COUNT(DISTINCT a.item_id) v FROM assets a JOIN items i ON i.id=a.item_id WHERE a.status='missing' AND i.status<>'trashed'"),
@@ -833,6 +878,150 @@ export class Repo {
       .run(now(), "user", action, entity, entityId, before === undefined || before === null ? null : JSON.stringify(before), after === undefined || after === null ? null : JSON.stringify(after));
   }
   listAudit(limit = 100) { return this.db.prepare("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?").all(limit); }
+
+  // ---------- categories：筛选计数 / 影响面 / 移动 / 合并 ----------
+  /**
+   * 当前筛选下的分类计数（**一次 GROUP BY**，不是每个分类查一次）。
+   * 分类筛选本身不参与计数（否则只会剩被选中的那个分类）；其它筛选（关键词/标签/avatar/来源/状态/容器/已导入/收藏）都生效。
+   */
+  categoryCounts(q: ItemQuery = {}): { all: number; uncategorized: number; tops: Record<string, number>; subs: Record<string, number> } {
+    const { sql: where, params } = this.buildWhere({ ...q, categoryIds: undefined, categoryMatch: undefined, uncategorized: false, pendingCategory: false });
+    const w = where || "";
+    const one = (extra: string) => (this.db.prepare("SELECT COUNT(*) c FROM items i" + w + extra).get(...params as any[]) as any).c as number;
+    const all = one("");
+    const uncategorized = one((w ? " AND " : " WHERE ") + "(i.cat_id IS NULL OR i.cat_id = '" + UNCATEGORIZED_ID + "')");
+    const rows = this.db.prepare("SELECT i.cat_id AS top, i.cat_sub_id AS sub, COUNT(*) c FROM items i" + w + " GROUP BY i.cat_id, i.cat_sub_id").all(...params as any[]) as any[];
+    const tops: Record<string, number> = {}; const subs: Record<string, number> = {};
+    for (const r of rows) {
+      if (!r.top) continue;
+      tops[r.top] = (tops[r.top] ?? 0) + r.c;
+      if (r.sub) subs[r.sub] = (subs[r.sub] ?? 0) + r.c;
+    }
+    tops[UNCATEGORIZED_ID] = uncategorized; // 未分类也作为一个"一级分类"参与导航计数
+    return { all, uncategorized, tops, subs };
+  }
+
+  /** 删除/合并前的影响面（UI 二次确认要显示的数字）。 */
+  categoryImpact(id: string): { items: number; direct: number; subs: number; suggestions: number; children: { id: string; name: string }[] } {
+    const defs = this.categoryDefs();
+    const self = defs.find((d) => d.id === id);
+    if (!self) throw Object.assign(new Error("分类不存在: " + id), { code: "NOT_FOUND", status: 404 });
+    const one = (sql: string, ...p: unknown[]) => (this.db.prepare(sql).get(...p as any[]) as any).c as number;
+    const direct = self.parentId === null
+      ? one("SELECT COUNT(*) c FROM items WHERE status<>'trashed' AND cat_id=?", id)
+      : one("SELECT COUNT(*) c FROM items WHERE status<>'trashed' AND cat_sub_id=?", id);
+    const items = self.parentId === null
+      ? one("SELECT COUNT(*) c FROM items WHERE status<>'trashed' AND (cat_id=? OR cat_sub_id IN (SELECT id FROM categories WHERE parent_id=?))", id, id)
+      : direct;
+    return {
+      items, direct,
+      subs: defs.filter((d) => d.parentId === id).length,
+      suggestions: one("SELECT COUNT(*) c FROM items WHERE cat_suggest_id=? OR cat_suggest_sub_id=?", id, id),
+      children: defs.filter((d) => d.parentId === id).map((d) => ({ id: d.id, name: d.name })),
+    };
+  }
+
+  /** 把子分类移动到另一个一级分类下（ID 不变）。 */
+  moveCategory(id: string, parentId: string): CategoryDef {
+    const defs = this.categoryDefs();
+    const self = defs.find((d) => d.id === id);
+    if (!self) throw Object.assign(new Error("分类不存在: " + id), { code: "NOT_FOUND", status: 404 });
+    if (self.parentId === null) throw Object.assign(new Error("只支持把子分类移动到另一个一级分类下（一级骨架不可移动）"), { code: "INVALID_INPUT", status: 400 });
+    const target = defs.find((d) => d.id === parentId);
+    if (!target) throw Object.assign(new Error("目标分类不存在: " + parentId), { code: "INVALID_INPUT", status: 400 });
+    if (target.parentId !== null) throw Object.assign(new Error("目标必须是一级分类: " + parentId), { code: "INVALID_INPUT", status: 400 });
+    if (target.id === self.parentId) return self;
+    this.db.prepare("UPDATE categories SET parent_id=?, updated_at=? WHERE id=?").run(parentId, now(), id);
+    this.invalidateCategories();
+    this.logAudit("category.move", "category", id, { parentId: self.parentId }, { parentId });
+    return this.categoryDefs().find((d) => d.id === id)!;
+  }
+
+  /** 合并分类：from 的素材与建议迁到 into，然后删除 from（事务）。只允许同级合并。 */
+  mergeCategories(fromId: string, intoId: string): { moved: number; movedSuggestions: number; deleted: number } {
+    if (fromId === intoId) throw Object.assign(new Error("不能合并到自己"), { code: "INVALID_INPUT", status: 400 });
+    const defs = this.categoryDefs();
+    const from = defs.find((d) => d.id === fromId); const into = defs.find((d) => d.id === intoId);
+    if (!from || !into) throw Object.assign(new Error("分类不存在: " + (from ? intoId : fromId)), { code: "NOT_FOUND", status: 404 });
+    if (from.builtin) throw Object.assign(new Error("系统分类不能作为合并源（可以合并到系统分类）"), { code: "CONFLICT", status: 409 });
+    const fromTop = from.parentId === null; const intoTop = into.parentId === null;
+    if (fromTop !== intoTop) throw Object.assign(new Error("只能同级合并（一级↔一级、子↔子）"), { code: "INVALID_INPUT", status: 400 });
+    const tx = this.db.transaction(() => {
+      const t = now();
+      let moved = 0; let movedSuggestions = 0; let deleted = 0;
+      if (fromTop) {
+        moved += this.db.prepare("UPDATE items SET cat_id=?, updated_at=? WHERE cat_id=?").run(into.id, t, fromId).changes;
+        movedSuggestions += this.db.prepare("UPDATE items SET cat_suggest_id=?, cat_suggest_sub_id=NULL WHERE cat_suggest_id=?").run(into.id, fromId).changes;
+        for (const kid of defs.filter((d) => d.parentId === fromId).map((d) => d.id)) {
+          moved += this.db.prepare("UPDATE items SET cat_sub_id=NULL, updated_at=? WHERE cat_sub_id=?").run(t, kid).changes;
+          this.db.prepare("UPDATE items SET cat_suggest_sub_id=NULL WHERE cat_suggest_sub_id=?").run(kid);
+          deleted += this.db.prepare("DELETE FROM categories WHERE id=?").run(kid).changes;
+        }
+      } else {
+        moved += this.db.prepare("UPDATE items SET cat_sub_id=?, updated_at=? WHERE cat_sub_id=?").run(into.id, t, fromId).changes;
+        movedSuggestions += this.db.prepare("UPDATE items SET cat_suggest_sub_id=? WHERE cat_suggest_sub_id=?").run(into.id, fromId).changes;
+      }
+      deleted += this.db.prepare("DELETE FROM categories WHERE id=?").run(fromId).changes;
+      this.logAudit("category.merge", "category", fromId, { from: fromId }, { into: intoId, moved, movedSuggestions, deleted });
+      return { moved, movedSuggestions, deleted };
+    });
+    const r = tx();
+    this.invalidateCategories();
+    return r;
+  }
+
+  // ---------- tags（v3：重命名 / 改色 / 删除 / 默认标签播种）----------
+  private tagRow(id: number) { return this.db.prepare("SELECT t.*, (SELECT COUNT(*) FROM item_tags it WHERE it.tag_id=t.id) AS itemCount FROM tags t WHERE t.id=?").get(id); }
+
+  updateTag(id: number, patch: { name?: string; color?: string | null; sort?: number }): any {
+    const cur = this.tagRow(id) as any;
+    if (!cur) throw Object.assign(new Error("标签不存在: " + id), { code: "NOT_FOUND", status: 404 });
+    const sets: string[] = []; const params: unknown[] = [];
+    if (patch.name !== undefined) {
+      const name = String(patch.name).trim();
+      if (!name) throw Object.assign(new Error("标签名不能为空"), { code: "INVALID_INPUT", status: 400 });
+      const dup = this.db.prepare("SELECT id FROM tags WHERE IFNULL(namespace,'')=IFNULL(?,'') AND name=? AND id<>?").get(cur.namespace, name, id) as any;
+      if (dup) throw Object.assign(new Error("已有同名标签（id=" + dup.id + "），可以合并到它"), { code: "CONFLICT", status: 409 });
+      sets.push("name = ?"); params.push(name);
+    }
+    if (patch.color !== undefined) { sets.push("color = ?"); params.push(patch.color); }
+    if (patch.sort !== undefined) { sets.push("sort = ?"); params.push(patch.sort); }
+    if (sets.length === 0) return this.tagRow(id);
+    params.push(id);
+    this.db.prepare("UPDATE tags SET " + sets.join(", ") + " WHERE id=?").run(...params as any[]);
+    this.logAudit("tag.update", "tag", String(id), { name: cur.name, color: cur.color }, patch);
+    return this.tagRow(id);
+  }
+
+  /** 删除标签：同时删掉关联（不删素材、不删文件）。 */
+  deleteTag(id: number): { removed: number } {
+    const cur = this.tagRow(id) as any;
+    if (!cur) throw Object.assign(new Error("标签不存在: " + id), { code: "NOT_FOUND", status: 404 });
+    const tx = this.db.transaction(() => {
+      const removed = this.db.prepare("DELETE FROM item_tags WHERE tag_id=?").run(id).changes;
+      this.db.prepare("DELETE FROM tags WHERE id=?").run(id);
+      this.logAudit("tag.delete", "tag", String(id), { name: cur.name }, { removed });
+      return { removed };
+    });
+    return tx();
+  }
+
+  /** 默认标签只播种一次（settings.tags_seed_version）；用户删掉的不会被复活。 */
+  seedDefaultTags(tags: readonly { name: string; color?: string; namespace?: string; sort?: number }[], version: string): number {
+    if (this.getSetting("tags_seed_version") === version) return 0;
+    const tx = this.db.transaction(() => {
+      let added = 0;
+      for (const t of tags) {
+        const exists = this.db.prepare("SELECT id FROM tags WHERE IFNULL(namespace,'')=IFNULL(?,'') AND name=?").get(t.namespace ?? null, t.name) as any;
+        if (exists) continue;
+        this.db.prepare("INSERT INTO tags(name, namespace, color, sort) VALUES (?,?,?,?)").run(t.name, t.namespace ?? null, t.color ?? null, t.sort ?? 0);
+        added++;
+      }
+      this.db.prepare("INSERT INTO settings(key, value) VALUES ('tags_seed_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(version);
+      return added;
+    });
+    return tx();
+  }
 
   // ---------- stats / export ----------
   stats(): StatsShape {

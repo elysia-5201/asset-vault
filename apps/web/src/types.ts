@@ -179,10 +179,16 @@ export interface ItemQuery {
   /** 物品分类多选（URL 键是 catIds；命中任一/全部由 categoryMatch 决定） */
   categoryIds?: string[];
   categoryMatch?: "any" | "all";
-  /** 只看未分类（cat_id IS NULL） */
+  /** 只看未分类（cat_id IS NULL，v3 起等价于分类树里的系统分类「未分类」） */
   uncategorized?: boolean;
   /** 只看有待确认的自动分类建议 */
   pendingCategory?: boolean;
+  /** 标签多选（URL 键是 tags=a,b；与旧的单值 tag 并存，两者都会被服务端 OR 到同一条件上） */
+  tags?: string[];
+  /** 多标签语义：any=命中任一（默认）；all=必须同时具有全部 */
+  tagsMatch?: "any" | "all";
+  /** 只看收藏（URL 键 favoriteOnly=1） */
+  favoriteOnly?: boolean;
   sort?: "updated" | "title" | "size";
   limit?: number;
   offset?: number;
@@ -211,6 +217,35 @@ export interface CategoryStats {
   total: number;
   missingFiles: number;
 }
+/**
+ * GET /api/categories/counts?<与 /api/items 相同的筛选参数> → { all, uncategorized, tops, subs }
+ * 口径：**当前筛选下**的计数（分类筛选本身不参与，否则只会剩被选中的那个分类）。
+ * 分类管理页用 GET /api/categories 的全局 stats，两者别混。
+ */
+export interface CategoryCounts {
+  all: number;
+  uncategorized: number;
+  /** 一级分类 id → 条目数（含其下子分类的归属） */
+  tops: Record<string, number>;
+  /** 子分类 id → 条目数 */
+  subs: Record<string, number>;
+}
+/** GET /api/categories/:id/impact —— 删除/合并前的影响面。 */
+export interface CategoryImpact {
+  /** 该分类（一级含其子分类）下的条目数 */
+  items: number;
+  /** 只算直接挂在该节点上的条目数（服务端给，mock 也给） */
+  direct?: number;
+  /** 子分类数 */
+  subs: number;
+  /** 引用了该分类（或该分类建议）的条目数 */
+  suggestions: number;
+  /** 子分类清单（服务端给） */
+  children?: { id: string; name: string }[];
+}
+/** GET /api/tags 的一条：TagRow + 被多少条目使用（契约 §4 补 itemCount）。 */
+export type TagListRow = TagRow & { itemCount?: number };
+
 /** GET /api/categories */
 export interface CategoriesResponse {
   categories: CategoryNode[];

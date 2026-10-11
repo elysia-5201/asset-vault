@@ -6,7 +6,7 @@
  * 因此 cardOf / listItems 的投影与真实后端同形。
  */
 import { DEFAULT_CATEGORY_THRESHOLDS } from "@core/categories/classify";
-import { DEFAULT_TAXONOMY, type CategoryDef, type CategoryLevel } from "@core/categories/taxonomy";
+import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID, type CategoryDef, type CategoryLevel } from "@core/categories/taxonomy";
 import type { CategoryAssignment, CategoryNode, CategoryRefSource, CategorySuggestion, ItemRow } from "@core/contracts";
 
 export interface MockCategoryConfig { autoThreshold: number; suggestThreshold: number }
@@ -20,8 +20,9 @@ export const NO_CAT = {
 export const categoryDefs: CategoryDef[] = DEFAULT_TAXONOMY.map((d) => ({ ...d }));
 export const categoryConfig: MockCategoryConfig = { ...DEFAULT_CATEGORY_THRESHOLDS };
 
-// 故意停用一个子分类：前端下拉/筛选必须跳过它（enabled=false），但**已归属**的条目仍要显示它的名字。
-const DISABLED_SEED = "hair.texture";
+// 故意停用一个子分类：前端下拉/筛选必须跳过它（enabled=false），但**已归属**的条目仍要显示它的名字，
+// 且按它筛选仍能命中（v3：停用只影响"能不能被新选"，不影响已有归属）。
+const DISABLED_SEED = "hair.set";
 {
   const d = categoryDefs.find((x) => x.id === DISABLED_SEED);
   if (d) d.enabled = false;
@@ -166,16 +167,168 @@ export function statsOf(items: ItemRow[], isOwned: (itemId: number) => boolean, 
   };
 }
 
+// ---------- v3：筛选计数 / 影响面 / 移动 / 合并 / 删除（与 apps/server/src/db/repo.ts 同语义） ----------
+
+/** 带 code/status 的 mock 错误（由 mock/index.ts 译成 MockHttpError，语义对齐服务端 Object.assign(new Error(...), {code,status})）。 */
+function cerr(code: string, message: string, status: number): Error {
+  return Object.assign(new Error(message), { code, status });
+}
+
+export interface MockCategoryCounts {
+  all: number;
+  uncategorized: number;
+  /** 一级分类 id → 条目数（含其下子分类的归属） */
+  tops: Record<string, number>;
+  /** 子分类 id → 条目数 */
+  subs: Record<string, number>;
+}
+
+/**
+ * GET /api/categories/counts 的口径：**调用方传入的行必须已经过"非分类筛选"**，
+ * 分类条件本身不参与（否则只会剩被选中的那个分类）。未分类 = cat_id 为空或指向系统分类。
+ */
+export function countsOf(rows: ItemRow[]): MockCategoryCounts {
+  const tops: Record<string, number> = {}; const subs: Record<string, number> = {};
+  let uncategorized = 0;
+  for (const i of rows) {
+    const top = i.cat_id;
+    if (!top || top === UNCATEGORIZED_ID) { uncategorized += 1; continue; }
+    tops[top] = (tops[top] ?? 0) + 1;
+    if (i.cat_sub_id) subs[i.cat_sub_id] = (subs[i.cat_sub_id] ?? 0) + 1;
+  }
+  tops[UNCATEGORIZED_ID] = uncategorized;
+  return { all: rows.length, uncategorized, tops, subs };
+}
+
+export interface MockCategoryImpact {
+  items: number;
+  direct: number;
+  subs: number;
+  suggestions: number;
+  children: { id: string; name: string }[];
+}
+
+/** GET /api/categories/:id/impact（删除/合并前的影响面）。 */
+export function impactOf(all: ItemRow[], id: string): MockCategoryImpact {
+  const self = catById(id);
+  if (!self) throw cerr("NOT_FOUND", "分类不存在：" + id, 404);
+  const live = all.filter((i) => i.status !== "trashed");
+  const children = catChildren(id).map((c) => ({ id: c.id, name: c.name }));
+  const direct = self.parentId === null
+    ? live.filter((i) => i.cat_id === id).length
+    : live.filter((i) => i.cat_sub_id === id).length;
+  const items = self.parentId === null
+    ? live.filter((i) => i.cat_id === id || (i.cat_sub_id !== null && catById(i.cat_sub_id)?.parentId === id)).length
+    : direct;
+  return {
+    items, direct, subs: children.length,
+    suggestions: live.filter((i) => i.cat_suggest_id === id || i.cat_suggest_sub_id === id).length,
+    children,
+  };
+}
+
+/** POST /api/categories/:id/move {parentId} —— 子分类换父（ID 不变）。 */
+export function moveCategoryTo(id: string, parentId: string): CategoryDef {
+  const self = catById(id);
+  if (!self) throw cerr("NOT_FOUND", "分类不存在：" + id, 404);
+  if (self.parentId === null) throw cerr("INVALID_INPUT", "只支持把子分类移动到另一个一级分类下（一级骨架不可移动）", 400);
+  const target = catById(parentId);
+  if (!target) throw cerr("INVALID_INPUT", "目标分类不存在：" + parentId, 400);
+  if (target.parentId !== null) throw cerr("INVALID_INPUT", "目标必须是一级分类：" + parentId, 400);
+  self.parentId = target.id;
+  return self;
+}
+
+/** POST /api/categories/:id/merge {intoId} —— from 的素材与建议迁到 into，然后删除 from（同级合并）。 */
+export function mergeInMock(all: ItemRow[], fromId: string, intoId: string, now: string): { moved: number; movedSuggestions: number; deleted: number } {
+  if (fromId === intoId) throw cerr("INVALID_INPUT", "不能合并到自己", 400);
+  const from = catById(fromId); const into = catById(intoId);
+  if (!from || !into) throw cerr("NOT_FOUND", "分类不存在：" + (from ? intoId : fromId), 404);
+  if (from.builtin) throw cerr("CONFLICT", "系统分类不能作为合并源（可以合并到系统分类）", 409);
+  if ((from.parentId === null) !== (into.parentId === null)) throw cerr("INVALID_INPUT", "只能同级合并（一级↔一级、子↔子）", 400);
+  let moved = 0; let movedSuggestions = 0; let deleted = 0;
+  if (from.parentId === null) {
+    for (const i of all) {
+      if (i.cat_id === fromId) { i.cat_id = into.id; i.updated_at = now; moved += 1; }
+      if (i.cat_suggest_id === fromId) { i.cat_suggest_id = into.id; i.cat_suggest_sub_id = null; movedSuggestions += 1; }
+    }
+    for (const kid of catChildren(fromId)) {
+      for (const i of all) {
+        if (i.cat_sub_id === kid.id) { i.cat_sub_id = null; i.updated_at = now; moved += 1; }
+        if (i.cat_suggest_sub_id === kid.id) i.cat_suggest_sub_id = null;
+      }
+      const at = categoryDefs.findIndex((d) => d.id === kid.id);
+      if (at >= 0) { categoryDefs.splice(at, 1); deleted += 1; }
+    }
+  } else {
+    for (const i of all) {
+      if (i.cat_sub_id === fromId) { i.cat_sub_id = into.id; i.updated_at = now; moved += 1; }
+      if (i.cat_suggest_sub_id === fromId) { i.cat_suggest_sub_id = into.id; movedSuggestions += 1; }
+    }
+  }
+  const at = categoryDefs.findIndex((d) => d.id === fromId);
+  if (at >= 0) { categoryDefs.splice(at, 1); deleted += 1; }
+  return { moved, movedSuggestions, deleted };
+}
+
+/** 把一批条目整体清成「未分类」（cat_* 全清，与 repo.deleteCategory 的 clearAll 一致）。 */
+function clearAllOf(row: ItemRow, now: string): void {
+  row.cat_id = null; row.cat_sub_id = null; row.cat_source = null; row.cat_confidence = null;
+  row.cat_reason = null; row.cat_evidence = null; row.cat_assigned_at = null; row.updated_at = now;
+}
+
+/** DELETE /api/categories/:id?transferTo=<id|none> —— 素材先转移再删；系统分类/有子分类 → 409。 */
+export function deleteInMock(all: ItemRow[], id: string, transferTo: string | null | undefined, now: string): { moved: number; movedSubs: number; movedSuggestions: number; deleted: number } {
+  const self = catById(id);
+  if (!self) throw cerr("NOT_FOUND", "分类不存在：" + id, 404);
+  if (self.builtin) throw cerr("CONFLICT", "系统分类不能删除，请改用停用（enabled=false）", 409);
+  const kids = catChildren(id);
+  if (kids.length) throw cerr("CONFLICT", "该分类下还有 " + kids.length + " 个子分类，请先删除或移动", 409);
+  const target = transferTo === undefined || transferTo === null || transferTo === "" || transferTo === "none" ? null : catById(transferTo);
+  if (transferTo && transferTo !== "none" && !target) throw cerr("INVALID_INPUT", "转移目标不存在：" + transferTo, 400);
+  let tTop: string | null = null; let tSub: string | null = null;
+  if (target) {
+    if (target.parentId === null) tTop = target.id === UNCATEGORIZED_ID ? null : target.id;
+    else { tTop = target.parentId; tSub = target.id; }
+  }
+  const explicitUncat = transferTo !== undefined && transferTo !== null && tTop === null && tSub === null;
+  let moved = 0; let movedSubs = 0; let movedSuggestions = 0;
+  for (const i of all) {
+    if (i.cat_sub_id === id) {
+      // 显式指定「未分类」= 整条降级（清主分类 + 子分类），与服务端 clearAll + cat_sub_id=? 一致
+      if (explicitUncat) clearAllOf(i, now);
+      else { i.cat_sub_id = tSub; i.updated_at = now; }
+      movedSubs += 1;
+    }
+    if (i.cat_id === id) {
+      if (tTop === null && tSub === null) clearAllOf(i, now);
+      else { i.cat_id = tTop; i.cat_sub_id = tSub; i.cat_source = "manual"; i.cat_assigned_at = now; i.updated_at = now; }
+      moved += 1;
+    }
+    if (i.cat_suggest_id === id || i.cat_suggest_sub_id === id) {
+      if (tTop === null) {
+        i.cat_suggest_id = null; i.cat_suggest_sub_id = null; i.cat_suggest_confidence = null;
+        i.cat_suggest_reason = null; i.cat_suggest_evidence = null; i.cat_suggest_at = null;
+      } else { i.cat_suggest_id = tTop; i.cat_suggest_sub_id = tSub; }
+      movedSuggestions += 1;
+    }
+  }
+  const at = categoryDefs.findIndex((d) => d.id === id);
+  if (at >= 0) categoryDefs.splice(at, 1);
+  return { moved, movedSubs, movedSuggestions, deleted: 1 };
+}
+
 // ---------- mock 内的「自动推荐」（够用即可：真实规则在 packages/core/src/categories/classify.ts） ----------
 interface MockRule { re: RegExp; categoryId: string; subCategoryId: string | null }
+// 子分类 id 必须存在于 v3 taxonomy（否则 setItemCategory 会按"不属于该主分类"清空子分类）
 const RULES: MockRule[] = [
-  { re: /セーラー|衣装|服|dress|hoodie|shirt|skirt|パーカー|巫女|衣装|ブラウス/i, categoryId: "clothing", subCategoryId: "tops" },
-  { re: /髪|ヘア|hair|ウィッグ|ウィッグ/i, categoryId: "hair", subCategoryId: "model" },
-  { re: /アクセサリ|ネックレス|ピアス|耳飾|指輪|飾り|accessor/i, categoryId: "accessories", subCategoryId: "other" },
-  { re: /シェーダー|shader|liltoon|poiyomi|レンダリング/i, categoryId: "shaders", subCategoryId: "shader" },
-  { re: /modular\s*avatar|ツール|tool|kit|キット/i, categoryId: "tools", subCategoryId: "modular_avatar" },
-  { re: /テクスチャ|texture|マテリアル|material/i, categoryId: "textures", subCategoryId: "texture" },
-  { re: /アニメ|モーション|animation|ダンス|ポーズ|モーション/i, categoryId: "animation", subCategoryId: "anim" },
+  { re: /セーラー|衣装|服|dress|hoodie|shirt|skirt|パーカー|巫女|衣装|ブラウス/i, categoryId: "clothing", subCategoryId: "clothing.tops" },
+  { re: /髪|ヘア|hair|ウィッグ|ウィッグ/i, categoryId: "hair", subCategoryId: "hair.set" },
+  { re: /アクセサリ|ネックレス|ピアス|耳飾|指輪|飾り|accessor/i, categoryId: "accessories", subCategoryId: null },
+  { re: /シェーダー|shader|liltoon|poiyomi|レンダリング/i, categoryId: "shaders", subCategoryId: "shaders.general" },
+  { re: /modular\s*avatar|ツール|tool|kit|キット/i, categoryId: "tools", subCategoryId: "tools.avatar" },
+  { re: /テクスチャ|texture|マテリアル|material/i, categoryId: "textures", subCategoryId: null },
+  { re: /アニメ|モーション|animation|ダンス|ポーズ|モーション/i, categoryId: "animation", subCategoryId: "animation.set" },
 ];
 
 export interface MockRecommendation {

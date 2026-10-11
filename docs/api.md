@@ -7,7 +7,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | `{ok, version, dbPath, roots, counts}` |
-| GET | `/items?q=&avatar=&avatarMatch=any|all&ownedOnly=&site=&status=&tag=&container=&imported=1|0&sort=updated|title|size&limit=&offset=&catIds=&catMatch=any|all&uncategorized=1&pendingCategory=1` | `{total, items: ItemCard[]}`；`q` 为 FTS5 trigram 子串（<3 字符回退 LIKE），`avatar` 支持逗号分隔多值；`catIds` 支持逗号分隔与重复键（见「物品分类」） |
+| GET | `/items?q=&avatar=&avatarMatch=any|all&ownedOnly=&site=&status=&tag=&container=&imported=1|0&sort=updated|title|size&limit=&offset=&catIds=&catMatch=any|all&uncategorized=1&pendingCategory=1&tags=&tagsMatch=any|all&favoriteOnly=1` | `{total, items: ItemCard[]}`；`q` 为 FTS5 trigram 子串（<3 字符回退 LIKE），`avatar` 支持逗号分隔多值；`catIds`/`tags` 支持逗号分隔与重复键（见「物品分类」「分类体系 v3」） |
 | GET | `/items/:id` | `ItemDetail`（item/images/assets/avatars/tags/updates） |
 | POST | `/items` `{title, sourceUrl?, notes?}` | 手动建条目 |
 | PATCH | `/items/:id` `{title?, status?, notes?, rating?, favorite?, shopName?, author?, categoryName?, tags?: string[]}` | `tags` 为**全量替换**；返回更新后的 ItemDetail |
@@ -96,7 +96,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 |---|---|---|
 | GET/POST | `/roots`，POST `{path, mode}` | 库根 |
 | DELETE | `/roots/:id` | |
-| GET/POST | `/tags`，POST `{name, namespace?, color?}` | |
+| GET/POST | `/tags`，POST `{name, namespace?, color?}` | POST **幂等**（同名同 namespace 返回已存在的那条）。v3 起 GET 带 `color/sort/itemCount`，另有 `PATCH /tags/:id`、`DELETE /tags/:id`（见「分类体系 v3」） |
 | GET/POST | `/projects`，POST `{name, path}` | Unity 工程 |
 | POST | `/projects/:id/imports` `{itemId, assetId?}` | 记录"已导入"（**登记**，不代表工程里真的有） |
 | POST | `/projects/:id/scan-usage` `{budgetMs?}` | 扫工程 Assets/ 的 GUID 与素材库求交，整表替换 `project_refs`（见「工程实际引用」） |
@@ -228,4 +228,74 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 用户已定的记 `protected:true`（不一致时只写建议）。计数器互斥：`applied + suggested + cleared + skipped === scanned`。
 `cleared` = 清掉的过期建议（无证据、或推荐与当前归属一致）；`skipped` = 无需变动（含推荐与当前归属一致且没有旧建议）。
 推荐与当前归属一致时**不会**再挂一条待确认建议。
+
+## 分类体系 v3（标签 / 筛选计数 / 分类管理）—— 契约 docs/categories-v3.md
+
+v3 是 v2 之上的**增量**：一级分类 15 个（含系统分类「未分类」，0 子分类）+ 80 个二级子分类 = 95 个节点。
+- `uncategorized`（未分类）是**系统一级分类**：不可删除、不可停用，永远可访问，也是删除/合并的合法转移目标。
+  v2 一节里 `other.uncategorized` 的说法在 v3 已不存在（v3 的 other 只有 `other.unclassed` / `other.pending`）。
+- **未分类的规范存储仍是 `items.cat_id IS NULL`**：`cat_id IS NULL` 与 `cat_id='uncategorized'` 视为同一集合
+  （筛选与计数都用这个口径），所以不用给历史素材回写一行 —— 与旧的 `uncategorized=1` 完全等价。
+- 分类结构固定两层；**ID 不随位置变化**：子分类可以被移动到另一个一级分类下（ID 不变，前缀可能与实际父不一致）。
+
+⚠️ 静态段（`/categories/counts`）注册在 `/categories/:id*` 之前 —— `apps/server/src/http/routes.ts` 里静态段一律先注册。
+
+### 标签（与分类严格分开；身份 = `(namespace, name)`，**颜色不是身份**）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/tags` | `{tags: [{id, name, namespace, color, sort, itemCount}]}`，按 namespace → sort → name 排序 |
+| POST | `/tags` `{name, color?, namespace?}` | 新建 → **201** `{tag}`；**同名（同 namespace）幂等**：直接返回已存在的那条 → 200 `{tag}`，绝不重复创建。`name` 空 → 400 |
+| PATCH | `/tags/:id` `{name?, color?, sort?}` | → `{tag}`。改名按 **id** 关联，素材上的标签自动跟随；改成已存在的名字 → 409；不存在 → 404 |
+| DELETE | `/tags/:id` | → `{removed: n}`（同时删 `item_tags` 关联；**不删素材、不删文件**）；不存在 → 404 |
+
+默认标签**只播种一次**（`settings.tags_seed_version`；`apps/server/src/server.ts` 启动时调
+`repo.seedDefaultTags(DEFAULT_TAGS, TAGS_SEED_VERSION)`，表在 `packages/core/src/categories/default-tags.ts`）：
+哥特风 / 可爱风 / 赛博风 / 黑色 / 白色 / 免费 / 已购买 / PhysBones / Modular Avatar / Quest 兼容 / 待检查。
+用户删掉的**不会**被下一次启动复活。
+
+### 筛选参数（`/items` 与 `/categories/counts` 完全共用同一解析器，v3 增量）
+
+| 参数 | 说明 |
+|---|---|
+| `tags=a,b` | 标签多选（逗号分隔或重复键），形状与 `avatar` 一致；与旧的单个 `tag=` **同时给出时是 AND** |
+| `tagsMatch=any\|all` | 默认 `any`（命中任一标签）；`all` = 必须同时具备全部标签（`COUNT(DISTINCT t.name) = N`） |
+| `favoriteOnly=1` | 只看收藏（`items.favorite = 1`） |
+
+关键词 / 分类（`catIds` + `catMatch`）/ 标签（`tags` + `tagsMatch`，或旧 `tag`）/ 头像 / 来源 / 状态 / 容器 / 已导入 /
+收藏 / 未分类 / 待确认建议 全部在 `repo.buildWhere()` 里拼成**一条真实 SQL**（路由层不做二次过滤，前端也不过滤）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/categories/counts?...与 /items 相同...` | 当前筛选下的分类计数：`{all, uncategorized, tops: {id: count}, subs: {id: count}}`。**一次 GROUP BY** 算出（不是每个分类查一次）；**分类筛选参数本身不参与计数**（repo 层已剔除，否则只会剩被选中的那个分类）。恒等式：`counts.all === GET /items（同一 query）.total`，`counts.uncategorized === GET /items?uncategorized=1.total` |
+
+### 分类管理
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/categories/:id/impact` | 删除/合并前的影响面 → `{items, direct, subs, suggestions, children: [{id, name}]}`；不存在 → 404 |
+| POST | `/categories/:id/move` `{parentId}` | 子分类换父（**ID 不变**，允许跨一级分类）→ `{category}`；一级骨架不可移动 / 目标不是一级 / `parentId` 缺失 → 400；不存在 → 404 |
+| POST | `/categories/:id/merge` `{intoId}` | 合并 → `{moved, deleted, movedSuggestions}`：素材与待确认建议先迁到 `intoId`，再删源（**事务**，绝不删素材）。**系统分类不能作为合并源 → 409**；只允许同级合并（一级↔一级、子↔子）→ 400；`intoId` 缺失 → 400 |
+| DELETE | `/categories/:id?transferTo=<id\|none>` | → `{moved, movedSubs, deleted, movedSuggestions}`：素材先转移再删行（**事务**）。`transferTo` 缺省或 `none` = 未分类（清空归属）；系统分类 → 409；不存在 → 404 |
+
+**系统分类（`builtin=true`）不可删除、不可停用**：`DELETE /categories/:id` 与 `PATCH /categories/:id {enabled:false}` 都 → 409
+（改名/排序不受限）；普通分类可自由增删改移合并。
+
+**合并一级分类的子分类语义（实现口径）**：`repo.mergeCategories` 合并一级分类时会把它**原有的子分类一并删除**，
+指向这些子分类的素材只清空 `cat_sub_id`（主分类改指目标）。因此返回的 `deleted` = 1(源) + N(被删的孤儿子分类)，
+调用方请按 `deleted >= 1` 判断「源分类已消失」，不要写死 `=== 1`。
+
+### 建议标签（只建议，**绝不**自动写 `item_tags`）
+
+`GET /items/:id` 的响应额外带 **`suggestedTags: [{name, reason}]`**（v3 增量、只读派生，见
+`apps/server/src/services/categories.ts` 的 `suggestTagsFor`）：按已有证据（标题/日文标题/描述/备注/文件名/包内路径）
+匹配少量高置信关键词（PhysBones / Modular Avatar / Quest 兼容 / 免费 / 哥特风 / 可爱风）；
+只建议**标签表里已存在**且该条目**还没有**的标签（用户删掉的标签不会被复活），**绝不写库**；任何异常一律返回 `[]`。
+
+### 计数口径小结
+
+- `GET /categories` 的 `stats.counts[].count` = **全局计数**（不受筛选影响）→ 管理页用。
+- `GET /categories/counts` = **当前筛选下**的计数 → 分类导航栏用（UI 需标明「当前筛选下」）。
+- 两者都只统计 `status <> 'trashed'`；未分类 = `cat_id IS NULL OR cat_id = 'uncategorized'`。
+
 

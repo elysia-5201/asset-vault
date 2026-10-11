@@ -11,12 +11,12 @@ import type {
 import { mockHandle, mockMediaUrl, mockEntry, MockHttpError } from "./mock";
 import type {
   AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BatchCategoryResponse, BoothPeekResponse,
-  CategoriesResponse, CategoryConfig, CategoryNode, CategoryStatCount,
+  CategoriesResponse, CategoryConfig, CategoryCounts, CategoryImpact, CategoryNode, CategoryStatCount,
   DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
-  RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse,
+  RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse,
   UpdateCheckResponse, ViewMode,
 } from "./types";
 export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse } from "./types";
@@ -209,10 +209,24 @@ export async function getHealth(): Promise<HealthResponse> {
   };
 }
 
-export async function listItems(q: ItemQuery): Promise<ItemsResponse> {
-  const raw = await request<unknown>("GET", "/items" + queryString({
+/**
+ * 与 /api/items 同名的筛选参数（**不含分类条件**：计数口径要求分类本身不参与过滤）。
+ * GET /api/categories/counts 与 GET /api/items 共用这一份，避免两边参数走偏。
+ */
+function itemFilterParams(q: ItemQuery): Record<string, unknown> {
+  return {
     q: q.q, avatar: q.avatar, avatarMatch: q.avatarMatch, ownedOnly: q.ownedOnly ? 1 : undefined,
     site: q.site, status: q.status, tag: q.tag, container: q.container, imported: q.imported,
+    // 标签多选（docs/categories-v3.md §4）：tags=a,b + tagsMatch=any|all；旧单值 tag 保持原样
+    tags: q.tags && q.tags.length ? q.tags.join(",") : undefined,
+    tagsMatch: q.tagsMatch && q.tagsMatch !== "any" ? q.tagsMatch : undefined,
+    favoriteOnly: q.favoriteOnly ? 1 : undefined,
+  };
+}
+
+export async function listItems(q: ItemQuery): Promise<ItemsResponse> {
+  const raw = await request<unknown>("GET", "/items" + queryString({
+    ...itemFilterParams(q),
     // 契约写法是 catIds=clothing,clothing.tops（服务端按 avatar 的方式 String(x).split(",")，逗号串两种实现都吃）
     catIds: q.categoryIds && q.categoryIds.length ? q.categoryIds.join(",") : undefined,
     catMatch: q.categoryMatch && q.categoryMatch !== "any" ? q.categoryMatch : undefined,
@@ -251,6 +265,12 @@ export function isCategoryApiMissing(e: unknown): boolean {
   if (e instanceof ApiError) {
     return e.status === 404 || e.status === 405 || e.status === 501 || e.code === "NOT_FOUND";
   }
+  // mock 模式下 request() 会把 MockHttpError 原样抛出（不经过 ApiError），这里按形状兜一层
+  const err = e as { status?: unknown; code?: unknown } | null;
+  if (err && typeof err === "object") {
+    const st = typeof err.status === "number" ? err.status : 0;
+    return st === 404 || st === 405 || st === 501 || err.code === "NOT_FOUND";
+  }
   return false;
 }
 /** 分类相关请求的可读错误（404 时明确说「后端未提供分类接口」）。 */
@@ -282,6 +302,64 @@ export async function getCategories(): Promise<CategoriesResponse> {
       autoThreshold: num01(config.autoThreshold, 0.75),
       suggestThreshold: num01(config.suggestThreshold, 0.4),
     } as CategoryConfig,
+  };
+}
+
+/** 数字映射表归一化：服务端给 { id: count }，容忍数组形状 [{id,count}] 与缺字段。 */
+function countMap(x: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (Array.isArray(x)) {
+    for (const e of x) {
+      const r = rec(e);
+      const id = typeof r.id === "string" ? r.id : "";
+      if (id) out[id] = numOr(r.count, 0);
+    }
+    return out;
+  }
+  const r = rec(x);
+  for (const [k, v] of Object.entries(r)) out[k] = numOr(v, 0);
+  return out;
+}
+
+/**
+ * GET /api/categories/counts?<与 /api/items 相同的筛选参数> → { all, uncategorized, tops, subs }
+ * 一级分类栏显示的就是这份**当前筛选下**的计数（随关键词/标签/头像/来源/状态/容器/已导入/收藏变化）。
+ */
+export async function getCategoryCounts(q: ItemQuery = {}): Promise<CategoryCounts> {
+  const raw = rec(await request<unknown>("GET", "/categories/counts" + queryString(itemFilterParams(q))));
+  return {
+    all: numOr(raw.all, 0),
+    uncategorized: numOr(raw.uncategorized, 0),
+    tops: countMap(raw.tops),
+    subs: countMap(raw.subs),
+  };
+}
+
+/** GET /api/categories/:id/impact → 删除/合并前的影响面（UI 二次确认要显示的数字）。 */
+export async function getCategoryImpact(id: string): Promise<CategoryImpact> {
+  const raw = rec(await request<unknown>("GET", "/categories/" + encodeURIComponent(id) + "/impact"));
+  return {
+    items: numOr(raw.items, 0),
+    direct: raw.direct === undefined ? undefined : numOr(raw.direct, 0),
+    subs: numOr(raw.subs, 0),
+    suggestions: numOr(raw.suggestions, 0),
+    children: arr<{ id: string; name: string }>(raw.children).filter((c) => c && typeof c.id === "string"),
+  };
+}
+
+/** POST /api/categories/:id/move {parentId} —— 子分类换父（ID 不变）。 */
+export async function moveCategory(id: string, parentId: string): Promise<CategoryNode> {
+  const raw = rec(await request<unknown>("POST", "/categories/" + encodeURIComponent(id) + "/move", { parentId }));
+  return rec(raw.category) as unknown as CategoryNode;
+}
+
+/** POST /api/categories/:id/merge {intoId} —— 素材与建议迁到目标后删源（事务）。 */
+export async function mergeCategory(id: string, intoId: string): Promise<{ moved: number; movedSuggestions?: number; deleted: number }> {
+  const raw = rec(await request<unknown>("POST", "/categories/" + encodeURIComponent(id) + "/merge", { intoId }));
+  return {
+    moved: numOr(raw.moved, 0),
+    movedSuggestions: raw.movedSuggestions === undefined ? undefined : numOr(raw.movedSuggestions, 0),
+    deleted: numOr(raw.deleted, 0),
   };
 }
 
@@ -354,9 +432,13 @@ export async function updateCategory(id: string, patch: { name?: string; parentI
   const raw = rec(await request<unknown>("PATCH", "/categories/" + encodeURIComponent(id), patch));
   return (rec(raw.category) as unknown as CategoryNode);
 }
-/** DELETE /api/categories/:id —— 有子分类 → 409；返回被移出的条目数。 */
-export function deleteCategory(id: string): Promise<{ moved: number; movedSubs: number }> {
-  return request("DELETE", "/categories/" + encodeURIComponent(id));
+/**
+ * DELETE /api/categories/:id?transferTo=<id|none> —— 素材先转移再删；系统分类 409。
+ * transferTo 缺省（undefined）时不带该参数，服务端按"未分类"处理。
+ */
+export function deleteCategory(id: string, transferTo?: string | null): Promise<{ moved: number; movedSubs: number; deleted?: number }> {
+  const q = transferTo === undefined ? "" : "?transferTo=" + encodeURIComponent(transferTo === null ? "none" : transferTo);
+  return request("DELETE", "/categories/" + encodeURIComponent(id) + q);
 }
 export function deleteItem(id: number): Promise<unknown> { return request("DELETE", "/items/" + id); }
 export function restoreItem(id: number): Promise<ItemCardWeb> { return request("POST", "/items/" + id + "/restore"); }
@@ -659,8 +741,46 @@ export async function scanProjectUsage(projectId: number): Promise<ScanUsageResp
 export async function listRoots(): Promise<RootsResponse> {
   return { roots: pickArray<LibraryRootRow>(await request<unknown>("GET", "/roots"), "roots") };
 }
+/** GET /api/tags —— v3 起契约补 color/sort/itemCount（缺 itemCount 时前端只不显示计数）。 */
 export async function listTags(): Promise<TagsResponse> {
-  return { tags: pickArray<TagRow>(await request<unknown>("GET", "/tags"), "tags") };
+  const raw = pickArray<TagListRow>(await request<unknown>("GET", "/tags"), "tags");
+  return {
+    tags: raw.map((t) => ({
+      id: numOr(t.id, 0),
+      name: typeof t.name === "string" ? t.name : String(t.name ?? ""),
+      namespace: typeof t.namespace === "string" ? t.namespace : null,
+      color: typeof t.color === "string" ? t.color : null,
+      sort: numOr(t.sort, 0),
+      itemCount: t.itemCount === undefined ? undefined : numOr(t.itemCount, 0),
+    })),
+  };
+}
+/** POST /api/tags {name,color?} —— 幂等：同名（同一 namespace）直接返回已存在的那个。 */
+export async function createTag(body: { name: string; color?: string | null; namespace?: string | null }): Promise<TagListRow> {
+  const raw = rec(await request<unknown>("POST", "/tags", body));
+  const tag = rec(raw.tag ?? raw);
+  return {
+    id: numOr(tag.id, 0), name: String(tag.name ?? body.name),
+    namespace: typeof tag.namespace === "string" ? tag.namespace : null,
+    color: typeof tag.color === "string" ? tag.color : null, sort: numOr(tag.sort, 0),
+    itemCount: tag.itemCount === undefined ? undefined : numOr(tag.itemCount, 0),
+  };
+}
+/** PATCH /api/tags/:id {name?,color?} —— 素材关联按 id 跟随，改名不丢关联。 */
+export async function updateTag(id: number, patch: { name?: string; color?: string | null }): Promise<TagListRow> {
+  const raw = rec(await request<unknown>("PATCH", "/tags/" + id, patch));
+  const tag = rec(raw.tag ?? raw);
+  return {
+    id: numOr(tag.id, id), name: String(tag.name ?? ""),
+    namespace: typeof tag.namespace === "string" ? tag.namespace : null,
+    color: typeof tag.color === "string" ? tag.color : null, sort: numOr(tag.sort, 0),
+    itemCount: tag.itemCount === undefined ? undefined : numOr(tag.itemCount, 0),
+  };
+}
+/** DELETE /api/tags/:id → { removed }（同时删 item_tags 关联；不删素材、不删文件）。 */
+export async function deleteTag(id: number): Promise<{ removed: number }> {
+  const raw = rec(await request<unknown>("DELETE", "/tags/" + id));
+  return { removed: numOr(raw.removed, 0) };
 }
 export function getStats(): Promise<StatsResponse> { return request("GET", "/stats"); }
 
