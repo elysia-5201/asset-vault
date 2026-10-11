@@ -1,8 +1,9 @@
 name: build
 
+# 只在**手动触发**时构建：不再跟随 tag 推送自动出包 / 发 Release。
+# 需要时由 lead 按用户指令触发（Actions 页面 Run workflow，或 gh workflow run build）。
+# 将来若要发 Release：给对应 commit 打 tag 后再手动触发 —— Publish 步骤只在 tag ref 上执行。
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
