@@ -125,6 +125,11 @@ export interface ItemRow {
   adult: number; status: ItemStatus; rating: number | null; favorite: number; notes: string | null;
   cover_image_id: number | null; compat_declared_count: number | null; id_confidence: number | null;
   id_match_method: string | null; source_gone: number; last_checked_at: string | null; created_at: string; updated_at: string;
+  // 物品分类（v2）：cat_id 为 null = 未分类；cat_source 见 CategoryRefSource
+  cat_id: string | null; cat_sub_id: string | null; cat_source: CategoryRefSource | null; cat_confidence: number | null;
+  cat_reason: string | null; cat_evidence: string | null; cat_assigned_at: string | null;
+  cat_suggest_id: string | null; cat_suggest_sub_id: string | null; cat_suggest_confidence: number | null;
+  cat_suggest_reason: string | null; cat_suggest_evidence: string | null; cat_suggest_at: string | null;
 }
 export interface ImageRow {
   id: number; item_id: number; role: ImageRole; origin: ImageOrigin; source_url: string | null; file_path: string | null;
@@ -156,9 +161,60 @@ export interface ItemCard {
   avatars: { id: number; name: string; match: AvatarMatch }[]; tags: string[]; compatDeclaredCount: number | null;
   /** 所属套装（collection）名称，用于卡片徽章与筛选展示 */
   collections?: { id: number; name: string }[];
+  /** 分类归属；null = 未分类（卡片显示「未分类」） */
+  category?: CategoryAssignment | null;
+  /** 自动推荐待确认；null = 无待确认建议 */
+  suggestion?: CategorySuggestion | null;
   updatedAt: string;
 }
 export interface ItemDetail extends ItemCard { item: ItemRow; images: ImageRow[]; assets: AssetRow[]; notes: string | null; description: string | null; collections?: { id: number; name: string }[] }
+
+// ---------- 物品分类（Asset Categories）----------
+// 分类定义/规则的唯一真源是 packages/core/src/categories/{taxonomy,classify}.ts；
+// 这里只做类型再导出，保证服务端与前端用同一份类型，避免两处定义漂移。
+export type { CategoryDef, CategorySource, CategoryLevel } from "./categories/taxonomy";
+export type { CategoryRule, CategoryEvidenceHit, CategoryEvidenceInput, CategoryRecommendation, CategoryThresholds } from "./categories/classify";
+
+/** 素材的分类归属（主分类 + 可选子分类）。categoryId 为 null 表示未分类。 */
+export interface CategoryAssignment {
+  categoryId: string | null;
+  categoryName: string | null;
+  subCategoryId: string | null;
+  subCategoryName: string | null;
+  /** manual=手选 / confirmed=采纳建议 / auto=高置信度自动应用 / migrated=历史迁移；null=未分类 */
+  source: CategoryRefSource | null;
+  confidence: number | null;
+  /** 命中依据的结构化证据（可展开查看） */
+  evidence: unknown[] | null;
+  /** 人类可读依据说明 */
+  reason: string | null;
+  assignedAt: string | null;
+}
+export type CategoryRefSource = "manual" | "confirmed" | "auto" | "migrated";
+
+/** 自动推荐、尚未确认（不覆盖用户手选分类。§6） */
+export interface CategorySuggestion {
+  categoryId: string;
+  categoryName: string;
+  subCategoryId: string | null;
+  subCategoryName: string | null;
+  confidence: number;
+  reason: string | null;
+  evidence: unknown[] | null;
+  suggestedAt: string | null;
+}
+
+/** 分类树节点（API 返回；含每个分类的素材数） */
+export interface CategoryNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  sort: number;
+  enabled: boolean;
+  builtin: boolean;
+  itemCount: number;
+  children?: CategoryNode[];
+}
 
 // ---------- 错误 ----------
 export type AppErrorCode =

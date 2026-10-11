@@ -50,12 +50,33 @@ CREATE TABLE IF NOT EXISTS items (
   id_confidence REAL, id_match_method TEXT,
   source_gone INTEGER NOT NULL DEFAULT 0,
   last_checked_at TEXT,
+  -- 物品分类（v2，用户自己的分类体系，与 BOOTH 自带 category_name/category_parent 是两个维度）
+  cat_id TEXT, cat_sub_id TEXT, cat_source TEXT, cat_confidence REAL,
+  cat_reason TEXT, cat_evidence TEXT, cat_assigned_at TEXT,
+  cat_suggest_id TEXT, cat_suggest_sub_id TEXT, cat_suggest_confidence REAL,
+  cat_suggest_reason TEXT, cat_suggest_evidence TEXT, cat_suggest_at TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_items_source ON items(source_site, source_item_id) WHERE source_item_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_items_status ON items(status);
 CREATE INDEX IF NOT EXISTS ix_items_shop ON items(shop_name);
 CREATE INDEX IF NOT EXISTS ix_items_updated ON items(updated_at DESC);
+CREATE INDEX IF NOT EXISTS ix_items_cat ON items(cat_id);
+CREATE INDEX IF NOT EXISTS ix_items_cat_sub ON items(cat_sub_id);
+CREATE INDEX IF NOT EXISTS ix_items_cat_suggest ON items(cat_suggest_id);
+
+-- 物品分类树（两层：parent_id IS NULL = 主分类）。初始内容由 migrate 从 DEFAULT_TAXONOMY 幂等播种。
+CREATE TABLE IF NOT EXISTS categories (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  parent_id TEXT REFERENCES categories(id) ON DELETE RESTRICT,
+  sort INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  builtin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_categories_parent ON categories(parent_id, sort);
 
 CREATE TABLE IF NOT EXISTS assets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

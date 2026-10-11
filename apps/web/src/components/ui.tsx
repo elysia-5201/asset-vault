@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { AvatarMatch, ContainerKind, ItemStatus, SourceSite } from "@core/contracts";
+import type { AvatarMatch, CategoryRefSource, ContainerKind, ItemStatus, SourceSite } from "@core/contracts";
 import { parseEvidence, shortenPath } from "../util";
 
 export function Badge(props: { tone?: "ok" | "warn" | "bad" | "busy" | "muted" | "violet" | ""; children: ReactNode; title?: string }) {
@@ -104,6 +104,10 @@ export const SITE_LABEL: Record<SourceSite, string> = {
 export const STATUS_LABEL: Record<ItemStatus, string> = { inbox: "待整理", active: "在库", archived: "归档", trashed: "回收站" };
 export const CONTAINER_LABEL: Record<ContainerKind, string> = { zip: "zip", "7z": "7z", rar: "rar", unitypackage: "unitypackage", dir: "目录", file: "单文件" };
 export const MATCH_LABEL: Record<AvatarMatch, string> = { any: "任一", all: "全部", exclude: "排除" };
+/** 物品分类归属来源（docs/categories.md §6）。 */
+export const CATEGORY_SOURCE_LABEL: Record<CategoryRefSource, string> = {
+  manual: "手动设置", confirmed: "采纳建议", auto: "自动推断", migrated: "历史迁移",
+};
 
 export const SITES: SourceSite[] = ["booth", "gumroad", "unity_asset_store", "itch", "other", "local"];
 export const STATUSES: ItemStatus[] = ["inbox", "active", "archived", "trashed"];

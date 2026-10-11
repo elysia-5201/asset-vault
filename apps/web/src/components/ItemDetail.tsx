@@ -10,6 +10,7 @@ import {
 import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
+import { CategoryEditor } from "./CategoryEditor";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
 export interface ProjectLite { id: number; name: string; path: string }
@@ -590,6 +591,9 @@ export function ItemDetail(props: {
               </div>
               {localTagNote && <div className="notice" style={{ marginTop: "6px" }}>该后端未接受标签改动（POST /items/:id/tags 与 PATCH tags 均失败），改动仅本机生效。</div>}
             </Section>
+
+            {/* 物品分类编辑区（docs/categories.md §7）。注意：下面「元数据」里的「分类」是 BOOTH 来源分类，两者不是一回事。 */}
+            <CategoryEditor detail={detail} onToast={props.onToast} onBusy={setBusy} onSaved={() => { load(); props.onChanged(); }} />
 
             <Section title="元数据">
               <table className="kv">

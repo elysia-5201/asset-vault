@@ -248,3 +248,41 @@ button.tag-chip.on { color: #cfe6ff; background: var(--accent-soft); border-colo
 .update-vers { display: flex; align-items: center; gap: 9px; font-size: 15px; }
 .update-vers .update-arrow { color: var(--fg-mute); }
 .update-vers .update-latest { color: var(--ok); font-weight: 700; }
+/* ---------- 物品分类（筛选 / 卡片 / 详情 / 批量） ---------- */
+/* 筛选区：分类多选（树状 chip + 计数）。沿用 button.tag-chip / .on 与 --accent / --warn 令牌 */
+.cat-filter { display: flex; flex-direction: column; gap: 4px; border-top: 1px dashed var(--line-soft); padding-top: 6px; }
+.cat-filter .seg { flex: 0 0 auto; }
+.cat-tree { display: flex; flex-direction: column; gap: 2px; max-height: 190px; overflow: auto; padding: 2px 1px; }
+.cat-group { display: flex; flex-direction: column; gap: 2px; }
+.cat-group > .row > .btn.ghost { padding: 1px 4px; color: var(--fg-mute); }
+.cat-kids { margin-left: 18px; border-left: 1px solid var(--line-soft); padding-left: 6px; }
+.cat-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--fg-mute); min-width: 132px; }
+.cat-field select { width: auto; min-width: 132px; }
+
+/* 卡片：选择模式复选框（缩略图右上角，不遮挡标题/角标） */
+.thumb .pick {
+  position: absolute; top: 6px; right: 6px; z-index: 2; display: grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 7px; border: 1px solid rgba(255,255,255,.35);
+  background: rgba(8,12,18,.66); cursor: pointer;
+}
+.thumb .pick input { margin: 0; width: 13px; height: 13px; }
+.thumb .pick.on { border-color: var(--accent); background: var(--accent-soft); }
+.badge-btn { cursor: pointer; font: inherit; }
+.badge-btn:hover { filter: brightness(1.15); }
+
+/* 批量分类操作条（中栏，工具栏与列表之间） */
+.batch-bar {
+  padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #182029, #151b23); display: flex; flex-direction: column;
+}
+.cat-failed { margin-top: 6px; border: 1px solid rgba(232,98,79,.35); background: rgba(232,98,79,.08); border-radius: 8px; padding: 5px 7px; }
+.cat-fail-row { display: flex; gap: 7px; align-items: baseline; font-size: 11.5px; color: #ffd7d0; }
+.cat-fail-row .why { color: var(--fg-dim); word-break: break-word; }
+
+/* 详情页分类编辑区：命中证据 / 建议依据 */
+.cat-evidence { display: flex; flex-direction: column; gap: 3px; font-family: var(--mono); font-size: 11px; }
+.cat-ev { display: flex; gap: 6px; align-items: baseline; }
+.cat-ev .k { color: var(--accent); flex: 0 0 auto; min-width: 62px; }
+.cat-ev .v { color: var(--fg-dim); word-break: break-all; flex: 1 1 auto; }
+.cat-ev .g { color: var(--ok); flex: 0 0 auto; }
+.cat-suggest { border-color: rgba(224,165,46,.4); background: rgba(224,165,46,.10); color: var(--fg); }

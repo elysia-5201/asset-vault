@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AvatarMatch, JobRow, LibraryRootRow, TagRow } from "@core/contracts";
+import type { AvatarMatch, CategoryNode, JobRow, LibraryRootRow, TagRow } from "@core/contracts";
 import {
-  apiMode, checkAppUpdate, describeError, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
+  apiMode, categoryApiMessage, checkAppUpdate, describeError, getCategories, getHealth, listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
   onModeChange, patchItem, recordImport, retryConnect, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
-import type { AvatarCard, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
+import type { AvatarCard, CategoryStats, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
 import { formatBytes, formatDate, parseAtQuery, resolveAvatarNames } from "./util";
 import { AvatarRail } from "./components/AvatarRail";
 import { SearchBar, type FilterState } from "./components/SearchBar";
@@ -14,6 +14,7 @@ import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
+import { CategoryBatchBar } from "./components/CategoryBatchBar";
 import { Spinner, ToastHost, useDebounced, type Toast } from "./components/ui";
 
 const IMPORTED_KEY = "av.importedItems";
@@ -47,7 +48,17 @@ export default function App() {
   const [selectedAvatarIds, setSelectedAvatarIds] = useState<number[]>([]);
   const [avatarMatch, setAvatarMatch] = useState<AvatarMatch>("any");
   const [ownedOnly, setOwnedOnly] = useState(false);
-  const [filters, setFilters] = useState<FilterState>({ site: "", status: "", container: "", tag: "", imported: "any", sort: "updated" });
+  const [filters, setFilters] = useState<FilterState>({
+    site: "", status: "", container: "", tag: "", imported: "any", sort: "updated",
+    catIds: [], catMatch: "any", uncategorized: false, pendingCategory: false,
+  });
+  /** 分类树 + 统计（供筛选区与管理页用）；catErr 非空时显式提示后端未提供分类接口 */
+  const [categories, setCategories] = useState<CategoryNode[]>([]);
+  const [catStats, setCatStats] = useState<CategoryStats | null>(null);
+  const [catErr, setCatErr] = useState("");
+  /** 批量分类：选择模式（独立复选框，不复用整卡点击） */
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [selectedItemId, setSelectedItemId] = useState<number | null>(null);
   const [importedIds, setImportedIds] = useState<number[]>([]);
   const [sideTab, setSideTab] = useState<"import" | "jobs">("import");
@@ -77,6 +88,12 @@ export default function App() {
     listJobs(undefined, 50).then((r) => setJobs(r.jobs)).catch((e) => toast("bad", describeError(e))).finally(() => setJobsLoading(false));
   }, [toast]);
 
+  const loadCategories = useCallback(() => {
+    getCategories()
+      .then((r) => { setCategories(r.categories); setCatStats(r.stats); setCatErr(""); })
+      .catch((e) => { setCategories([]); setCatStats(null); setCatErr(categoryApiMessage(e, "加载分类")); });
+  }, []);
+
   const loadMeta = useCallback(() => {
     getHealth().then(setHealth).catch(() => setHealth(null));
     listTags().then((r) => setTags(r.tags)).catch(() => setTags([]));
@@ -84,7 +101,7 @@ export default function App() {
     listProjects().then((r) => setProjects(r.projects)).catch(() => setProjects([]));
   }, []);
 
-  useEffect(() => { loadAvatars(); loadMeta(); loadJobs(); }, [mode, loadAvatars, loadMeta, loadJobs]);
+  useEffect(() => { loadAvatars(); loadMeta(); loadJobs(); loadCategories(); }, [mode, loadAvatars, loadMeta, loadJobs, loadCategories]);
 
   // 启动后**静默**检查一次更新：有更新才弹面板，失败/已是最新都不打扰（离线可用性优先）。
   // 依赖 mode：内置 mock 模式下后端不可达，等切回 live 再试。
@@ -125,6 +142,11 @@ export default function App() {
       avatarMatch, ownedOnly, site: filters.site, status: filters.status, tag: filters.tag || undefined,
       container: filters.container,
       imported: filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0,
+      // 分类筛选：拼进真实查询，与关键词/@头像/标签/收藏/拥有状态等条件叠加
+      categoryIds: filters.catIds.length ? filters.catIds : undefined,
+      categoryMatch: filters.catMatch,
+      uncategorized: filters.uncategorized || undefined,
+      pendingCategory: filters.pendingCategory || undefined,
       sort: filters.sort, limit: 120,
     })
       .then((r) => { setItems(r.items); setTotal(r.total); })
@@ -161,6 +183,13 @@ export default function App() {
   // 「已导入」由服务端按 project_imports 过滤（GET /items?imported=1|0）；
   // 本地登记只用于卡片徽标（ItemCard 无 imported 字段）。
   const shownItems = items;
+
+  const toggleSelect = (id: number) => setSelectedIds((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  /** 选中项里「未分类」的（cat_id IS NULL）——「仅对未分类批量」用 */
+  const uncategorizedSelected = useMemo(
+    () => items.filter((i) => selectedIds.includes(i.id) && !(i.category?.categoryId)).map((i) => i.id),
+    [items, selectedIds],
+  );
 
   const toggleAvatar = (id: number) => setSelectedAvatarIds((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 
@@ -213,6 +242,11 @@ export default function App() {
           </span>
           <span className="spacer" />
           <button className="btn tiny" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => setDupPanel(true)}>查重</button>
+          <button
+            className="btn tiny"
+            title="批量分类：在列表卡片上加复选框，可批量设置主/子分类、移除子分类、重新生成建议"
+            onClick={() => { setSelectMode((v) => !v); setSelectedIds([]); }}
+          >{selectMode ? "退出选择" : "批量分类"}</button>
           <button className="btn tiny" disabled={updateBusy} title="检查应用更新（GET /api/update-check?force=1，查 GitHub Releases）" onClick={doCheckUpdate}>
             {updateBusy ? "检查中…" : "检查更新"}
           </button>
@@ -233,7 +267,20 @@ export default function App() {
           text={text} onText={setText} filters={filters} onFilters={setFilters}
           atAvatars={parsed.avatars} unresolved={resolved.unresolved} onRemoveAt={removeAtName}
           tags={tags.map((t) => t.name)} loading={itemsLoading} total={total}
+          categories={categories} catStats={catStats} catErr={catErr}
         />
+        {selectMode && (
+          <CategoryBatchBar
+            selectedIds={selectedIds}
+            uncategorizedIds={uncategorizedSelected}
+            categories={categories}
+            catErr={catErr}
+            onClearSelection={() => setSelectedIds([])}
+            onExitSelectMode={() => { setSelectMode(false); setSelectedIds([]); }}
+            onToast={toast}
+            onDone={() => { loadItems(); loadCategories(); setSelectedIds([]); }}
+          />
+        )}
         <div className="col-scroll">
           {itemsErr && <div className="pane-body"><div className="err">{itemsErr}</div></div>}
           {!itemsErr && !itemsLoading && !shownItems.length && (
@@ -248,6 +295,7 @@ export default function App() {
               <ItemCardView
                 key={it.id} item={it} onOpen={setSelectedItemId} onToggleFavorite={toggleFavorite}
                 imported={importedIds.includes(it.id) || filters.imported === "yes"}
+                selectMode={selectMode} selected={selectedIds.includes(it.id)} onToggleSelect={toggleSelect}
               />
             ))}
           </div>

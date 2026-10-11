@@ -7,7 +7,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | `{ok, version, dbPath, roots, counts}` |
-| GET | `/items?q=&avatar=&avatarMatch=any|all&ownedOnly=&site=&status=&tag=&container=&imported=1|0&sort=updated|title|size&limit=&offset=` | `{total, items: ItemCard[]}`；`q` 为 FTS5 trigram 子串（<3 字符回退 LIKE），`avatar` 支持逗号分隔多值 |
+| GET | `/items?q=&avatar=&avatarMatch=any|all&ownedOnly=&site=&status=&tag=&container=&imported=1|0&sort=updated|title|size&limit=&offset=&catIds=&catMatch=any|all&uncategorized=1&pendingCategory=1` | `{total, items: ItemCard[]}`；`q` 为 FTS5 trigram 子串（<3 字符回退 LIKE），`avatar` 支持逗号分隔多值；`catIds` 支持逗号分隔与重复键（见「物品分类」） |
 | GET | `/items/:id` | `ItemDetail`（item/images/assets/avatars/tags/updates） |
 | POST | `/items` `{title, sourceUrl?, notes?}` | 手动建条目 |
 | PATCH | `/items/:id` `{title?, status?, notes?, rating?, favorite?, shopName?, author?, categoryName?, tags?: string[]}` | `tags` 为**全量替换**；返回更新后的 ItemDetail |
@@ -179,6 +179,53 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | `GET /tags` | `{tags}` |
 | `GET /stats` | 统计对象 |
 | `POST /scan` | `{jobId, state}`；`{dryRun:true}` 时返回 `{dryRun, path, files, dirs, bytes, truncated, items[]}` |
+| `POST /categories` | `{category: CategoryNode}`（201） |
+| `PATCH /categories/:id`, `PUT /categories/config` | `{category}` / `{autoThreshold, suggestThreshold}` |
+| `POST /items/:id/category`, `.../category/accept`, `.../category/dismiss` | `{item: ItemDetail}` |
+| `POST /items/category/batch` | `{updated, failed: [{itemId, reason}], requested}` |
+| `POST /categories/reclassify` | `{scanned, applied, suggested, cleared, skipped, protected, results[]}` |
 
 ## 媒体
 `GET /media/:imageId` 直接返回缩略图（webp，最长边 512）；原图缺失时才回退原文件。可直接作 `<img src>`。
+
+## 物品分类（v2）
+
+用户自己的分类体系（可手改、可自动推荐），与 BOOTH 商品页自带的只读分类（`items.category_name/category_parent`）**是两回事**。
+数据在 `items.cat_id / cat_sub_id` + 13 个 `cat_*` 列，结构固定**两层**（主分类 `parent_id IS NULL`，子分类 ID 形如 `clothing.tops`）。
+`cat_id IS NULL` = **未分类**（UI 灰 chip）；分类树里 `other.uncategorized`（「其他 › 未分类」）是用户**显式选择**的一个分类，二者不同。
+归属来源 `cat_source`：`manual`（下拉框手选）/ `confirmed`（采纳建议）/ `auto`（自动推断）/ `migrated`（历史迁移）。
+**`manual`/`confirmed` 永不被自动任务覆盖**：自动路径只走 `repo.applyAutoCategory()`（受保护时只写待确认建议，返回 `protected:true`）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/categories` | `{categories: CategoryNode[]（树，含 itemCount）, stats: CategoryStats, config: {autoThreshold, suggestThreshold}}`。初始库 = 14 主分类 / 79 子分类 = 93 个节点（`packages/core/src/categories/taxonomy.ts`），首次建库/迁移时播种 |
+| POST | `/categories` `{id?, name, parentId?, sort?}` | 建分类 → **201** `{category}`；`id` 已存在 → 409；`parentId` 不存在 → 400 |
+| PATCH | `/categories/:id` `{name?, sort?, enabled?, parentId?}` | → 200 `{category}`；不存在 → 404；移动受两层结构约束（子分类不能再改父、有子分类的主分类不能移动）→ 400/409 |
+| DELETE | `/categories/:id` | → 200 `{moved, movedSubs}`。其下素材退回未分类（**不删素材**）；还有子分类 → 409 |
+| PUT | `/categories/config` `{autoThreshold?, suggestThreshold?}` | 阈值（0..1，可给数字或数字串），写 settings `category_auto_threshold` / `category_suggest_threshold` → `{autoThreshold, suggestThreshold}`；非法值 → 400；读侧坏值回落默认 `{0.75, 0.4}` |
+| POST | `/items/:id/category` `{categoryId: string\|null, subCategoryId?: string\|null}` | 手动设分类（`source='manual'`）→ `{item}`。`categoryId=null` 清除归属；传子分类 ID 会自动归位到其主分类；未知分类 ID → 400；子分类不属于主分类 → **自动清空子分类**（不 400） |
+| POST | `/items/:id/category/accept` | 采纳当前建议：`source='confirmed'` + 清建议 → `{item}`；没有建议 → 400 |
+| POST | `/items/:id/category/dismiss` | 忽略建议：只清建议，**不动归属** → `{item}` |
+| POST | `/items/category/batch` `{itemIds: number[], categoryId?, subCategoryId?, mode?}` | 批量 → `{updated, failed: [{itemId, reason}], requested}`。`mode`：`set`（默认，设为某分类/清空）/ `clear_sub`（保留主分类、只移除子分类）/ `resuggest`（重算建议）。`itemIds` 空 → 400；不存在/无子分类可移的条目进 `failed`，不中断 |
+| POST | `/categories/reclassify` `{itemIds?, onlyUncategorized?, apply?, all?, limit?}` | 批量重跑 → `{scanned, applied, suggested, cleared, skipped, protected, results: [{itemId, categoryId, subCategoryId, confidence, level, applied, protected, reason}]}` |
+
+**`/items` 分类筛选**（可与关键词/Avatar/标签/收藏/拥有状态组合，全部落到真实 SQL）：
+`catIds=clothing,clothing.tops`（逗号分隔或 `&catIds=a&catIds=b` 重复键均可；选中主分类命中其自身、选中子分类命中子分类），
+`catMatch=any`（默认）/ `all`（条目路径必须同时命中每个选中节点），`uncategorized=1`（`cat_id IS NULL`），`pendingCategory=1`（有未确认建议）。
+
+**分级与阈值**（`packages/core/src/categories/classify.ts`）：置信度 = `min(1, score/2)`，与第二名差距 < 35% 时 ×0.6（歧义降权）；
+`>= autoThreshold` → `level="auto"`（允许自动应用，必须可追溯：`cat_reason` + `cat_evidence` JSON）；`>= suggestThreshold` → `"suggest"`（只给建议）；
+否则 `"none"`（保持未分类，**不为凑自动分类率硬塞**）。**置信度未校准，不得当真实概率**。
+
+**自动分类钩子**（全部 try/catch 包住，分类异常绝不阻断主流程；入口见 `apps/server/src/services/categories.ts`）：
+① 扫库建档 / `POST /import/paths`（`jobs/runner.ts` 在 indexing+matching 完成后，含 Inbox 入库）；
+② BOOTH 链接导入 / 补全元数据（`services/booth.ts`，覆盖 `POST /items/:id/link-booth`）；
+③ 后台任务（`jobs/runner.ts`，reindex / match_avatars / import_url / check_update 同样覆盖）；
+④ `PATCH /items/:id` 且 body 含 `title/title_ja/description/category_name/category_parent/shop_name/author` 时（纯 UI 开关如 favorite/status 不触发）。
+
+**`reclassify` 语义**（范围优先级为实现口径，已与 lead 报备）：范围 = `itemIds` > `onlyUncategorized:true` > `all:true`，三者都不给 → 400（不静默全库改分类）；
+`limit` 默认 500、上限 5000。`apply` 默认 **false**（只写建议、不改归属）；`apply:true` 时 level=auto 才写归属，且只经 `applyAutoCategory`，
+用户已定的记 `protected:true`（不一致时只写建议）。计数器互斥：`applied + suggested + cleared + skipped === scanned`。
+`cleared` = 清掉的过期建议（无证据、或推荐与当前归属一致）；`skipped` = 无需变动（含推荐与当前归属一致且没有旧建议）。
+推荐与当前归属一致时**不会**再挂一条待确认建议。
+

@@ -9,6 +9,7 @@ import { indexAsset } from "../services/indexing";
 import { matchItem } from "../services/match";
 import { checkItemUpdate } from "../services/updates";
 import { walkCandidates, planFromFiles, registerAssets, type ScannedFile } from "../services/scan";
+import { applyCategoryEvidence } from "../services/categories";
 import type { MediaStore } from "../services/media";
 
 export interface JobDeps { repo: Repo; media: MediaStore; booth: BoothClient; log: (msg: string) => void }
@@ -160,6 +161,12 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         const o = await matchItem(repo, itemId, scratchByItem.get(itemId) ?? {});
         if (o.addedItem + o.addedAsset > 0) deps.log(`avatars: item ${itemId} +${o.addedItem} item / +${o.addedAsset} asset (declared=${o.declared})`);
       } catch (e) { scratch.errors.push(`match item ${itemId}: ${asError(e).message}`); }
+    }
+    // ---- 自动分类（§5-1/§5-3：扫库建档 / Inbox 入库在 indexing+matching 完成后；manual/confirmed 由
+    //      repo.applyAutoCategory 保护）。单条失败只记日志，绝不影响作业状态机。----
+    for (const itemId of scratch.itemIds) {
+      try { applyCategoryEvidence(repo, itemId, { log: deps.log }); }
+      catch (e) { deps.log(`category item ${itemId} skipped: ${asError(e).message}`); }
     }
     if (scratch.errors.length > 0) deps.log(`job ${jobId} partial failures (${scratch.errors.length}): ${scratch.errors.slice(0, 3).join(" | ")}`);
     repo.transitionJob(jobId, "match_ok");

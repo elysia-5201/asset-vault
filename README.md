@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-195%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-335%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -29,6 +29,7 @@
 | **avatar 维度** | 一条素材可适配多个模型；6 类证据（标题 / BOOTH 标签 / 描述 / 包内路径 / unitypackage 路径 / 文件名）自动打分，别名单表归一 |
 | **自动校准** | 只要**包内容**里认出了某些模型，就按内容口径算适配；只在商品页标签里出现过的不算（商品页声明另存为「声明适配」）。**通用工具类素材**（插件/姿势/着色器）不吃这套 |
 | **按 avatar 快筛** | 头像轨点选即过滤，多选支持 **ANY / ALL**；`@Manuka 裙子` 语法；只看已拥有 |
+| **物品分类** | 14 主分类 / 79 子分类（服装/工具/饰品/妆容/头发/模型/纹理材质/Shader/动画/特效/音频/场景/UI/其他），按 BOOTH 标题·标签·描述·文件名·包内路径·unitypackage 路径做**可解释**推荐：每条建议都带命中词与权重，可一键采纳；高置信度自动应用也只走同一条带保护的通路 |
 | **中日文子串搜索** | SQLite FTS5 **trigram**（`Shinano` / `ミルフィ` / `しなの` / `milky` 都能中段命中；<3 字符回退 LIKE） |
 | **更新检测** | 快照 `variations[].downloadable` 文件名/大小 + 价格 + 图集，一键「检查更新」出差异 |
 | **作业与恢复** | 13 状态状态机 + CAS 转移；`kill -9` 后重启自动回收在飞作业（`recovered` 事件可查） |
@@ -94,8 +95,10 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（195 用例 / 19 套件；真实素材 fixture 需环境变量，未设则 SKIP）
+node scripts/test.mjs            # 全仓单测（335 用例 / 40 套件；真实素材 fixture 需环境变量，未设则 SKIP）
 npx tsc --noEmit                 # 类型检查（0 error）
+node --import tsx scripts/acceptance-categories.mjs   # 物品分类端到端（21 项：迁移/保护/筛选/统计/批量/阈值）
+AV_SRC_DB=/path/vault.db node --import tsx scripts/acceptance-categories.mjs   # 同上，改用真实库副本跑
 bash scripts/acceptance.sh       # AC1-AC12 冒烟
 bash scripts/acceptance-ops.sh   # 缺文件标记 / 失败原因 / 崩溃恢复
 bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
@@ -170,7 +173,18 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 
 > 开发沙箱里 `/mnt/e` 这类 Windows 盘是**只读**的，所以所有 Windows 侧写入都通过 `cmd.exe` / PowerShell 走 Windows 进程完成。
 
-### 7. HTTP API
+### 7. 物品分类
+
+- 分类是**独立维度**，和 BOOTH 来源分类、标签、avatar 适配、收藏都不互相覆盖；一条素材 = 1 个主分类 + 可选 1 个子分类，也可以是**未分类**。
+- 详情页「分类」区：选主分类 → 子分类联动（换主分类会清掉不属于它的子分类）→ 保存后立即刷新，并显示来源：
+  `手动设置` / `采纳建议` / `自动推断`（自动的可展开看**依据与置信度**）/ `历史迁移`。
+- 自动推荐分三档：**高置信度 → 自动应用**（可追溯，仍不会覆盖你的手选）、**中置信度 → 只出建议等你确认**、**低置信度 → 保持未分类**（不为了自动率硬归类）。
+- **手动分类是最高优先级**：补全 BOOTH、重扫压缩包、Inbox 重试、后台任务恢复、套装合并都不会静默覆盖它；合并时两边都是手选且不同 → 只提示冲突，保留目标。
+- 筛选面板可按分类多选（带计数）、只看未分类、只看待确认，可与关键词 / avatar / 标签 / 收藏 / 已导入组合。
+- 列表可进「选择模式」做批量：批量设主分类 / 子分类 / 移除子分类 / 重新生成建议 / 只处理未分类；执行前显示影响条数，失败会逐条回报。
+- 规则与阈值：分类定义与关键词规则集中在 `packages/core/src/categories/`；置信度阈值可在界面/接口改（`PUT /api/categories/config`，默认 auto 0.75 / suggest 0.4）。设计细节见 `docs/categories.md`。
+
+### 8. HTTP API
 
 完整契约见 `docs/api.md`（含 Unity 桥、套装、合并、导入等端点）；健康检查 `GET /api/health`。
 
@@ -186,7 +200,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 195 用例 + `tsc --noEmit` + 验收脚本（AC1–AC12） |
+| 质检 | `node:test` 335 用例（含分类：定义结构 / 规则评分 / 迁移 / Repo / 服务层，+88 例）+ `tsc --noEmit` + 验收脚本（AC1–AC12） |
 
 ### 打包与迁移踩坑（留档）
 
@@ -208,23 +222,24 @@ asset-vault/
 │   ├─ identify.ts           # 商品号抽取 / URL 解析 / 置信度
 │   ├─ source/booth.ts       # BOOTH 抓取（限速、退避、代理、登录页识别）
 │   ├─ avatars/              # 别名归一 + 6 类证据打分
+│   ├─ categories/           # 物品分类：定义（14 主 × 79 子）+ 可解释规则评分
 │   ├─ archive/              # zip / 7z / rar 列目录与直读
 │   ├─ unitypackage.ts       # gzip+tar 解析与条目读取
 │   └─ images.ts / hash.ts   # sharp 缩略图 / 流式 sha256
 ├─ apps/server/src/          # Fastify + SQLite + 作业执行器
 │   ├─ db/                   # schema.sql / migrate / repo / seed
 │   ├─ jobs/runner.ts        # 状态机驱动 + worker
-│   ├─ services/             # booth / scan / indexing / match / updates / media / download / unity
+│   ├─ services/             # booth / scan / indexing / match / categories / updates / media / download / unity
 │   └─ http/routes.ts        # HTTP API（契约见 docs/api.md）
 ├─ apps/web/                 # React 19 + Vite（头像轨 / 网格 / 详情 / 包内树 / 作业 / 导入）
 ├─ apps/desktop/             # Electron 主进程 + esbuild 打包脚本
 ├─ config/avatars.seed.json  # 头像与别名种子（可编辑，首次启动播种）
 ├─ data/                     # vault.db + media/ 缩略图缓存（可重建）
-├─ docs/                     # api.md / CONTRACT.md / verification/
+├─ docs/                     # api.md / categories.md / CONTRACT.md / verification/
 └─ scripts/                  # test / start / acceptance / win-* / sanitize 等
 ```
 
-**数据模型**（SQLite，15 张核心表）：`items`（来源站+商品号唯一）· `item_images` · `assets`（物理路径唯一）·
+**数据模型**（SQLite，16 张核心表）：`items`（来源站+商品号唯一；含 13 个 `cat_*` 物品分类列）· `categories`（分类树，两层）· `item_images` · `assets`（物理路径唯一）·
 `archive_entries` · `unitypackage_assets` · `avatars` + `avatar_aliases` + `item_avatars`（多对多，含 manual/confirmed 保护）·
 `asset_avatars`（文件级 + 包内前缀）· `tags` / `item_tags` · `collections` · `library_roots` · `projects` / `project_imports` ·
 `jobs` / `job_events` · `source_snapshots` / `updates` · `settings` / `audit_log` + `items_fts`（FTS5 trigram）。
@@ -264,8 +279,6 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 
 ## 📋 TODO
 
-- [ ] 选个 LICENSE（建议 MIT）并补 `LICENSE` 文件
-- [ ] 用**脱敏样库**做几张截图 / GIF，把上面「预览」补上
 - [ ] 7z / rar 内嵌图片也抽缩略图（现在只抽 zip / unitypackage）
 - [ ] 「全アバター対応」工具类素材的匹配口径做成开关（现在是内容证据优先）
 - [ ] 头像别名继续补（Chiffon / Milltina 已补；mao / koyuki / rurika 这类还没有）
@@ -274,6 +287,11 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - [ ] CI 覆盖三平台单测（现在 workflow 只在 `windows-latest` 跑）
 - [ ] 「全库批量重跑匹配 + 校准」的 UI 入口（现在得调 API）
 - [ ] 超大包（>500MB）解析进度反馈
+- [ ] 分类规则继续扩词（现在以日/中/英常见说法为主）并用真实库做阈值校准（当前 24 条实测：自动 16 / 建议 6 / 留空 2）
+- [ ] 分类管理 UI（后端已有增删改/停用接口，现在要调 API）
+- [ ] 「全库重新生成分类建议」的 UI 入口（后端 `POST /api/categories/reclassify` 支持 `all`/`onlyUncategorized`，现在界面只做了条目级与选中批量）
+- [ ] 自动分类的证据再吃一路「zip 内层 unitypackage 路径」（现在只读已缓存的包清单，避免拖慢热路径）
+- [ ] macOS / Linux 桌面版的分类回填批处理（迁移不需要回填，历史素材默认未分类）
 
 ---
 
@@ -286,6 +304,8 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - **导入 Unity 的前置条件**：工程装了 `com.coplaydev.unity-mcp` 且编辑器开着；MCP 不在时会明确显示「没连上 + 探测了哪些端口」，不会静默失败。
 - **只有 `.unitypackage` 能自动导入**：纯贴图 / PSD 素材不会出现在导入列表里。
 - **商品页标签口径**：卖家常把「支持的全部 base」打成一堆 tag。默认**内容证据优先**（商品页声明另存「声明适配」）；通用工具类素材不受影响。
+- **分类证据范围**：自动分类只看已缓存的包清单（zip 内层 unitypackage 不完全参与），因此少量素材会停在「建议」或「未分类」——这是刻意的保守，不猜。
+- **分类树里的「其他 › 未分类」≠ 未分类**：前者是人工显式选择的一个分类，后者是 `cat_id` 为空（筛「只看未分类」筛的是后者）。
 - **头像表是白名单**：不在表里的模型不会被匹配（显示为 `?`），需要手动补名字/别名。
 - **`data/unity-staging/` 会累积**：可以随时整个删掉（只是缓存）。
 

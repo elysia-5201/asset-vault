@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 
 import { getItem, mediaUrl } from "../api";
 import type { ItemCardWeb } from "../types";
 import { formatBytes, formatDate } from "../util";
-import { Badge, SITE_LABEL, STATUS_LABEL } from "./ui";
+import { Badge, CATEGORY_SOURCE_LABEL, SITE_LABEL, STATUS_LABEL } from "./ui";
 
 /** 卡片多图轮播：ItemCard 只有 coverUrl，故首次悬停/聚焦时按需 GET /items/:id 取 images（缓存）。 */
 const imageCache = new Map<number, string[]>();
@@ -12,6 +12,10 @@ export function ItemCardView(props: {
   onOpen: (id: number) => void;
   onToggleFavorite: (item: ItemCardWeb) => void;
   imported: boolean;
+  /** 批量选择模式：整卡点击改为勾选（复选框在缩略图右上角），不会打开详情 */
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (id: number) => void;
 }) {
   const { item } = props;
   const [urls, setUrls] = useState<string[]>(() => imageCache.get(item.id) ?? (item.coverUrl ? [item.coverUrl] : []));
@@ -60,18 +64,38 @@ export function ItemCardView(props: {
     setIdx((i) => (i + delta + urls.length) % urls.length);
   };
   const current = urls[idx] ?? item.coverUrl;
+  const sel = props.selected === true;
+  const pick = () => { if (props.selectMode) props.onToggleSelect?.(item.id); else props.onOpen(item.id); };
+  // 物品分类徽章：主分类优先，有子分类显示「主 › 子」；未分类显示灰 chip「未分类」
+  const cat = item.category ?? null;
+  const catLabel = cat && cat.categoryId
+    ? (cat.subCategoryId && cat.subCategoryName ? cat.categoryName + " › " + cat.subCategoryName : (cat.categoryName ?? cat.categoryId))
+    : null;
 
   return (
     <div
-      className="card"
-      onClick={() => props.onOpen(item.id)}
+      className={"card" + (sel ? " sel" : "")}
+      onClick={pick}
       onMouseEnter={ensure}
       onFocus={ensure}
       tabIndex={0}
-      title={item.title}
+      title={props.selectMode ? "选择模式：点击卡片切换勾选（不打开详情）" : item.title}
     >
       <div className="thumb">
         {current ? <img src={current} alt="" loading="lazy" /> : <div className="empty">无图</div>}
+        {props.selectMode && (
+          <label
+            className={"pick" + (sel ? " on" : "")}
+            title={sel ? "取消选择" : "选择这条（批量分类）"}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <input
+              type="checkbox"
+              checked={sel}
+              onChange={() => props.onToggleSelect?.(item.id)}
+            />
+          </label>
+        )}
         <div className="corner">
           <Badge tone={item.status === "inbox" ? "warn" : item.status === "trashed" ? "bad" : "muted"}>{STATUS_LABEL[item.status]}</Badge>
           {item.status === "inbox" && <Badge tone="busy">inbox</Badge>}
@@ -95,6 +119,18 @@ export function ItemCardView(props: {
           {item.shopName && <span>· {item.shopName}</span>}
         </div>
         <div className="row wrap" style={{ gap: "4px" }}>
+          {catLabel
+            ? <Badge tone="busy" title={"物品分类：" + catLabel + (cat?.source ? "（" + CATEGORY_SOURCE_LABEL[cat.source] + "）" : "")}>{catLabel}</Badge>
+            : <Badge tone="muted" title="尚未归属任何物品分类（与 BOOTH 来源分类无关）">未分类</Badge>}
+          {item.suggestion && (
+            <button
+              className="badge warn badge-btn"
+              title={"有待确认的自动分类建议：" + (item.suggestion.subCategoryName ?? item.suggestion.categoryName) + "（点开详情可采纳/忽略）"}
+              onClick={(e) => { e.stopPropagation(); props.onOpen(item.id); }}
+            >
+              建议 {item.suggestion.subCategoryName ?? item.suggestion.categoryName}
+            </button>
+          )}
           {item.avatars.slice(0, 3).map((a) => <Badge key={a.id} tone="violet" title={a.evidence ?? "无证据字段"}>@{a.name}</Badge>)}
           {item.avatars.length > 3 && <Badge tone="muted">+{item.avatars.length - 3}</Badge>}
           {(item.collections ?? []).slice(0, 1).map((c) => <Badge key={c.id} tone="ok" title="套装/合集">{c.name}</Badge>)}

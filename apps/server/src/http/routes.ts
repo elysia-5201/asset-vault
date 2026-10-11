@@ -26,6 +26,8 @@ import { findDuplicatesForItem, listDuplicateGroups, recomputeSignatures } from 
 import { itemUsage, projectUsage, scanProjectUsage } from "../services/projectusage";
 import { relateItems } from "../../../../packages/core/src/related";
 import { compareVersions, parseVersion, stripVersionPrefix } from "../../../../packages/core/src/version";
+import { evidenceToJson } from "../../../../packages/core/src/categories/classify";
+import { applyCategoryEvidence, getCategoryConfig, recommendForItem, reclassifyCategories, setCategoryConfig } from "../services/categories";
 
 export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
 
@@ -37,6 +39,13 @@ function downloadRootOf(repo: Repo, dataDir: string): string {
 }
 
 const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]);
+
+/** 触发分类重跑的元数据字段（§5-4）：只有"分类证据用得到"的字段变了才重跑，纯 UI 开关不算。 */
+const CATEGORY_TRIGGER_FIELDS = [
+  "title", "title_ja", "titleJa", "description",
+  "category_name", "categoryName", "category_parent", "categoryParent",
+  "shop_name", "shopName", "author",
+] as const;
 
 /** Unity 的 .asset/.mat/.prefab/.anim … 其实都是 YAML 文本，按文本预览才有意义。 */
 const UNITY_TEXT_EXT = /\.(txt|md|json|meta|yaml|yml|xml|html?|csv|log|cs|shader|cginc|hlib|hlsl|compute|uss|uxml|asmdef|asmref|inputactions|asset|mat|prefab|anim|controller|unity|preset|physicmaterial|guiskin|mixer|playable|signal|overridecontroller)$/i;
@@ -192,11 +201,17 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const q = req.query as any;
       const avatarIds = String(q.avatar ?? "").split(",").map((s) => toInt(s, NaN)).filter((n) => Number.isFinite(n));
+      // 分类筛选（docs/categories.md §4）：catIds 支持逗号分隔与重复键两种写法
+      const rawCat = q.catIds === undefined || q.catIds === null ? [] : (Array.isArray(q.catIds) ? q.catIds : [q.catIds]);
+      const categoryIds = (rawCat as any[]).flatMap((s) => String(s ?? "").split(",")).map((s) => s.trim()).filter(Boolean);
       return repo.listItems({
         q: q.q, avatarIds, avatarMatch: q.avatarMatch === "all" ? "all" : "any", ownedOnly: q.ownedOnly === "1" || q.ownedOnly === "true",
         site: q.site, status: q.status, tag: q.tag, container: q.container,
         imported: q.imported === "1" || q.imported === "true" ? true : q.imported === "0" || q.imported === "false" ? false : undefined,
         collectionId: q.collection ? toInt(q.collection, 0) || undefined : undefined,
+        categoryIds, categoryMatch: q.catMatch === "all" ? "all" : "any",
+        uncategorized: q.uncategorized === "1" || q.uncategorized === "true",
+        pendingCategory: q.pendingCategory === "1" || q.pendingCategory === "true",
         sort: q.sort === "title" || q.sort === "size" ? q.sort : "updated",
         limit: toInt(q.limit, 60), offset: toInt(q.offset, 0),
       });
@@ -217,7 +232,11 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (!b?.title) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "title 必填" } });
       let sourceSite: any = "local"; let sourceItemId: string | null = null;
       if (b.sourceUrl) { const p = parseBoothUrl(String(b.sourceUrl)); if (p) { sourceSite = "booth"; sourceItemId = p.itemId; } }
-      return repo.createItem({ title: String(b.title), source_site: sourceSite, source_item_id: sourceItemId, source_url: b.sourceUrl ?? null, notes: b.notes ?? null, status: b.status ?? (sourceItemId ? "active" : "inbox") });
+      const created = repo.createItem({ title: String(b.title), source_site: sourceSite, source_item_id: sourceItemId, source_url: b.sourceUrl ?? null, notes: b.notes ?? null, status: b.status ?? (sourceItemId ? "active" : "inbox") });
+      // §5：手动建档也属于"建档"入口，给一次分类推荐（永不抛，失败不影响建档）
+      try { applyCategoryEvidence(repo, created.id, { log: deps.log }); }
+      catch (e) { deps.log("category: POST item " + created.id + " 分类失败（已忽略）: " + String((e as any)?.message ?? e)); }
+      return repo.getItem(created.id) ?? created;
     } catch (e) { return fail(reply, e); }
   });
 
@@ -230,6 +249,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       delete patch.tags;
       if (Object.keys(patch).length > 0) repo.updateItem(id, patch);
       if (tags) repo.setItemTags(id, tags, "manual");
+      // §5-4：元数据变了 → 分类证据也变了，重跑一次（走 applyAutoCategory，manual/confirmed 受保护）。
+      // 纯 UI 开关（favorite/status/notes/rating…）不触发。分类失败绝不阻断 PATCH。
+      if (CATEGORY_TRIGGER_FIELDS.some((k) => (body as any)[k] !== undefined)) {
+        try { applyCategoryEvidence(repo, id, { log: deps.log }); }
+        catch (e) { deps.log("category: PATCH item " + id + " 分类失败（已忽略）: " + String((e as any)?.message ?? e)); }
+      }
       return repo.getItem(id);
     } catch (e) { return fail(reply, e); }
   });
@@ -898,6 +923,157 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       await matchItem(repo, targetId, {});
       deps.log("merge: item " + sourceId + " -> " + targetId + " assets=" + r.movedAssets + " images=" + r.movedImages);
       return { ...r, target: repo.getItem(targetId) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  // ---------- 物品分类（v2；契约 docs/categories.md §4/§5/§6）----------
+  /** 分类树（含 itemCount）+ 统计 + 阈值配置。 */
+  app.get("/api/categories", async (req, reply) => {
+    try {
+      return { categories: repo.listCategories(), stats: repo.categoryStats(), config: getCategoryConfig(repo) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.post("/api/categories", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const name = String(b?.name ?? "").trim();
+      if (!name) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "name 必填" } });
+      const category = repo.createCategory({
+        id: b?.id === undefined || b.id === null ? undefined : String(b.id).trim(),
+        name, parentId: b?.parentId === undefined || b.parentId === null ? null : String(b.parentId),
+        sort: b?.sort === undefined ? undefined : toInt(b.sort, 0),
+      });
+      return reply.status(201).send({ category });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.patch("/api/categories/:id", async (req, reply) => {
+    try {
+      const id = String((req.params as any).id ?? "");
+      const b = (req.body ?? {}) as any;
+      const patch: { name?: string; parentId?: string | null; sort?: number; enabled?: boolean } = {};
+      if (b?.name !== undefined) patch.name = String(b.name);
+      if (b?.parentId !== undefined) patch.parentId = b.parentId === null ? null : String(b.parentId);
+      if (b?.sort !== undefined) patch.sort = toInt(b.sort, 0);
+      if (b?.enabled !== undefined) patch.enabled = b.enabled === true || b.enabled === 1 || b.enabled === "1" || b.enabled === "true";
+      return { category: repo.updateCategory(id, patch) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.delete("/api/categories/:id", async (req, reply) => {
+    try {
+      const r = repo.deleteCategory(String((req.params as any).id ?? ""));
+      return { moved: r.moved, movedSubs: r.movedSubs };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.put("/api/categories/config", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      return setCategoryConfig(repo, { autoThreshold: b?.autoThreshold, suggestThreshold: b?.suggestThreshold });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /**
+   * 批量重跑分类。默认 **不改归属**（apply=false 只写建议）；apply=true 也只经 applyAutoCategory，
+   * manual/confirmed 记 protected 且不被覆盖。范围：itemIds > onlyUncategorized > all（三者都缺 → 400）。
+   */
+  app.post("/api/categories/reclassify", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const itemIds = Array.isArray(b?.itemIds) ? b.itemIds.map((n: any) => toInt(n, 0)).filter((n: number) => n > 0) : undefined;
+      const truthy = (v: unknown) => v === true || v === 1 || v === "1" || v === "true";
+      return reclassifyCategories(repo, {
+        itemIds,
+        onlyUncategorized: truthy(b?.onlyUncategorized),
+        apply: truthy(b?.apply),
+        all: truthy(b?.all),
+        limit: b?.limit === undefined ? undefined : toInt(b.limit, 0),
+        log: deps.log,
+      });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  // 注意：静态段必须先于 /api/items/:id/... 注册（/api/items/category/batch 否则会被当成 id）。
+  /** 批量分类：set（设为某分类/清空）/ clear_sub（只移除子分类）/ resuggest（重算建议）。 */
+  app.post("/api/items/category/batch", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const mode = b?.mode === undefined || b.mode === null ? "set" : String(b.mode);
+      if (mode !== "set" && mode !== "clear_sub" && mode !== "resuggest") {
+        return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "mode 必须是 set/clear_sub/resuggest" } });
+      }
+      // 显式标 number[]：b 是 any，Set 从 any 推断会得到 Set<unknown>（随后 itemId 变 unknown）
+      const requested: number[] = Array.isArray(b?.itemIds) ? (b.itemIds as unknown[]).map((n) => toInt(n, 0)).filter((n) => n > 0) : [];
+      const ids: number[] = [...new Set(requested)];
+      if (ids.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemIds 必填（非空数组）" } });
+      const categoryId = b?.categoryId === undefined || b?.categoryId === null ? null : String(b.categoryId);
+      const subCategoryId = b?.subCategoryId === undefined || b?.subCategoryId === null ? null : String(b.subCategoryId);
+      let updated = 0;
+      const failed: { itemId: number; reason: string }[] = [];
+      for (const itemId of ids) {
+        const row = repo.itemRow(itemId);
+        if (!row) { failed.push({ itemId, reason: "条目不存在" }); continue; }
+        try {
+          if (mode === "set") {
+            repo.setItemCategory(itemId, { categoryId, subCategoryId, source: "manual" });
+          } else if (mode === "clear_sub") {
+            if (!row.cat_id) { failed.push({ itemId, reason: "条目未分类，没有子分类可移除" }); continue; }
+            repo.setItemCategory(itemId, {
+              categoryId: row.cat_id, subCategoryId: null, source: row.cat_source ?? "manual",
+              confidence: row.cat_confidence, reason: row.cat_reason, evidence: row.cat_evidence,
+            });
+          } else {
+            const rec = recommendForItem(repo, itemId);
+            if (!rec.categoryId) repo.clearItemCategorySuggestion(itemId);
+            else repo.suggestItemCategory(itemId, {
+              categoryId: rec.categoryId, subCategoryId: rec.subCategoryId, confidence: rec.confidence,
+              reason: rec.reason, evidence: evidenceToJson(rec),
+            });
+          }
+          updated++;
+        } catch (e) { failed.push({ itemId, reason: String((e as any)?.message ?? e) }); }
+      }
+      return { updated, failed, requested: requested.length };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 手动设置分类（source='manual'）；categoryId=null 清除归属。子分类不属于主分类 → repo 自动清空子分类。 */
+  app.post("/api/items/:id/category", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      if (!repo.itemRow(id)) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      const b = (req.body ?? {}) as any;
+      const categoryId = b?.categoryId === undefined || b?.categoryId === null ? null : String(b.categoryId);
+      const subCategoryId = b?.subCategoryId === undefined || b?.subCategoryId === null ? null : String(b.subCategoryId);
+      repo.setItemCategory(id, { categoryId, subCategoryId, source: "manual" });
+      return { item: repo.getItem(id) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 采纳当前建议：source='confirmed'，同时清掉建议。没有建议 → 400。 */
+  app.post("/api/items/:id/category/accept", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const row = repo.itemRow(id);
+      if (!row) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      if (!row.cat_suggest_id) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "该条目没有待确认的分类建议" } });
+      repo.setItemCategory(id, {
+        categoryId: row.cat_suggest_id, subCategoryId: row.cat_suggest_sub_id, source: "confirmed",
+        confidence: row.cat_suggest_confidence, reason: row.cat_suggest_reason, evidence: row.cat_suggest_evidence,
+      });
+      return { item: repo.getItem(id) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 忽略建议：只清建议，不动归属。 */
+  app.post("/api/items/:id/category/dismiss", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      if (!repo.itemRow(id)) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      repo.clearItemCategorySuggestion(id);
+      return { item: repo.getItem(id) };
     } catch (e) { return fail(reply, e); }
   });
 

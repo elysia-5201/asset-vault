@@ -4,7 +4,7 @@
  */
 import type {
   ArchiveEntry, AssetAvatarRow, AssetRow, AvatarAliasRow, AvatarKind, AvatarMatch,
-  BoothItemMeta, ContainerKind, ImageRow, ItemCard, ItemRow, ItemStatus, JobEventRow,
+  BoothItemMeta, CategoryLevel, CategoryNode, ContainerKind, ImageRow, ItemCard, ItemRow, ItemStatus, JobEventRow,
   JobRow, LibraryRootRow, SourceSite, TagRow, UnityPackageAsset, UpdateKind,
 } from "@core/contracts";
 
@@ -13,6 +13,12 @@ export type {
   BoothItemMeta, ContainerKind, ImageRow, ItemRow, ItemStatus, JobEventRow, JobRow,
   LibraryRootRow, SourceSite, TagRow, UnityPackageAsset, UpdateKind,
 };
+
+// ---------- 物品分类（docs/categories.md §4；类型真源在 @core/contracts，这里只再导出） ----------
+export type {
+  CategoryAssignment, CategoryDef, CategoryEvidenceHit, CategoryLevel, CategoryNode,
+  CategoryRefSource, CategorySuggestion,
+} from "@core/contracts";
 
 /** ItemCard.avatars 的契约元素是 {id,name,match}；证据字段是附加可选项，缺失时 UI 显式标注。 */
 export interface CompatAvatar {
@@ -170,9 +176,72 @@ export interface ItemQuery {
   container?: ContainerKind | "";
   /** 是否已导入 Unity 工程（服务端按 project_imports 过滤） */
   imported?: 1 | 0;
+  /** 物品分类多选（URL 键是 catIds；命中任一/全部由 categoryMatch 决定） */
+  categoryIds?: string[];
+  categoryMatch?: "any" | "all";
+  /** 只看未分类（cat_id IS NULL） */
+  uncategorized?: boolean;
+  /** 只看有待确认的自动分类建议 */
+  pendingCategory?: boolean;
   sort?: "updated" | "title" | "size";
   limit?: number;
   offset?: number;
+}
+
+// ---------------- 物品分类（GET /api/categories 等，docs/categories.md §4） ----------------
+/** 分类自动/建议阈值（settings：category_auto_threshold / category_suggest_threshold）。 */
+export interface CategoryConfig {
+  autoThreshold: number;
+  suggestThreshold: number;
+}
+/** 单个分类的统计（与 repo.categoryStats().counts 同形）。 */
+export interface CategoryStatCount {
+  id: string;
+  name: string;
+  parentId: string | null;
+  count: number;
+  topCount: number;
+  owned: number;
+  favorite: number;
+}
+export interface CategoryStats {
+  counts: CategoryStatCount[];
+  uncategorized: number;
+  pending: number;
+  total: number;
+  missingFiles: number;
+}
+/** GET /api/categories */
+export interface CategoriesResponse {
+  categories: CategoryNode[];
+  stats: CategoryStats;
+  config: CategoryConfig;
+}
+/** POST /api/items/category/batch */
+export interface BatchCategoryResponse {
+  updated: number;
+  failed: { itemId: number; reason: string }[];
+  requested: number;
+}
+/** POST /api/categories/reclassify 的一条结果 */
+export interface ReclassifyRow {
+  itemId: number;
+  categoryId: string | null;
+  subCategoryId: string | null;
+  confidence: number;
+  level: CategoryLevel;
+  applied: boolean;
+  protected: boolean;
+  reason: string;
+}
+export interface ReclassifyResponse {
+  scanned: number;
+  applied: number;
+  suggested: number;
+  cleared: number;
+  skipped: number;
+  protected: number;
+  results: ReclassifyRow[];
 }
 
 // ---------------- 疑似重复（/api/duplicates*，后端契约已冻结） ----------------

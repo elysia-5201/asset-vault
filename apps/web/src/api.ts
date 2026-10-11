@@ -10,14 +10,16 @@ import type {
 } from "@core/contracts";
 import { mockHandle, mockMediaUrl, mockEntry, MockHttpError } from "./mock";
 import type {
-  AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BoothPeekResponse,
+  AssetDetailResponse, AssetTreeResponse, AvatarCard, AvatarsResponse, BatchCategoryResponse, BoothPeekResponse,
+  CategoriesResponse, CategoryConfig, CategoryNode, CategoryStatCount,
   DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
-  RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
+  ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagsResponse, UnityPackageResponse,
   UpdateCheckResponse, ViewMode,
 } from "./types";
+export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse } from "./types";
 
 export const API_BASE = "/api";
 
@@ -211,6 +213,11 @@ export async function listItems(q: ItemQuery): Promise<ItemsResponse> {
   const raw = await request<unknown>("GET", "/items" + queryString({
     q: q.q, avatar: q.avatar, avatarMatch: q.avatarMatch, ownedOnly: q.ownedOnly ? 1 : undefined,
     site: q.site, status: q.status, tag: q.tag, container: q.container, imported: q.imported,
+    // 契约写法是 catIds=clothing,clothing.tops（服务端按 avatar 的方式 String(x).split(",")，逗号串两种实现都吃）
+    catIds: q.categoryIds && q.categoryIds.length ? q.categoryIds.join(",") : undefined,
+    catMatch: q.categoryMatch && q.categoryMatch !== "any" ? q.categoryMatch : undefined,
+    uncategorized: q.uncategorized ? 1 : undefined,
+    pendingCategory: q.pendingCategory ? 1 : undefined,
     sort: q.sort, limit: q.limit, offset: q.offset,
   }));
   const items = pickArray<ItemCardWeb>(raw, "items");
@@ -233,6 +240,123 @@ export function createItem(title: string, sourceUrl?: string, notes?: string): P
 }
 export function patchItem(id: number, patch: Record<string, unknown>): Promise<ItemCardWeb> {
   return request("PATCH", "/items/" + id, patch);
+}
+
+// ---------------- 物品分类（docs/categories.md §4） ----------------
+/**
+ * 后端没有分类接口时的显式判据（404 / 405 / 501 / NOT_FOUND）。
+ * 需求 §4：**不得**静默 catch 成"点了没反应"——UI 必须能区分「未加载 / 后端不支持 / 失败」。
+ */
+export function isCategoryApiMissing(e: unknown): boolean {
+  if (e instanceof ApiError) {
+    return e.status === 404 || e.status === 405 || e.status === 501 || e.code === "NOT_FOUND";
+  }
+  return false;
+}
+/** 分类相关请求的可读错误（404 时明确说「后端未提供分类接口」）。 */
+export function categoryApiMessage(e: unknown, action = "分类操作"): string {
+  if (isCategoryApiMissing(e)) return action + "失败：后端未提供分类接口（" + describeError(e) + "）";
+  return action + "失败：" + describeError(e);
+}
+
+const num01 = (v: unknown, dflt: number): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : dflt;
+};
+
+/** GET /api/categories → { categories 树(含 itemCount), stats, config }。 */
+export async function getCategories(): Promise<CategoriesResponse> {
+  const raw = rec(await request<unknown>("GET", "/categories"));
+  const stats = rec(raw.stats);
+  const config = rec(raw.config);
+  return {
+    categories: pickArray<CategoryNode>(raw, "categories"),
+    stats: {
+      counts: pickArray<CategoryStatCount>(stats, "counts"),
+      uncategorized: numOr(stats.uncategorized, 0),
+      pending: numOr(stats.pending, 0),
+      total: numOr(stats.total, 0),
+      missingFiles: numOr(stats.missingFiles, 0),
+    },
+    config: {
+      autoThreshold: num01(config.autoThreshold, 0.75),
+      suggestThreshold: num01(config.suggestThreshold, 0.4),
+    } as CategoryConfig,
+  };
+}
+
+/** 条目级分类端点的响应可能是裸 ItemDetail，也可能是 { item: ItemDetail }（契约写的是后者）。 */
+function detailFrom(raw: unknown): ItemDetailWeb {
+  const outer = rec(raw);
+  const inner = rec(outer.item);
+  const pick = Array.isArray(outer.images) ? outer : Array.isArray(inner.images) ? inner : outer;
+  const d = pick as unknown as ItemDetailWeb;
+  return { ...d, images: arr(d.images), assets: arr(d.assets), avatars: arr(d.avatars), tags: arr(d.tags) };
+}
+
+/** POST /api/items/:id/category —— categoryId=null 清除归属（source='manual'）。 */
+export async function setItemCategory(id: number, body: { categoryId: string | null; subCategoryId?: string | null }): Promise<ItemDetailWeb> {
+  return detailFrom(await request<unknown>("POST", "/items/" + id + "/category", body));
+}
+/** POST /api/items/:id/category/accept —— 采纳当前建议（source='confirmed'，清建议）。 */
+export async function acceptCategorySuggestion(id: number): Promise<ItemDetailWeb> {
+  return detailFrom(await request<unknown>("POST", "/items/" + id + "/category/accept", {}));
+}
+/** POST /api/items/:id/category/dismiss —— 忽略建议（只清建议，不动归属）。 */
+export async function dismissCategorySuggestion(id: number): Promise<ItemDetailWeb> {
+  return detailFrom(await request<unknown>("POST", "/items/" + id + "/category/dismiss", {}));
+}
+/** POST /api/items/category/batch —— mode: set(默认) | clear_sub | resuggest。 */
+export async function batchSetItemCategory(body: {
+  itemIds: number[];
+  categoryId?: string | null;
+  subCategoryId?: string | null;
+  mode?: "set" | "clear_sub" | "resuggest";
+}): Promise<BatchCategoryResponse> {
+  const raw = rec(await request<unknown>("POST", "/items/category/batch", body));
+  return {
+    updated: numOr(raw.updated, 0),
+    failed: arr<{ itemId: number; reason: string }>(raw.failed),
+    requested: numOr(raw.requested, body.itemIds.length),
+  };
+}
+/** POST /api/categories/reclassify —— 自动分类（apply=false 只出建议；onlyUncategorized 只处理未分类）。 */
+export async function reclassifyCategories(body: {
+  itemIds?: number[];
+  onlyUncategorized?: boolean;
+  apply?: boolean;
+  all?: boolean;
+  limit?: number;
+}): Promise<ReclassifyResponse> {
+  const raw = rec(await request<unknown>("POST", "/categories/reclassify", body, { timeoutMs: 120000 }));
+  return {
+    scanned: numOr(raw.scanned, 0),
+    applied: numOr(raw.applied, 0),
+    suggested: numOr(raw.suggested, 0),
+    cleared: numOr(raw.cleared, 0),
+    skipped: numOr(raw.skipped, 0),
+    protected: numOr(raw.protected, 0),
+    results: arr<ReclassifyResponse["results"][number]>(raw.results),
+  };
+}
+/** PUT /api/categories/config —— 自动/建议阈值（0..1，suggest 不得高于 auto）。 */
+export async function setCategoryConfig(patch: { autoThreshold?: number; suggestThreshold?: number }): Promise<CategoryConfig> {
+  const raw = rec(await request<unknown>("PUT", "/categories/config", patch));
+  return { autoThreshold: num01(raw.autoThreshold, 0.75), suggestThreshold: num01(raw.suggestThreshold, 0.4) };
+}
+/** POST /api/categories —— 新建分类（分类树管理用；UI 暂未接线）。 */
+export async function createCategory(body: { id?: string; name: string; parentId?: string | null; sort?: number }): Promise<CategoryNode> {
+  const raw = rec(await request<unknown>("POST", "/categories", body));
+  return (rec(raw.category) as unknown as CategoryNode);
+}
+/** PATCH /api/categories/:id —— 改名/排序/启停/换父级。 */
+export async function updateCategory(id: string, patch: { name?: string; parentId?: string | null; sort?: number; enabled?: boolean }): Promise<CategoryNode> {
+  const raw = rec(await request<unknown>("PATCH", "/categories/" + encodeURIComponent(id), patch));
+  return (rec(raw.category) as unknown as CategoryNode);
+}
+/** DELETE /api/categories/:id —— 有子分类 → 409；返回被移出的条目数。 */
+export function deleteCategory(id: string): Promise<{ moved: number; movedSubs: number }> {
+  return request("DELETE", "/categories/" + encodeURIComponent(id));
 }
 export function deleteItem(id: number): Promise<unknown> { return request("DELETE", "/items/" + id); }
 export function restoreItem(id: number): Promise<ItemCardWeb> { return request("POST", "/items/" + id + "/restore"); }

@@ -4,6 +4,7 @@ import { BoothClient, parseBoothUrl } from "../../../../packages/core/src/source
 import { parseDeclaredCount } from "../../../../packages/core/src/avatars/normalize";
 import type { Repo } from "../db/repo";
 import type { MediaStore } from "./media";
+import { applyCategoryEvidence } from "./categories";
 
 export interface ImportOutcome { itemId: number; created: boolean; images: number; meta: BoothItemMeta; files: number }
 
@@ -49,6 +50,15 @@ async function attachImagesAndSnapshot(repo: Repo, media: MediaStore, client: Bo
 
 const MAX_IMAGES = 12;
 
+/**
+ * 分类钩子（§5-2）：BOOTH 元数据（标题/描述/BOOTH 分类/店铺/标签）落地后重跑一次分类。
+ * 走 applyCategoryEvidence（内部只经 repo.applyAutoCategory）；分类异常绝不阻断导入。
+ */
+function classifyQuietly(repo: Repo, itemId: number): void {
+  try { applyCategoryEvidence(repo, itemId); }
+  catch { /* 分类异常不得阻断导入 */ }
+}
+
 /** 抓 BOOTH 商品元数据 + 图集，落地条目（幂等：同 (booth, itemId) 更新而非重复建）。 */
 export async function importBoothUrl(
   repo: Repo,
@@ -82,6 +92,7 @@ export async function importBoothUrl(
     repo.updateItem(targetId, fields2 as any);
     repo.attachTags(targetId, meta.tags.map((t) => t.name), "auto");
     const outcome = await attachImagesAndSnapshot(repo, media, client, targetId, meta);
+    classifyQuietly(repo, targetId);
     return { itemId: targetId, created: false, images: outcome.images, meta, files: outcome.files };
   }
   const existing = owner;
@@ -117,5 +128,6 @@ export async function importBoothUrl(
     jsonHash: sha256Text(JSON.stringify({ n: meta.title, p: meta.priceText, i: meta.images.map((x) => x.original), f: files })),
     files, priceText: meta.priceText, imageUrls: meta.images.map((x) => x.original),
   });
+  classifyQuietly(repo, itemId);
   return { itemId, created, images, meta, files: files.length };
 }

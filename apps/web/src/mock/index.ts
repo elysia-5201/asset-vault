@@ -12,6 +12,10 @@ import {
   addJob, archiveEntries, assetAvatars, assets, avatars, images, itemAvatars, itemTags,
   items, jobs, nextId, projects, roots, svgCover, tags, unityPackageAssets, updates,
 } from "./seed";
+import {
+  NO_CAT, assignmentOf, catById, catChildren, catMatches, catTops, categoryConfig,
+  categoryDefs, recommendFor, setItemCategory, statsOf, suggestionOf, treeOf,
+} from "./categories";
 
 export class MockHttpError extends Error {
   constructor(public code: AppErrorCode, message: string, public status: number) {
@@ -70,8 +74,18 @@ function cardOf(item: ItemRow): ItemCard {
     coverImageId: item.cover_image_id, coverUrl: coverUrlOf(item), imageCount: imgs.length, assetCount: ast.length,
     totalBytes: ast.reduce((n, a) => n + a.size, 0),
     avatars: avatarsOfItem(item.id), tags: itemTags.get(item.id) ?? [], compatDeclaredCount: item.compat_declared_count,
+    category: assignmentOf(item), suggestion: suggestionOf(item),
     updatedAt: item.updated_at,
   };
+}
+
+/** 该条目是否有存续资产（分类统计 missingFiles 用）。 */
+function hasLiveAsset(itemId: number): boolean {
+  return assets.some((a) => a.item_id === itemId && a.status !== "trashed");
+}
+function isOwnedItem(itemId: number): boolean {
+  const owned = new Set(avatars.filter((a) => a.owned).map((a) => a.id));
+  return itemAvatars.some((x) => x.item_id === itemId && owned.has(x.avatar_id));
 }
 function itemCountOf(avatarId: number): number {
   const ids = new Set(itemAvatars.filter((x) => x.avatar_id === avatarId).map((x) => x.item_id));
@@ -108,6 +122,11 @@ function listItems(q: URLSearchParams) {
   const ownedOnly = q.get("ownedOnly") === "1" || q.get("ownedOnly") === "true";
   const avatarIds = (q.getAll("avatar").join(",") || "").split(",").map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
   const match = (q.get("avatarMatch") ?? "any") as AvatarMatch;
+  // 分类筛选：URL 键是 catIds（契约写法是逗号分隔；这里两种都吃：catIds=a,b 与 catIds=a&catIds=b）
+  const catIds = (q.getAll("catIds").join(",") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const catMatch: "any" | "all" = q.get("catMatch") === "all" ? "all" : "any";
+  const uncategorized = q.get("uncategorized") === "1" || q.get("uncategorized") === "true";
+  const pendingCategory = q.get("pendingCategory") === "1" || q.get("pendingCategory") === "true";
   const sort = q.get("sort") ?? "updated";
   const limit = num(q.get("limit")) ?? 100;
   const offset = num(q.get("offset")) ?? 0;
@@ -115,6 +134,9 @@ function listItems(q: URLSearchParams) {
   let rows = items.filter((i) => (status ? i.status === status : i.status !== "trashed"));
   if (site) rows = rows.filter((i) => i.source_site === site);
   if (tag) rows = rows.filter((i) => (itemTags.get(i.id) ?? []).includes(tag));
+  if (catIds.length) rows = rows.filter((i) => catMatches(i, catIds, catMatch));
+  if (uncategorized) rows = rows.filter((i) => !i.cat_id);
+  if (pendingCategory) rows = rows.filter((i) => i.cat_suggest_id !== null);
   if (text) {
     rows = rows.filter((i) => [i.title, i.shop_name, i.author, i.category_name, i.description, i.notes, i.source_item_id]
       .some((f) => (f ?? "").toLowerCase().includes(text)));
@@ -257,11 +279,48 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
         purchased: 0, purchased_at: null, published_at: null, category_name: null, category_parent: null,
         description: null, adult: 0, status: "inbox", rating: null, favorite: 0, notes: String(b.notes ?? "") || null,
         cover_image_id: null, compat_declared_count: null, id_confidence: null, id_match_method: "manual",
-        source_gone: 0, last_checked_at: null, created_at: now, updated_at: now,
+        source_gone: 0, last_checked_at: null, ...NO_CAT, created_at: now, updated_at: now,
       };
       items.push(row); itemTags.set(id, []);
       return { status: 201, body: cardOf(row) };
     }
+    // 批量分类（/items/category/batch）：必须放在 Number(seg[1]) 之前，否则会被当成条目 id
+    if (seg.length === 3 && seg[1] === "category" && seg[2] === "batch" && M === "POST") {
+      const ids = Array.isArray(b.itemIds) ? (b.itemIds as unknown[]).map(Number).filter((n) => Number.isInteger(n)) : [];
+      if (!ids.length) fail("INVALID_INPUT", "itemIds 不能为空");
+      const mode = typeof b.mode === "string" && b.mode ? b.mode : "set";
+      if (!["set", "clear_sub", "resuggest"].includes(mode)) fail("INVALID_INPUT", "未知 mode：" + mode);
+      const categoryId = b.categoryId === undefined ? undefined : (b.categoryId === null || b.categoryId === "" ? null : String(b.categoryId));
+      const subCategoryId = b.subCategoryId === undefined || b.subCategoryId === null || b.subCategoryId === "" ? null : String(b.subCategoryId);
+      if (mode === "set" && categoryId === undefined) fail("INVALID_INPUT", "mode=set 需要 categoryId（null = 清除归属）");
+      if (mode === "set" && categoryId !== null && categoryId !== undefined && !catById(categoryId)) fail("INVALID_INPUT", "分类不存在：" + categoryId);
+      if (subCategoryId !== null && categoryId) {
+        const sd = catById(subCategoryId);
+        if (sd && sd.parentId !== categoryId) fail("INVALID_INPUT", "子分类不属于主分类：" + subCategoryId);
+      }
+      const failed: { itemId: number; reason: string }[] = [];
+      let updated = 0;
+      for (const iid of ids) {
+        const row = items.find((i) => i.id === iid);
+        if (!row) { failed.push({ itemId: iid, reason: "条目不存在" }); continue; }
+        if (mode === "set") {
+          setItemCategory(row, { categoryId: categoryId ?? null, subCategoryId, source: "manual" }, now);
+        } else if (mode === "clear_sub") {
+          if (!row.cat_id) { failed.push({ itemId: iid, reason: "该条目未分类，没有可移除的子分类" }); continue; }
+          setItemCategory(row, { categoryId: row.cat_id, subCategoryId: null, source: row.cat_source ?? "manual", confidence: row.cat_confidence, reason: row.cat_reason, evidence: row.cat_evidence }, now);
+        } else {
+          const rec = recommendFor(row, itemTags.get(iid) ?? []);
+          if (!rec.categoryId) { failed.push({ itemId: iid, reason: "没有命中任何分类关键词（保持未分类）" }); continue; }
+          row.cat_suggest_id = rec.categoryId; row.cat_suggest_sub_id = rec.subCategoryId;
+          row.cat_suggest_confidence = rec.confidence; row.cat_suggest_reason = rec.reason; row.cat_suggest_evidence = rec.evidence;
+          row.cat_suggest_at = now;
+        }
+        row.updated_at = now;
+        updated += 1;
+      }
+      return { status: 200, body: { updated, failed, requested: ids.length } };
+    }
+
     const id = Number(seg[1]);
     const item = items.find((i) => i.id === id);
     if (!item) fail("NOT_FOUND", "条目 " + seg[1] + " 不存在", 404);
@@ -273,6 +332,34 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
       if (Array.isArray(b.tags)) itemTags.set(id, (b.tags as unknown[]).map(String));
       item.updated_at = now;
       return { status: 200, body: cardOf(item) };
+    }
+    if (seg.length === 3 && seg[2] === "category" && M === "POST") {
+      const raw = b.categoryId;
+      if (raw === undefined) fail("INVALID_INPUT", "categoryId 必填（null = 清除归属）");
+      const categoryId = raw === null || raw === "" ? null : String(raw);
+      if (categoryId !== null && !catById(categoryId)) fail("INVALID_INPUT", "分类不存在：" + categoryId);
+      const sub = b.subCategoryId === undefined || b.subCategoryId === null || b.subCategoryId === "" ? null : String(b.subCategoryId);
+      setItemCategory(item, { categoryId, subCategoryId: sub, source: "manual" }, now);
+      item.updated_at = now;
+      return { status: 200, body: detailOf(item) };
+    }
+    if (seg.length === 4 && seg[2] === "category" && seg[3] === "accept" && M === "POST") {
+      // 与服务端 routes.ts:1061 对齐：没有建议 → 400 INVALID_INPUT（不是 409）
+      if (!item.cat_suggest_id) fail("INVALID_INPUT", "该条目没有待确认的分类建议");
+      setItemCategory(item, {
+        categoryId: item.cat_suggest_id, subCategoryId: item.cat_suggest_sub_id, source: "confirmed",
+        confidence: item.cat_suggest_confidence, reason: item.cat_suggest_reason, evidence: item.cat_suggest_evidence,
+      }, now);
+      item.updated_at = now;
+      return { status: 200, body: detailOf(item) };
+    }
+    if (seg.length === 4 && seg[2] === "category" && seg[3] === "dismiss" && M === "POST") {
+      // 服务端 dismiss 是幂等清理（无建议也 200），mock 同样不报错
+
+      item.cat_suggest_id = null; item.cat_suggest_sub_id = null; item.cat_suggest_confidence = null;
+      item.cat_suggest_reason = null; item.cat_suggest_evidence = null; item.cat_suggest_at = null;
+      item.updated_at = now;
+      return { status: 200, body: detailOf(item) };
     }
     if (seg.length === 2 && M === "DELETE") { item.status = "trashed"; item.updated_at = now; return { status: 200, body: { ok: true, status: "trashed" } }; }
     if (seg.length === 3 && seg[2] === "restore" && M === "POST") { item.status = "inbox"; item.updated_at = now; return { status: 200, body: cardOf(item) }; }
@@ -382,6 +469,150 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
     }
   }
 
+  if (seg[0] === "categories") {
+    if (seg.length === 1 && M === "GET") {
+      return {
+        status: 200,
+        body: {
+          categories: treeOf(items),
+          stats: statsOf(items, isOwnedItem, hasLiveAsset),
+          config: { ...categoryConfig },
+        },
+      };
+    }
+    if (seg.length === 1 && M === "POST") {
+      const name = String(b.name ?? "").trim();
+      if (!name) fail("INVALID_INPUT", "name 不能为空");
+      const parentId = b.parentId === undefined || b.parentId === null || b.parentId === "" ? null : String(b.parentId);
+      let id = typeof b.id === "string" && b.id.trim() ? b.id.trim() : "";
+      if (parentId !== null) {
+        const parent = catById(parentId);
+        if (!parent) fail("INVALID_INPUT", "父分类不存在：" + parentId);
+        if (parent.parentId !== null) fail("INVALID_INPUT", "分类最多两层（" + parentId + " 已经是子分类）");
+        if (!id) id = parentId + ".custom" + (catChildren(parentId).length + 1);
+      } else if (!id) {
+        id = "custom" + (catTops().length + 1);
+      }
+      if (catById(id)) fail("CONFLICT", "分类 ID 已存在：" + id, 409);
+      const siblings = parentId === null ? catTops() : catChildren(parentId);
+      const sortRaw = Number(b.sort);
+      const def = {
+        id, name, parentId, sort: Number.isFinite(sortRaw) ? sortRaw : (siblings.at(-1)?.sort ?? 0) + 10,
+        enabled: true, builtin: false,
+      };
+      categoryDefs.push(def);
+      return { status: 201, body: { category: { ...def, itemCount: 0, children: parentId === null ? [] : undefined } } };
+    }
+    if (seg.length === 2 && seg[1] === "config" && M === "PUT") {
+      if (b.autoThreshold !== undefined) {
+        const v = Number(b.autoThreshold);
+        if (!Number.isFinite(v) || v < 0 || v > 1) fail("INVALID_INPUT", "autoThreshold 必须在 0..1");
+        categoryConfig.autoThreshold = v;
+      }
+      if (b.suggestThreshold !== undefined) {
+        const v = Number(b.suggestThreshold);
+        if (!Number.isFinite(v) || v < 0 || v > 1) fail("INVALID_INPUT", "suggestThreshold 必须在 0..1");
+        categoryConfig.suggestThreshold = v;
+      }
+      // 与服务端 services/categories.ts setCategoryConfig 对齐：只校验 0..1，不强制 suggest<=auto
+      return { status: 200, body: { ...categoryConfig } };
+    }
+    if (seg.length === 2 && seg[1] === "reclassify" && M === "POST") {
+      const wantIds = Array.isArray(b.itemIds) ? (b.itemIds as unknown[]).map(Number).filter((n) => Number.isInteger(n)) : null;
+      const onlyUncategorized = b.onlyUncategorized === true || b.onlyUncategorized === "1";
+      const all = b.all === true || b.all === "1";
+      const apply = b.apply !== false;
+      const limitRaw = Number(b.limit);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 2000) : 500;
+      let targets = wantIds ? items.filter((i) => wantIds.includes(i.id) && i.status !== "trashed") : items.filter((i) => i.status !== "trashed");
+      // 未显式给 itemIds / all 时，默认只处理「未分类」的条目（自动分类的安全默认）
+      if (!wantIds && !all) targets = targets.filter((i) => !i.cat_id);
+      if (onlyUncategorized) targets = targets.filter((i) => !i.cat_id);
+      const results: {
+        itemId: number; categoryId: string | null; subCategoryId: string | null; confidence: number;
+        level: string; applied: boolean; protected: boolean; reason: string;
+      }[] = [];
+      let applied = 0, suggested = 0, cleared = 0, skipped = 0, protectedN = 0;
+      for (const row of targets.slice(0, limit)) {
+        const rec = recommendFor(row, itemTags.get(row.id) ?? []);
+        const userSet = row.cat_source === "manual" || row.cat_source === "confirmed";
+        let didApply = false;
+        let didProtect = false;
+        if (!rec.categoryId || rec.level === "none") {
+          skipped += 1;
+          if (row.cat_suggest_id) { row.cat_suggest_id = null; row.cat_suggest_sub_id = null; row.cat_suggest_confidence = null; row.cat_suggest_reason = null; row.cat_suggest_evidence = null; row.cat_suggest_at = null; cleared += 1; }
+        } else if (rec.level === "auto" && apply && !userSet) {
+          setItemCategory(row, { categoryId: rec.categoryId, subCategoryId: rec.subCategoryId, source: "auto", confidence: rec.confidence, reason: rec.reason, evidence: rec.evidence }, now);
+          applied += 1; didApply = true;
+        } else {
+          row.cat_suggest_id = rec.categoryId; row.cat_suggest_sub_id = rec.subCategoryId;
+          row.cat_suggest_confidence = rec.confidence; row.cat_suggest_reason = rec.reason;
+          row.cat_suggest_evidence = rec.evidence; row.cat_suggest_at = now;
+          suggested += 1;
+          if (userSet && rec.level === "auto") { didProtect = true; protectedN += 1; }
+        }
+        row.updated_at = now;
+        results.push({
+          itemId: row.id, categoryId: rec.categoryId, subCategoryId: rec.subCategoryId, confidence: rec.confidence,
+          level: rec.level, applied: didApply, protected: didProtect, reason: rec.reason,
+        });
+      }
+      return {
+        status: 200,
+        body: { scanned: results.length, applied, suggested, cleared, skipped, protected: protectedN, results },
+      };
+    }
+    const cid = decodeURIComponent(seg[1] ?? "");
+    const def = catById(cid);
+    if (!def) fail("NOT_FOUND", "分类不存在：" + cid, 404);
+    if (seg.length === 2 && M === "PATCH") {
+      if (typeof b.name === "string") {
+        const nm = b.name.trim();
+        if (!nm) fail("INVALID_INPUT", "name 不能为空");
+        def.name = nm;
+      }
+      if (b.sort !== undefined) {
+        const v = Number(b.sort);
+        if (!Number.isFinite(v)) fail("INVALID_INPUT", "sort 必须是数字");
+        def.sort = v;
+      }
+      if (b.enabled !== undefined) def.enabled = b.enabled === true || b.enabled === 1 || b.enabled === "1";
+      if (b.parentId !== undefined) {
+        const pid = b.parentId === null || b.parentId === "" ? null : String(b.parentId);
+        if (pid === null) {
+          if (catChildren(def.id).length) fail("CONFLICT", "该分类下有子分类，不能提升为主分类", 409);
+          def.parentId = null;
+        } else {
+          const parent = catById(pid);
+          if (!parent) fail("INVALID_INPUT", "父分类不存在：" + pid);
+          if (parent.parentId !== null) fail("INVALID_INPUT", "分类最多两层");
+          if (pid === def.id) fail("INVALID_INPUT", "父分类不能是自己");
+          if (def.parentId === null && catChildren(def.id).length) fail("CONFLICT", "该分类下有子分类，不能再挂到别的分类下", 409);
+          def.parentId = pid;
+        }
+      }
+      const node = { ...def, itemCount: items.filter((i) => i.status !== "trashed" && (i.cat_id === def.id || i.cat_sub_id === def.id)).length };
+      return { status: 200, body: { category: node } };
+    }
+    if (seg.length === 2 && M === "DELETE") {
+      const kids = catChildren(def.id);
+      if (kids.length) fail("CONFLICT", "该分类下有 " + kids.length + " 个子分类，先移走或删除它们", 409);
+      const hit = items.filter((i) => (def.parentId === null ? i.cat_id === def.id : i.cat_sub_id === def.id));
+      for (const row of hit) {
+        if (def.parentId === null) {
+          row.cat_id = null; row.cat_sub_id = null; row.cat_source = null; row.cat_confidence = null;
+          row.cat_reason = null; row.cat_evidence = null; row.cat_assigned_at = null;
+        } else {
+          row.cat_sub_id = null;
+        }
+        row.updated_at = now;
+      }
+      const at = categoryDefs.findIndex((d) => d.id === def.id);
+      if (at >= 0) categoryDefs.splice(at, 1);
+      return { status: 200, body: { moved: def.parentId === null ? hit.length : 0, movedSubs: def.parentId === null ? 0 : hit.length } };
+    }
+  }
+
   if (seg[0] === "avatars") {
     if (seg.length === 1 && M === "GET") {
       const text = (query.get("q") ?? "").trim().toLowerCase();
@@ -475,7 +706,7 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
       let item = items.find((i) => i.source_item_id === meta.itemId);
       if (!item) {
         const id = Math.max(0, ...items.map((i) => i.id)) + 1;
-        item = { id, uid: "booth-" + meta.itemId, source_site: "booth", source_item_id: meta.itemId, source_url: meta.url, canonical_url: meta.url, title: meta.title, title_ja: null, shop_name: meta.shop.name, shop_subdomain: meta.shop.subdomain, author: null, price_text: meta.priceText, price_yen: meta.priceYen, purchased: 0, purchased_at: null, published_at: meta.publishedAt, category_name: meta.category.name, category_parent: meta.category.parent?.name ?? null, description: meta.description, adult: meta.isAdult ? 1 : 0, status: "inbox", rating: null, favorite: 0, notes: null, cover_image_id: null, compat_declared_count: null, id_confidence: 0.99, id_match_method: "url", source_gone: 0, last_checked_at: null, created_at: now, updated_at: now };
+        item = { id, uid: "booth-" + meta.itemId, source_site: "booth", source_item_id: meta.itemId, source_url: meta.url, canonical_url: meta.url, title: meta.title, title_ja: null, shop_name: meta.shop.name, shop_subdomain: meta.shop.subdomain, author: null, price_text: meta.priceText, price_yen: meta.priceYen, purchased: 0, purchased_at: null, published_at: meta.publishedAt, category_name: meta.category.name, category_parent: meta.category.parent?.name ?? null, description: meta.description, adult: meta.isAdult ? 1 : 0, status: "inbox", rating: null, favorite: 0, notes: null, cover_image_id: null, compat_declared_count: null, id_confidence: 0.99, id_match_method: "url", source_gone: 0, last_checked_at: null, ...NO_CAT, created_at: now, updated_at: now };
         items.push(item); itemTags.set(id, []);
       }
       const job = addJob("import_url", item.id, JSON.stringify({ url, downloadImages: b.downloadImages !== false }));

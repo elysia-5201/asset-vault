@@ -3,10 +3,11 @@
  * 仅在 API 不可达时使用（api.ts 探测 /health 失败 → mock 模式）。
  */
 import type {
-  ArchiveEntry, AssetAvatarRow, AssetRow, AvatarKind, AvatarMatch, ContainerKind,
+  ArchiveEntry, AssetAvatarRow, AssetRow, AvatarKind, AvatarMatch, CategoryRefSource, ContainerKind,
   ImageOrigin, ImageRole, ImageRow, ItemAvatarRow, ItemRow, ItemStatus, JobEventRow,
   JobKind, JobRow, JobState, LibraryRootRow, RootMode, SourceSite, TagRow, UnityPackageAsset,
 } from "@core/contracts";
+import { NO_CAT } from "./categories";
 
 const NOW = "2026-10-04T02:20:00.000Z";
 let seq = 1000;
@@ -71,16 +72,32 @@ interface SeedItem {
   compat?: number; hue: number; images: number; container: "zip" | "7z" | "unitypackage" | "dir" | "none";
   assetCount?: number; purchased?: number; publishedAt?: string; desc?: string;
   compatAvatars?: { id: number; match: AvatarMatch; confidence: number; evidence: string; source: "auto" | "manual" | "confirmed" }[];
+  /** v2 物品分类归属（预设，便于 mock 里直接看到徽章 / 来源标签 / 证据）。注意与上面的 BOOTH 来源分类 cat/catParent 区分开 */
+  catId?: string; catSubId?: string | null; catSource?: CategoryRefSource; catConf?: number | null;
+  catReason?: string | null; catEvidence?: string | null;
+  /** v2 待确认建议 */
+  suggestCat?: string; suggestSub?: string | null; suggestConf?: number | null; suggestReason?: string | null; suggestEvidence?: string | null;
 }
 const seeds: SeedItem[] = [
-  { title: "【12アバター対応】セーラー服セット", site: "booth", sid: "6115428", shop: "まぬか屋", author: "まぬか", cat: "衣装", catParent: "3Dモデル", price: "¥1,500", yen: 1500, status: "active", favorite: 1, hue: 210, images: 5, container: "zip", assetCount: 2, compat: 12, purchased: 1, publishedAt: "2025-11-03T00:00:00.000Z", notes: "袖のボーンは要調整。", tagNames: ["衣装", "対応アバター"], desc: "MANUKA / Selestia / 桔梗 など12体対応のセーラー服。", compatAvatars: [ { id: 1, match: "any", confidence: 0.96, evidence: "title:【12アバター対応】| booth_tag:MANUKA", source: "auto" }, { id: 2, match: "any", confidence: 0.91, evidence: "booth_tag:Selestia", source: "auto" }, { id: 3, match: "any", confidence: 0.74, evidence: "archive_path:桔梗/", source: "confirmed" } ] },
-  { title: "ロングヘア「ふわり」", site: "booth", sid: "6000001", shop: "Hair Lab", author: "sora", cat: "髪型", catParent: "3Dモデル", price: "¥800", yen: 800, status: "active", hue: 320, images: 4, container: "unitypackage", assetCount: 1, compat: 5, purchased: 1, publishedAt: "2025-08-21T00:00:00.000Z", tagNames: ["髪型"], desc: "物理設定済みのロングヘア。", compatAvatars: [ { id: 1, match: "any", confidence: 0.88, evidence: "unitypackage_path:Assets/Fuwari/", source: "auto" }, { id: 4, match: "any", confidence: 0.66, evidence: "description:しなの対応", source: "auto" } ] },
-  { title: "Loli_Shinano_6115428 対応1.01", site: "local", status: "inbox", hue: 160, images: 2, container: "zip", assetCount: 1, compat: 1, tagNames: ["衣装"], compatAvatars: [ { id: 4, match: "any", confidence: 0.93, evidence: "filename:Loli_Shinano_6115428", source: "auto" } ] },
-  { title: "[19 Avatars] Oversized Hoodie", site: "gumroad", sid: "hoodie19", shop: "NeonThreads", author: "kuro", cat: "衣装", price: "$12", yen: 1800, status: "inbox", hue: 275, images: 3, container: "zip", assetCount: 1, compat: 19, tagNames: ["衣装"], compatAvatars: [ { id: 2, match: "any", confidence: 0.81, evidence: "title:[19 Avatars]", source: "auto" } ] },
-  { title: "Modular Avatar 対応キット", site: "unity_asset_store", sid: "uap-modular", shop: "Unity Technologies", author: "Unity", cat: "ツール", price: "¥0", yen: 0, status: "archived", hue: 30, images: 2, container: "dir", assetCount: 1, tagNames: ["無料"], compatAvatars: [] },
-  { title: "【MANUKA専用】サイバーパンク衣装", site: "booth", sid: "7000123", shop: "CyberFit", author: "aki", cat: "衣装", catParent: "3Dモデル", price: "¥2,200", yen: 2200, status: "active", favorite: 1, adult: 1, hue: 190, images: 6, container: "7z", assetCount: 2, compat: 1, purchased: 1, notes: "7z は 7zip-bin 経由のみ。", tagNames: ["衣装", "対応アバター"], compatAvatars: [ { id: 1, match: "all", confidence: 0.99, evidence: "title:【MANUKA専用】| archive_path:MANUKA/", source: "manual" } ] },
-  { title: "アクセサリ詰め合わせ Vol.3", site: "booth", sid: "7000555", shop: "小物屋", author: "mio", cat: "アクセサリー", catParent: "3Dモデル", price: "¥500", yen: 500, status: "inbox", hue: 95, images: 3, container: "zip", assetCount: 1, compat: 0, tagNames: [], compatAvatars: [] },
-  { title: "Kikyo 用 巫女服", site: "booth", sid: "7000777", shop: "和装屋", author: "yuki", cat: "衣装", catParent: "3Dモデル", price: "¥1,100", yen: 1100, status: "inbox", hue: 350, images: 4, container: "zip", assetCount: 0, compat: 1, tagNames: ["衣装"], compatAvatars: [ { id: 3, match: "any", confidence: 0.87, evidence: "booth_tag:桔梗| title:Kikyo", source: "auto" } ] },
+  { title: "【12アバター対応】セーラー服セット", site: "booth", sid: "6115428", shop: "まぬか屋", author: "まぬか", cat: "衣装", catParent: "3Dモデル", price: "¥1,500", yen: 1500, status: "active", favorite: 1, hue: 210, images: 5, container: "zip", assetCount: 2, compat: 12, purchased: 1, publishedAt: "2025-11-03T00:00:00.000Z", notes: "袖のボーンは要調整。", tagNames: ["衣装", "対応アバター"], catId: "clothing", catSubId: "suit", catSource: "auto", catConf: 0.82,
+    catReason: "标题命中「セーラー服」（title 1.0）+ 标签「衣装」（tag 0.8）→ 得分 1.8",
+    catEvidence: '[{"field":"title","matched":"セーラー服","gain":1,"cat":"clothing","sub":"clothing.suit"},{"field":"tag","matched":"衣装","gain":0.8,"cat":"clothing","sub":"clothing.suit"}]',
+    desc: "MANUKA / Selestia / 桔梗 など12体対応のセーラー服。", compatAvatars: [ { id: 1, match: "any", confidence: 0.96, evidence: "title:【12アバター対応】| booth_tag:MANUKA", source: "auto" }, { id: 2, match: "any", confidence: 0.91, evidence: "booth_tag:Selestia", source: "auto" }, { id: 3, match: "any", confidence: 0.74, evidence: "archive_path:桔梗/", source: "confirmed" } ] },
+  { title: "ロングヘア「ふわり」", site: "booth", sid: "6000001", shop: "Hair Lab", author: "sora", cat: "髪型", catParent: "3Dモデル", price: "¥800", yen: 800, status: "active", hue: 320, images: 4, container: "unitypackage", assetCount: 1, compat: 5, purchased: 1, publishedAt: "2025-08-21T00:00:00.000Z", tagNames: ["髪型"], catId: "hair", catSubId: "model", catSource: "migrated", catConf: null, catReason: "历史数据迁移：按 BOOTH 分类「髪型」映射", catEvidence: null,
+    desc: "物理設定済みのロングヘア。", compatAvatars: [ { id: 1, match: "any", confidence: 0.88, evidence: "unitypackage_path:Assets/Fuwari/", source: "auto" }, { id: 4, match: "any", confidence: 0.66, evidence: "description:しなの対応", source: "auto" } ] },
+  { title: "Loli_Shinano_6115428 対応1.01", site: "local", status: "inbox", hue: 160, images: 2, container: "zip", assetCount: 1, compat: 1, catId: "hair", catSubId: "hair.texture", catSource: "manual", catReason: null,
+    tagNames: ["衣装"], compatAvatars: [ { id: 4, match: "any", confidence: 0.93, evidence: "filename:Loli_Shinano_6115428", source: "auto" } ] },
+  { title: "[19 Avatars] Oversized Hoodie", site: "gumroad", sid: "hoodie19", shop: "NeonThreads", author: "kuro", cat: "衣装", price: "$12", yen: 1800, status: "inbox", hue: 275, images: 3, container: "zip", assetCount: 1, catId: "clothing", catSubId: "clothing.tops", catSource: "manual",
+    compat: 19, tagNames: ["衣装"], compatAvatars: [ { id: 2, match: "any", confidence: 0.81, evidence: "title:[19 Avatars]", source: "auto" } ] },
+  { title: "Modular Avatar 対応キット", site: "unity_asset_store", sid: "uap-modular", shop: "Unity Technologies", author: "Unity", cat: "ツール", price: "¥0", yen: 0, status: "archived", hue: 30, images: 2, container: "dir", assetCount: 1, catId: "tools", catSubId: "tools.modular_avatar", catSource: "auto", catConf: 0.91, catReason: "标题命中「Modular Avatar」（title 1.0）", catEvidence: '[{"field":"title","matched":"Modular Avatar","gain":1,"cat":"tools","sub":"tools.modular_avatar"}]', tagNames: ["無料"], compatAvatars: [] },
+  { title: "【MANUKA専用】サイバーパンク衣装", site: "booth", sid: "7000123", shop: "CyberFit", author: "aki", cat: "衣装", catParent: "3Dモデル", price: "¥2,200", yen: 2200, status: "active", favorite: 1, adult: 1, hue: 190, images: 6, container: "7z", assetCount: 2, compat: 1, purchased: 1, catId: "clothing", catSubId: "clothing.suit", catSource: "manual",
+    suggestCat: "clothing", suggestSub: "clothing.dress", suggestConf: 0.52,
+    suggestReason: "标题命中「衣装」（title 1.0），但与第二候选差距 < 35%（歧义降权）",
+    suggestEvidence: '[{"field":"title","matched":"衣装","gain":1,"cat":"clothing","sub":"clothing.dress"}]',
+    notes: "7z は 7zip-bin 経由のみ。", tagNames: ["衣装", "対応アバター"], compatAvatars: [ { id: 1, match: "all", confidence: 0.99, evidence: "title:【MANUKA専用】| archive_path:MANUKA/", source: "manual" } ] },
+  { title: "アクセサリ詰め合わせ Vol.3", site: "booth", sid: "7000555", shop: "小物屋", author: "mio", cat: "アクセサリー", catParent: "3Dモデル", price: "¥500", yen: 500, status: "inbox", hue: 95, images: 3, container: "zip", assetCount: 1, suggestCat: "accessories", suggestSub: "accessories.other", suggestConf: 0.61, suggestReason: "标题命中「アクセサリ」（title 1.0）", suggestEvidence: '[{"field":"title","matched":"アクセサリ","gain":1,"cat":"accessories","sub":"accessories.other"}]', compat: 0, tagNames: [], compatAvatars: [] },
+  { title: "Kikyo 用 巫女服", site: "booth", sid: "7000777", shop: "和装屋", author: "yuki", cat: "衣装", catParent: "3Dモデル", price: "¥1,100", yen: 1100, status: "inbox", hue: 350, images: 4, container: "zip", assetCount: 0, compat: 1, catId: "clothing", catSubId: "clothing.dress", catSource: "confirmed", catConf: 0.74, catReason: "用户采纳了自动建议", catEvidence: null,
+    tagNames: ["衣装"], compatAvatars: [ { id: 3, match: "any", confidence: 0.87, evidence: "booth_tag:桔梗| title:Kikyo", source: "auto" } ] },
   { title: "汎用シェーダー詰め合わせ", site: "itch", sid: "shader-pack", shop: "ShadeWorks", author: "ren", cat: "シェーダー", price: "¥300", yen: 300, status: "active", hue: 240, images: 2, container: "none", assetCount: 0, tagNames: [], compatAvatars: [] },
   { title: "古い衣装（破損）", site: "booth", sid: "7000999", shop: "旧屋", author: "old", cat: "衣装", status: "trashed", hue: 0, images: 1, container: "none", assetCount: 0, tagNames: [], compatAvatars: [] },
 ];
@@ -131,6 +148,31 @@ function upEntries(prefix: string, count: number): UnityPackageAsset[] {
   return out;
 }
 
+/** ItemRow 里 v2 分类的那 13 列。 */
+type CatColumns = Pick<ItemRow,
+  | "cat_id" | "cat_sub_id" | "cat_source" | "cat_confidence" | "cat_reason" | "cat_evidence" | "cat_assigned_at"
+  | "cat_suggest_id" | "cat_suggest_sub_id" | "cat_suggest_confidence" | "cat_suggest_reason" | "cat_suggest_evidence" | "cat_suggest_at">;
+
+/** 把 seed 上的分类预设展开成 ItemRow 的 cat_* 列（无预设 = 未分类）。 */
+function catColumns(s: SeedItem, at: string): CatColumns {
+  return {
+    ...NO_CAT,
+    cat_id: s.catId ?? null,
+    cat_sub_id: s.catSubId ?? null,
+    cat_source: s.catId ? (s.catSource ?? "manual") : null,
+    cat_confidence: s.catConf ?? null,
+    cat_reason: s.catReason ?? null,
+    cat_evidence: s.catEvidence ?? null,
+    cat_assigned_at: s.catId ? at : null,
+    cat_suggest_id: s.suggestCat ?? null,
+    cat_suggest_sub_id: s.suggestSub ?? null,
+    cat_suggest_confidence: s.suggestConf ?? null,
+    cat_suggest_reason: s.suggestReason ?? null,
+    cat_suggest_evidence: s.suggestEvidence ?? null,
+    cat_suggest_at: s.suggestCat ? at : null,
+  };
+}
+
 function build(): void {
   let itemId = 0;
   for (const s of seeds) {
@@ -147,7 +189,7 @@ function build(): void {
       description: s.desc ?? null, adult: s.adult ?? 0, status: s.status ?? "inbox", rating: s.favorite ? 5 : null,
       favorite: s.favorite ?? 0, notes: s.notes ?? null, cover_image_id: null, compat_declared_count: s.compat ?? null,
       id_confidence: s.site === "booth" ? 0.99 : 0.6, id_match_method: s.site === "booth" ? "url" : "filename",
-      source_gone: 0, last_checked_at: "2026-10-01T00:00:00.000Z", created_at: createdAt, updated_at: createdAt,
+      source_gone: 0, last_checked_at: "2026-10-01T00:00:00.000Z", ...catColumns(s, createdAt), created_at: createdAt, updated_at: createdAt,
     };
     // images
     const roles: ImageRole[] = ["cover", "gallery", "gallery", "package_preview", "user"];
