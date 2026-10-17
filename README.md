@@ -38,6 +38,7 @@
 | **更新检测** | 快照 `variations[].downloadable` 文件名/大小 + 价格 + 图集，一键「检查更新」出差异 |
 | **作业与恢复** | 13 状态状态机 + CAS 转移；`kill -9` 后重启自动回收在飞作业（`recovered` 事件可查） |
 | **回收站** | 软删可恢复；磁盘文件缺失只标 `missing`，记录与收藏不丢 |
+| **扫描变更中心** | 扫描先出**可确认的清单**（新增 / 未变 / 已变化 / 缺失 / 疑似重复 / 不可读 / 错误），逐条勾选后**才**应用；应用前逐条重验 size+mtime，文件变了就标 stale 拒绝写库；只做登记/重新索引/确认缺失，**不移动、不删除源文件，也不自动合并重复项** |
 | **收件箱监听** | 把 IDM / 浏览器下载目录设为收件箱，新落盘的 zip/7z/rar/unitypackage **自动建档入库**（chokidar + awaitWriteFinish，3 秒静默触发） |
 | **真导入 Unity** | 详情页「导入到 Unity 工程」：探测**当前打开的那个编辑器**（mcp-for-unity），列出条目里所有 `.unitypackage`（压缩包内的、zip 套 zip 的也算）→ 按当前工程的 avatar **自动预选** → `AssetDatabase.ImportPackage(path,false)` 真导入；导入前清控制台、导入后回读报错 |
 | **套装 / 合并** | 同一商品拆成「模型包 + 材质包/DLC」时，用**套装**归组（各自保留条目），确认后再**合并**成一条（压缩包/图片/标签全并过去，来源进回收站可恢复）；套装里有一键「⤵并入」 |
@@ -194,7 +195,17 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - 规则与阈值：分类定义与关键词规则集中在 `packages/core/src/categories/`；置信度阈值可在界面/接口改（`PUT /api/categories/config`，默认 auto 0.75 / suggest 0.4）。设计细节见 `docs/categories-v3.md`（v3 契约）与 `docs/categories.md`（v2 起点）。
 - **迁移**：v1/v2 老库首次启动自动升到 v3（事务内完成，幂等）；旧子分类按映射表改指素材后删除，**素材、标签、avatar 适配、导入记录、回收站一律不动**（真实库实测：29 素材 / 908 标签关联 / 140 适配全部保留）。
 
-### 8. HTTP API
+### 8. 扫描变更中心
+
+- 顶栏「扫描预览」：选库根 → 生成预览。生成阶段**不写素材**，只落一份清单（可随时关掉、取消、删除）。
+- 清单里每条都标了变化：`新增` / `未变` / `已变化` / `缺失` / `疑似重复` / `不可读` / `错误`，可按类型筛选、逐条勾选或「全选可应用」。
+- **应用前会逐条重新 stat**：预览之后文件被删、被改（size/mtime 变了）、或「缺失项又出现了」→ 标 `stale` 跳过，要求重新扫描；不会拿旧快照写库。
+- 应用只做三件事：登记新文件 / 重新索引变化的文件 / 把**你确认勾选**的缺失资产标 `missing`；过程中仍走同一条建档管线（BOOTH 识别、头像匹配、分类推荐）。
+- **扫描不完整（截断/目录不可读）时不会提出缺失项**——"没看到"不等于"没了"；真实删除要等一次完整扫描。
+- 失败可「重试失败项」；已成功的条目不会被重复写。预览 24h 过期（过期只能重新扫描）。
+- 安全性：不移动/删除源文件；疑似重复只提示不合并；预览删除只删清单记录。详见 `docs/scan-preview.md`。
+
+### 9. HTTP API
 
 完整契约见 `docs/api.md`（含 Unity 桥、套装、合并、导入等端点）；健康检查 `GET /api/health`。
 
@@ -210,7 +221,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 335 用例（含分类：定义结构 / 规则评分 / 迁移 / Repo / 服务层，+88 例）+ `tsc --noEmit` + 验收脚本（AC1–AC12） |
+| 质检 | `node:test` 446 用例（分类 + 扫描变更中心）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs` |
 
 ### 打包与迁移踩坑（留档）
 
@@ -239,7 +250,7 @@ asset-vault/
 ├─ apps/server/src/          # Fastify + SQLite + 作业执行器
 │   ├─ db/                   # schema.sql / migrate / repo / seed
 │   ├─ jobs/runner.ts        # 状态机驱动 + worker
-│   ├─ services/             # booth / scan / indexing / match / categories / updates / media / download / unity
+│   ├─ services/             # booth / scan / scanpreview / indexing / match / categories / updates / media / download / unity
 │   └─ http/routes.ts        # HTTP API（契约见 docs/api.md）
 ├─ apps/web/                 # React 19 + Vite（头像轨 / 网格 / 详情 / 包内树 / 作业 / 导入）
 ├─ apps/desktop/             # Electron 主进程 + esbuild 打包脚本
@@ -249,10 +260,10 @@ asset-vault/
 └─ scripts/                  # test / start / acceptance / win-* / sanitize 等
 ```
 
-**数据模型**（SQLite，16 张核心表）：`items`（来源站+商品号唯一；含 13 个 `cat_*` 物品分类列）· `categories`（分类树，两层）· `item_images` · `assets`（物理路径唯一）·
+**数据模型**（SQLite，20 张核心表；另有 `items_fts` 全文索引）：`items`（来源站+商品号唯一；含 13 个 `cat_*` 物品分类列）· `categories`（分类树，两层）· `item_images` · `assets`（物理路径唯一）·
 `archive_entries` · `unitypackage_assets` · `avatars` + `avatar_aliases` + `item_avatars`（多对多，含 manual/confirmed 保护）·
 `asset_avatars`（文件级 + 包内前缀）· `tags` / `item_tags` · `collections` · `library_roots` · `projects` / `project_imports` ·
-`jobs` / `job_events` · `source_snapshots` / `updates` · `settings` / `audit_log` + `items_fts`（FTS5 trigram）。
+`jobs` / `job_events` · `source_snapshots` / `updates` · `scan_previews` / `scan_preview_items` / `scan_preview_errors` / `scan_apply_runs`（扫描变更中心）· `settings` / `audit_log` + `items_fts`（FTS5 trigram）。
 不物理删除（`status` 软删）。
 
 ---
@@ -298,6 +309,8 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - [ ] 「全库批量重跑匹配 + 校准」的 UI 入口（现在得调 API）
 - [ ] 超大包（>500MB）解析进度反馈
 - [ ] 分类规则继续扩词（现在以日/中/英常见说法为主）并用真实库做阈值校准（当前 24 条实测：自动 16 / 建议 6 / 留空 2）
+- [ ] 扫描变更中心：大目录的生成进度（现在是作业 + 轮询，没有细粒度百分比）
+- [ ] 扫描变更中心：撤销已应用（现在只能手工回滚；apply 不动源文件，所以代价低）
 - [ ] 「全库重新生成分类建议」的 UI 入口（后端 `POST /api/categories/reclassify` 支持 `all`/`onlyUncategorized`，现在界面只做了条目级与选中批量）
 - [ ] 自动分类的证据再吃一路「zip 内层 unitypackage 路径」（现在只读已缓存的包清单，避免拖慢热路径）
 - [ ] macOS / Linux 桌面版的分类回填批处理（迁移不需要回填，历史素材默认未分类）

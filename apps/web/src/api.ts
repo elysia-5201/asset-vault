@@ -16,10 +16,32 @@ import type {
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
-  RootsResponse, ScanDryRunResponse, ScanPlanItem, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse,
+  RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse,
   UpdateCheckResponse, ViewMode,
 } from "./types";
-export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse } from "./types";
+export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse, ScanPreview, ScanPreviewCounts, ScanPreviewItem } from "./types";
+
+// ---------- 扫描变更中心（M1）----------
+export async function listScanPreviews(limit = 30) { return request<{ previews: ScanPreview[] }>("GET", "/scan/previews?limit=" + limit); }
+export async function createScanPreview(input: { rootId?: number | null; path?: string; deep?: boolean }) {
+  return request<{ previewId: number; state: string; jobId?: number; existing?: boolean }>("POST", "/scan/previews", input, { timeoutMs: 30000 });
+}
+export async function getScanPreview(id: number) {
+  return request<{ preview: ScanPreview; applies: any[]; errors: any[] }>("GET", "/scan/previews/" + id);
+}
+export async function listScanPreviewItems(id: number, opts: { cursor?: number | null; limit?: number; change?: string } = {}) {
+  const q = "?limit=" + (opts.limit ?? 100) + (opts.cursor ? "&cursor=" + opts.cursor : "") + (opts.change ? "&change=" + encodeURIComponent(opts.change) : "");
+  return request<{ previewId: number; state: string; items: ScanPreviewItem[]; nextCursor: number | null; counts: ScanPreviewCounts; itemCounts: ScanPreview["itemCounts"] }>("GET", "/scan/previews/" + id + "/items" + q);
+}
+export async function decideScanPreviewItems(id: number, body: { keys?: string[]; change?: string; decision: "accept" | "skip" | "pending" }) {
+  return request<{ updated: number; itemCounts: ScanPreview["itemCounts"] }>("POST", "/scan/previews/" + id + "/items", body);
+}
+export async function applyScanPreview(id: number, body: { planHash?: string | null; mode?: "all"; itemKeys?: string[]; idempotencyKey?: string }) {
+  return request<{ previewId: number; applyRunId: number; jobId: number; files: number; missing: number; stale: number; requested: number }>("POST", "/scan/previews/" + id + "/apply", body, { timeoutMs: 30000 });
+}
+export async function cancelScanPreview(id: number) { return request<{ preview: ScanPreview }>("POST", "/scan/previews/" + id + "/cancel"); }
+export async function retryScanPreview(id: number) { return request<{ jobId: number; files: number; missing: number; stale: number; retried: number }>("POST", "/scan/previews/" + id + "/retry", {}, { timeoutMs: 30000 }); }
+export async function deleteScanPreview(id: number) { return request<{ deleted: boolean }>("DELETE", "/scan/previews/" + id); }
 
 export const API_BASE = "/api";
 

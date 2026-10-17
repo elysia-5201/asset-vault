@@ -16,6 +16,7 @@ import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
+import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
 import { CategoryBatchBar } from "./components/CategoryBatchBar";
 import { Spinner, ToastHost, useDebounced, type Toast } from "./components/ui";
 
@@ -67,6 +68,8 @@ export default function App() {
   const [sideTab, setSideTab] = useState<"import" | "jobs">("import");
   /** 库级「查重」面板开关。 */
   const [dupPanel, setDupPanel] = useState(false);
+  /** 扫描变更中心（M1）：先预览、确认后再写库。 */
+  const [previewPanel, setPreviewPanel] = useState(false);
   /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
@@ -289,6 +292,11 @@ export default function App() {
           >分类管理</button>
           <button
             className="btn tiny"
+            title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）"
+            onClick={() => setPreviewPanel(true)}
+          >扫描预览</button>
+          <button
+            className="btn tiny"
             title="批量分类：在列表卡片上加复选框，可批量设置主/子分类、移除子分类、重新生成建议"
             onClick={() => { setSelectMode((v) => !v); setSelectedIds([]); }}
           >{selectMode ? "退出选择" : "批量分类"}</button>
@@ -415,6 +423,9 @@ export default function App() {
       )}
 
       {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}
+      {previewPanel && (
+        <ScanPreviewPanel roots={roots} onClose={() => setPreviewPanel(false)} onToast={toast} onChanged={() => { loadItems(); loadMeta(); }} />
+      )}
       {dupPanel && (
         <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
       )}

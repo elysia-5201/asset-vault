@@ -243,6 +243,25 @@ export interface CategoryImpact {
   /** 子分类清单（服务端给） */
   children?: { id: string; name: string }[];
 }
+/** 扫描变更中心（M1）：一轮扫描的逐条变化类型。 */
+export type PreviewChange = "new" | "unchanged" | "changed" | "missing" | "duplicate_suspected" | "unreadable" | "error";
+export interface ScanPreviewCounts { total: number; new: number; unchanged: number; changed: number; missing: number; duplicate_suspected: number; unreadable: number; error: number }
+export interface ScanPreviewItem {
+  id: number; preview_id: number; item_key: string; path: string; path_norm: string; change: PreviewChange;
+  size: number | null; mtime: string | null; prev_size: number | null; prev_mtime: string | null;
+  asset_id: number | null; item_id: number | null; container: string | null; kind: string | null;
+  decision: "pending" | "accept" | "skip"; applied: number; error: string | null; detail_json: string | null;
+}
+export interface ScanPreview {
+  id: number; uid: string; root_id: number | null; path: string; path_norm: string; deep: number;
+  state: string; plan_hash: string | null; truncated: number; complete: number;
+  files: number; dirs: number; bytes: number; error_count: number;
+  counts: ScanPreviewCounts | null; scan: { readability?: unknown; missingProposed?: boolean; reasons?: string[] } | null;
+  error: string | null; apply_job_id: number | null;
+  created_at: string; finished_at: string | null; expires_at: string | null;
+  itemCounts: { total: number; accepted: number; applied: number; pending: number };
+}
+
 /** GET /api/tags 的一条：TagRow + 被多少条目使用（契约 §4 补 itemCount）。 */
 export type TagListRow = TagRow & { itemCount?: number };
 

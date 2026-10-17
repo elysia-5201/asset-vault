@@ -151,6 +151,20 @@ input[type=checkbox] { accent-color: var(--accent); }
 .drawer-body > .left { border-right: 1px solid var(--line); overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 .drawer-body > .right { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 @media (max-width: 900px) { .drawer-body { grid-template-columns: 1fr; } }
+/* 扫描变更中心：左列预览列表 / 右列条目与操作 */
+.preview-body { display: grid; grid-template-columns: 320px 1fr; min-height: 0; flex: 1; }
+.preview-body > .left { border-right: 1px solid var(--line); overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.preview-body > .right { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.preview-row { text-align: left; display: flex; flex-direction: column; gap: 3px; padding: 8px; border-radius: 8px;
+  border: 1px solid var(--line-soft); background: var(--bg-card); color: var(--fg); cursor: pointer; }
+.preview-row:hover { border-color: var(--line); }
+.preview-row.on { border-color: var(--accent); background: var(--accent-soft); }
+.preview-list { border: 1px solid var(--line-soft); border-radius: 8px; max-height: 46vh; overflow: auto; }
+.preview-item { display: grid; grid-template-columns: 22px 86px 1fr auto; gap: 8px; align-items: center;
+  padding: 4px 7px; border-bottom: 1px solid var(--line-soft); font-size: 12px; }
+.preview-item:last-child { border-bottom: 0; }
+.preview-item .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 900px) { .preview-body { grid-template-columns: 1fr; } }
 
 .section { border: 1px solid var(--line-soft); background: var(--bg-card); border-radius: 10px; padding: 10px; }
 .section > h4 { margin: 0 0 8px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 6px; }
