@@ -17,6 +17,7 @@ import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { CategoryBatchBar } from "./components/CategoryBatchBar";
 import { Spinner, ToastHost, useDebounced, type Toast } from "./components/ui";
 
@@ -70,6 +71,8 @@ export default function App() {
   const [dupPanel, setDupPanel] = useState(false);
   /** 扫描变更中心（M1）：先预览、确认后再写库。 */
   const [previewPanel, setPreviewPanel] = useState(false);
+  /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
+  const [settingsPanel, setSettingsPanel] = useState(false);
   /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
@@ -173,22 +176,60 @@ export default function App() {
     imported: (filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0) as 1 | 0 | undefined,
   }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.tag, filters.container, filters.tags.join(","), filters.tagsMatch, filters.favoriteOnly, filters.imported]);
 
-  const loadItems = useCallback(() => {
-    setItemsLoading(true); setItemsErr("");
+  /**
+   * 列表分页：首屏 120 条，之后按 offset 累加（无限滚动 + 「加载更多」按钮兜底）。
+   * - token 防串台：筛选一变，旧请求的响应直接丢弃（否则慢请求会把新结果覆盖回去）；
+   * - append 用 itemsRef 取当前长度，避免把 items 塞进依赖导致每次加载都重建回调；
+   * - 按 id 去重：即便服务端排序抖动，也不会出现重复卡片。
+   */
+  const PAGE_SIZE = 120;
+  const itemsRef = useRef<ItemCardWeb[]>([]);
+  const loadToken = useRef(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  useEffect(() => { itemsRef.current = items; }, [items]);
+
+  const loadItems = useCallback((opts: { append?: boolean } = {}) => {
+    const append = !!opts.append;
+    const token = ++loadToken.current;
+    if (append) setLoadingMore(true); else setItemsLoading(true);
+    setItemsErr("");
     listItems({
       ...commonQuery,
       // 组合筛选：分类 + 关键词 + 标签(ANY/ALL) + avatar(ANY/ALL) + 来源 + 状态 + 容器 + 已导入 + 收藏
       categoryIds: catQuery.categoryIds,
       uncategorized: catQuery.uncategorized || undefined,
       pendingCategory: filters.pendingCategory || undefined,
-      sort: filters.sort, limit: 120,
+      sort: filters.sort, limit: PAGE_SIZE, offset: append ? itemsRef.current.length : 0,
     })
-      .then((r) => { setItems(r.items); setTotal(r.total); })
-      .catch((e) => setItemsErr(describeError(e)))
-      .finally(() => setItemsLoading(false));
+      .then((r) => {
+        if (token !== loadToken.current) return;      // 过期响应：筛选已变
+        setTotal(r.total);
+        setItems((prev) => {
+          if (!append) { itemsRef.current = r.items; return r.items; }
+          const seen = new Set(prev.map((x) => x.id));
+          const next = [...prev, ...r.items.filter((x) => !seen.has(x.id))];
+          itemsRef.current = next;
+          return next;
+        });
+      })
+      .catch((e) => { if (token === loadToken.current) setItemsErr(describeError(e)); })
+      .finally(() => { if (token !== loadToken.current) return; setItemsLoading(false); setLoadingMore(false); });
   }, [commonQuery, catQuery, filters.pendingCategory, filters.sort]);
-
+  const loadMore = useCallback(() => loadItems({ append: true }), [loadItems]);
   useEffect(() => { loadItems(); }, [loadItems]);
+
+  /** 滚到底部自动续页（哨兵进入视口附近触发；不支持 IntersectionObserver 时只靠按钮）。 */
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    if (items.length >= total) return;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) loadMore();
+    }, { root: null, rootMargin: "500px 0px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [items.length, total, loadMore]);
 
   // 分类计数：随**其它**筛选变化（分类选择本身不参与，否则只会剩被选中的那个分类）。
   // 端点不可用（旧后端 / 404）时静默退回树上的全局 itemCount，并在分类栏标注来源。
@@ -354,9 +395,17 @@ export default function App() {
               />
             ))}
           </div>
+          {shownItems.length < total && (
+            <div ref={sentinelRef} style={{ display: "flex", justifyContent: "center", padding: "2px 12px 14px" }}>
+              <button className="btn tiny" disabled={loadingMore} onClick={loadMore}>
+                {loadingMore ? "载入中…" : "加载更多（还有 " + (total - shownItems.length) + " 条）"}
+              </button>
+            </div>
+          )}
           {shownItems.length > 0 && (
             <div className="hint" style={{ padding: "0 12px 16px" }}>
-              显示 {shownItems.length} / {total} 条 · 排序 {filters.sort} · {jobsAuto ? "作业自动刷新中" : "作业自动刷新已关"}
+              已加载 {shownItems.length} / {total} 条 · 排序 {filters.sort} · {jobsAuto ? "作业自动刷新中" : "作业自动刷新已关"}
+              {shownItems.length < total ? " · 滚动到底自动加载" : ""}
             </div>
           )}
         </div>
@@ -369,6 +418,7 @@ export default function App() {
             <button className={sideTab === "jobs" ? "on" : ""} onClick={() => setSideTab("jobs")}>作业 {inFlight ? "(" + inFlight + ")" : ""}</button>
           </div>
           <span className="spacer" />
+          <button className="btn tiny" title="库根 / 收件箱监听 / 下载目录 / Unity MCP / 检查更新" onClick={() => setSettingsPanel(true)}>设置</button>
           <button className="btn tiny" onClick={() => { loadItems(); loadJobs(); loadMeta(); }}>全部刷新</button>
         </div>
         {sideTab === "import"
@@ -423,6 +473,9 @@ export default function App() {
       )}
 
       {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}
+      {settingsPanel && (
+        <SettingsPanel onClose={() => setSettingsPanel(false)} onToast={toast} onChanged={() => { loadMeta(); loadItems(); }} />
+      )}
       {previewPanel && (
         <ScanPreviewPanel roots={roots} onClose={() => setPreviewPanel(false)} onToast={toast} onChanged={() => { loadItems(); loadMeta(); }} />
       )}

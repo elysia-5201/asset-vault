@@ -16,7 +16,7 @@ import type {
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
-  RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse,
+  RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
 } from "./types";
 export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse, ScanPreview, ScanPreviewCounts, ScanPreviewItem } from "./types";
@@ -764,6 +764,18 @@ export async function listRoots(): Promise<RootsResponse> {
   return { roots: pickArray<LibraryRootRow>(await request<unknown>("GET", "/roots"), "roots") };
 }
 /** GET /api/tags —— v3 起契约补 color/sort/itemCount（缺 itemCount 时前端只不显示计数）。 */
+export async function addRoot(path: string, mode?: string): Promise<LibraryRootRow> {
+  return request<LibraryRootRow>("POST", "/roots", { path, mode });
+}
+export async function removeRoot(id: number): Promise<{ ok: boolean }> { return request<{ ok: boolean }>("DELETE", "/roots/" + id); }
+export async function getSettings(): Promise<SettingsResponse> { return request<SettingsResponse>("GET", "/settings"); }
+export async function updateSettings(patch: Partial<{ downloadRoot: string; unityMcpUrl: string; updateRepo: string; updateToken: string }>) {
+  return request<Partial<SettingsResponse>>("PUT", "/settings", patch, { timeoutMs: 30000 });
+}
+export async function listWatches(): Promise<{ watches: WatchEntry[] }> { return request<{ watches: WatchEntry[] }>("GET", "/watch"); }
+export async function addWatch(path: string) { return request<{ watches: WatchEntry[] }>("POST", "/watch", { path }); }
+export async function removeWatch(path: string) { return request<{ watches: WatchEntry[] }>("DELETE", "/watch?path=" + encodeURIComponent(path)); }
+
 export async function listTags(): Promise<TagsResponse> {
   const raw = pickArray<TagListRow>(await request<unknown>("GET", "/tags"), "tags");
   return {

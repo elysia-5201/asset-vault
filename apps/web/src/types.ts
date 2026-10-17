@@ -91,6 +91,19 @@ export interface JobsResponse {
 export interface RootsResponse {
   roots: LibraryRootRow[];
 }
+/** 收件箱监听的一条（GET/POST/DELETE /api/watch）。 */
+export interface WatchEntry { path: string; enabled: boolean }
+/** GET/PUT /api/settings（token 只回「有没有配」，不回值）。 */
+export interface SettingsResponse {
+  downloadRoot: string;
+  dataDir: string;
+  dbPath: string;
+  watchPaths: WatchEntry[];
+  unityMcpUrl: string;
+  unityMcpCandidates: string[];
+  updateRepo: string;
+  updateTokenSet: boolean;
+}
 export interface TagsResponse {
   tags: TagRow[];
 }

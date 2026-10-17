@@ -117,7 +117,11 @@ export class Repo {
     const { sql: where, params } = this.buildWhere(q);
     const limit = Math.min(500, Math.max(1, q.limit ?? 60));
     const offset = Math.max(0, q.offset ?? 0);
-    const order = q.sort === "title" ? "i.title COLLATE NOCASE ASC" : q.sort === "size" ? "total_bytes DESC" : "i.updated_at DESC";
+    // 分页稳定性：排序键必须带唯一兜底列（id）。扫描产生的条目 updated_at 常落在同一毫秒，
+    // 只按 updated_at 排序时 SQLite 的行序不保证稳定 → 翻页会重复或漏项。
+    const order = q.sort === "title" ? "i.title COLLATE NOCASE ASC, i.id ASC"
+      : q.sort === "size" ? "total_bytes DESC, i.id DESC"
+      : "i.updated_at DESC, i.id DESC";
     const total = (this.db.prepare(`SELECT COUNT(*) c FROM items i${where}`).get(...params as any[]) as any).c as number;
     const rows = this.db.prepare(`
       SELECT i.*,

@@ -152,6 +152,9 @@ input[type=checkbox] { accent-color: var(--accent); }
 .drawer-body > .right { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 @media (max-width: 900px) { .drawer-body { grid-template-columns: 1fr; } }
 /* 扫描变更中心：左列预览列表 / 右列条目与操作 */
+.settings-body { overflow: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; max-width: 980px; }
+.settings-body input { padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg-hi); color: var(--fg); font-size: 12px; }
+.settings-body .section { display: flex; flex-direction: column; gap: 2px; }
 .preview-body { display: grid; grid-template-columns: 320px 1fr; min-height: 0; flex: 1; }
 .preview-body > .left { border-right: 1px solid var(--line); overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
 .preview-body > .right { overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
