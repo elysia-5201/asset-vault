@@ -264,7 +264,7 @@ expect(tagBad !== null && tagBad.status === 400, "非法颜色 → 400");
 // 组合筛选：标签 ANY/ALL + 收藏 + 分类叠加
 const tagAny = req("GET", "/items?tags=" + encodeURIComponent("衣装") + "," + encodeURIComponent("無料"));
 const tagAll = req("GET", "/items?tags=" + encodeURIComponent("衣装") + "," + encodeURIComponent("無料") + "&tagsMatch=all");
-expect(tagAny.body.total > tagAll.body.total && tagAll.body.total >= 0, "tags ANY/ALL：all 是 any 的子集（any=" + tagAny.body.total + " all=" + tagAll.body.total + "）");
+expect(tagAny.body.total > tagAll.body.total && tagAll.body.total >= 0, "API 仍支持 tags/tagsMatch（UI 已改为搜索命中标签；接口保留供脚本与兼容）");
 const combo = req("GET", "/items?catIds=clothing&tags=" + encodeURIComponent("衣装") + "&favoriteOnly=1");
 expect(combo.body.items.every((i: any) => i.favorite === 1 && (i.category?.categoryId === "clothing")), "组合筛选（分类+标签+收藏）结果同时满足全部条件（" + combo.body.total + " 条）");
 
@@ -298,11 +298,11 @@ expect(cardPick.includes("card sel") && cardPick.includes('type="checkbox"') && 
 const cardNoPick = mkCard({ category: null, suggestion: null });
 expect(!cardNoPick.includes('class="pick'), "卡片：非选择模式不渲染复选框（不复用整卡点击）");
 
-const baseFilters = { site: "", status: "", container: "", tag: "", imported: "any", sort: "updated", catTop: "", catSub: "", pendingCategory: false, tags: [] as string[], tagsMatch: "any" as const, favoriteOnly: false };
+const baseFilters = { site: "", status: "", container: "", imported: "any", sort: "updated", catTop: "", catSub: "", pendingCategory: false, favoriteOnly: false };
 const catCounts = req("GET", "/categories/counts").body;
 const tagRows = req("GET", "/tags").body.tags;
 const sbProps = {
-  text: "", onText: () => {}, atAvatars: [], unresolved: [], onRemoveAt: () => {}, tags: tagRows, loading: false, total: 9,
+  text: "", onText: () => {}, atAvatars: [], unresolved: [], onRemoveAt: () => {}, loading: false, total: 9,
   filters: baseFilters, onFilters: () => {}, categories: cats.body.categories, catCounts, countsScope: "filtered" as const, catErr: "",
 };
 const sb = render("SearchBar(categories)", createElement(SearchBar, sbProps as any));
@@ -313,8 +313,10 @@ expect(sbTop.includes("全部服饰") && sbTop.includes("cat-bar-sub") && sbTop.
 expect(sbTop.includes("清除分类筛选") && sbTop.includes("cat-chip on"), "筛选：选中分类后出现「清除分类筛选」与 .on（紫色）态");
 const sbUncat = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, catTop: "uncategorized" } } as any));
 expect(!sbUncat.includes("cat-bar-sub"), "无子分类的一级（未分类）不渲染二级分类栏（不占位）");
-const sbTagMulti = renderToString(createElement(SearchBar, { ...sbProps, filters: { ...baseFilters, tags: ["衣装", "無料"], tagsMatch: "all" } } as any));
-expect(sbTagMulti.includes("tag-dot") && sbTagMulti.includes("清除标签（") && sbTagMulti.includes("seg"), "标签栏：颜色点 + 多选 + ANY/ALL + 清除按钮");
+// v3.1：标签不再单独筛选（改由搜索命中）——标签栏必须消失，但搜索框要提示可以搜标签
+const sbNoTagBar = renderToString(createElement(SearchBar, { ...sbProps } as any));
+expect(!sbNoTagBar.includes("tag-dot") && !sbNoTagBar.includes("清除标签（") && !sbNoTagBar.includes("标签（单值）"), "标签不再单独筛选：不渲染标签多选栏与单值下拉");
+expect(sbNoTagBar.includes("标签"), "搜索框提示里包含「标签」（告诉用户可以直接搜标签）");
 const sbErr = renderToString(createElement(SearchBar, { ...sbProps, categories: [], catCounts: null, catErr: "加载分类失败：后端未提供分类接口（NOT_FOUND：mock 未实现）" } as any));
 expect(sbErr.includes("后端未提供分类接口"), "筛选：分类接口 404 时显式提示（不静默）");
 

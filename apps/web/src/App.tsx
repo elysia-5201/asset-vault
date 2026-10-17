@@ -168,13 +168,11 @@ export default function App() {
     q: parsed.q || undefined,
     avatar: effAvatarIds.length ? effAvatarIds : undefined,
     avatarMatch, ownedOnly,
-    site: filters.site, status: filters.status, tag: filters.tag || undefined,
+    site: filters.site, status: filters.status,
     container: filters.container,
-    tags: filters.tags.length ? filters.tags : undefined,
-    tagsMatch: filters.tagsMatch,
     favoriteOnly: filters.favoriteOnly || undefined,
     imported: (filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0) as 1 | 0 | undefined,
-  }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.tag, filters.container, filters.tags.join(","), filters.tagsMatch, filters.favoriteOnly, filters.imported]);
+  }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.container, filters.favoriteOnly, filters.imported]);
 
   /**
    * 列表分页：首屏 120 条，之后按 offset 累加（无限滚动 + 「加载更多」按钮兜底）。
@@ -360,7 +358,7 @@ export default function App() {
         <SearchBar
           text={text} onText={setText} filters={filters} onFilters={setFilters}
           atAvatars={parsed.avatars} unresolved={resolved.unresolved} onRemoveAt={removeAtName}
-          tags={tags} loading={itemsLoading} total={total}
+          loading={itemsLoading} total={total}
           categories={categories} catCounts={catCounts}
           countsScope={catCounts ? "filtered" : "global"} catErr={catErr}
         />

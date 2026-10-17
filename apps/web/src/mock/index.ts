@@ -154,8 +154,12 @@ function filterItems(q: URLSearchParams, withCategory = true): ItemRow[] {
     if (pendingCategory) rows = rows.filter((i) => i.cat_suggest_id !== null);
   }
   if (text) {
-    rows = rows.filter((i) => [i.title, i.shop_name, i.author, i.category_name, i.description, i.notes, i.source_item_id]
-      .some((f) => (f ?? "").toLowerCase().includes(text)));
+    // v3.1：标签并入搜索（与服务端一致：搜"哥特风"能命中带该标签的素材，标题里没有也行）
+    rows = rows.filter((i) => {
+      const fields = [i.title, i.shop_name, i.author, i.category_name, i.description, i.notes, i.source_item_id];
+      if (fields.some((f) => (f ?? "").toLowerCase().includes(text))) return true;
+      return (itemTags.get(i.id) ?? []).some((t) => t.toLowerCase().includes(text));
+    });
   }
   if (avatarIds.length) {
     const owns = (itemId: number, aid: number) => itemAvatars.some((x) => x.item_id === itemId && x.avatar_id === aid);
@@ -173,11 +177,12 @@ function filterItems(q: URLSearchParams, withCategory = true): ItemRow[] {
     const set = new Set(imports.map((x) => x.item_id));
     rows = rows.filter((i) => (importedQ === "1" ? set.has(i.id) : !set.has(i.id)));
   }
-  if (sort === "title") rows = [...rows].sort((a, b) => a.title.localeCompare(b.title, "ja"));
+  // 排序带 id 兜底（与服务端一致）：同时间戳/同名/同大小时分页才不重复不漏
+  if (sort === "title") rows = [...rows].sort((a, b) => a.title.localeCompare(b.title, "ja") || a.id - b.id);
   else if (sort === "size") {
     const size = (i: ItemRow) => assets.filter((a) => a.item_id === i.id).reduce((n, a) => n + a.size, 0);
-    rows = [...rows].sort((a, b) => size(b) - size(a));
-  } else rows = [...rows].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+    rows = [...rows].sort((a, b) => size(b) - size(a) || b.id - a.id);
+  } else rows = [...rows].sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : b.id - a.id));
   return rows;
 }
 

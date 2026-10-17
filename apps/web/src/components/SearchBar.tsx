@@ -1,14 +1,13 @@
-import type { AvatarMatch, CategoryNode, ContainerKind, ItemStatus, SourceSite, TagRow } from "@core/contracts";
+import type { AvatarMatch, CategoryNode, ContainerKind, ItemStatus, SourceSite } from "@core/contracts";
 import type { CategoryCounts } from "../types";
-import { CategoryBars, TagFilterBar } from "./CategoryBars";
+import { CategoryBars } from "./CategoryBars";
 import { CONTAINERS, CONTAINER_LABEL, SITES, SITE_LABEL, STATUSES, STATUS_LABEL } from "./ui";
 
 export interface FilterState {
   site: SourceSite | "";
   status: ItemStatus | "";
   container: ContainerKind | "";
-  /** 单值标签（旧语义，保持兼容；与多选 tags 并存，两者都会被服务端过滤） */
-  tag: string;
+
   imported: "any" | "yes" | "no";
   sort: "updated" | "title" | "size";
   /** 一级分类（"" = 全部；UNCATEGORIZED_ID = 未分类系统分类） */
@@ -17,17 +16,14 @@ export interface FilterState {
   catSub: string;
   /** 只看有待确认的自动分类建议 */
   pendingCategory: boolean;
-  /** 标签多选（URL 键 tags=a,b） */
-  tags: string[];
-  /** 多标签语义：any=命中任一（默认）；all=同时具有全部 */
-  tagsMatch: "any" | "all";
+
   /** 只看收藏 */
   favoriteOnly: boolean;
 }
 
 export const EMPTY_FILTERS: FilterState = {
-  site: "", status: "", container: "", tag: "", imported: "any", sort: "updated",
-  catTop: "", catSub: "", pendingCategory: false, tags: [], tagsMatch: "any", favoriteOnly: false,
+  site: "", status: "", container: "", imported: "any", sort: "updated",
+  catTop: "", catSub: "", pendingCategory: false, favoriteOnly: false,
 };
 
 export function SearchBar(props: {
@@ -38,8 +34,6 @@ export function SearchBar(props: {
   atAvatars: string[];
   unresolved: string[];
   onRemoveAt: (name: string) => void;
-  /** 标签字典（含 color / itemCount，用于颜色点与计数） */
-  tags: TagRow[];
   loading: boolean;
   total: number;
   /** 分类树（含每个节点的全局 itemCount）；未加载 / 后端不支持时为空数组 */
@@ -54,8 +48,6 @@ export function SearchBar(props: {
   const f = props.filters;
   const set = (patch: Partial<FilterState>) => props.onFilters({ ...f, ...patch });
   const catActive = f.catTop !== "" || f.pendingCategory;
-  const toggleTag = (name: string) =>
-    set({ tags: f.tags.includes(name) ? f.tags.filter((x) => x !== name) : [...f.tags, name] });
 
   return (
     <div className="toolbar">
@@ -63,7 +55,7 @@ export function SearchBar(props: {
         <span className="ico">⌕</span>
         <input
           type="search"
-          placeholder="搜索标题/店铺/作者（中日文子串），@头像名 过滤，如：@MANUKA セーラー"
+          placeholder="搜索标题/店铺/作者/标签（中日文子串），@头像名 过滤，如：@MANUKA 哥特风"
           value={props.text}
           onChange={(e) => props.onText(e.target.value)}
         />
@@ -111,16 +103,6 @@ export function SearchBar(props: {
         </span>
       </div>
 
-      {/* ---------- 标签多选（颜色点 + ANY/ALL；旧单值 tag 下拉仍在下方筛选网格里） ---------- */}
-      <TagFilterBar
-        tags={props.tags}
-        selected={f.tags}
-        match={f.tagsMatch}
-        onToggle={toggleTag}
-        onMatch={(m) => set({ tagsMatch: m })}
-        onClear={() => set({ tags: [] })}
-      />
-
       <div className="filters">
         <label>来源站
           <select value={f.site} onChange={(e) => set({ site: e.target.value as SourceSite | "" })}>
@@ -138,12 +120,6 @@ export function SearchBar(props: {
           <select value={f.container} onChange={(e) => set({ container: e.target.value as ContainerKind | "" })}>
             <option value="">全部</option>
             {CONTAINERS.map((s) => <option key={s} value={s}>{CONTAINER_LABEL[s]}</option>)}
-          </select>
-        </label>
-        <label>标签（单值）
-          <select value={f.tag} onChange={(e) => set({ tag: e.target.value })}>
-            <option value="">全部</option>
-            {props.tags.map((t) => <option key={t.id} value={t.name}>{t.name}</option>)}
           </select>
         </label>
         <label>已导入

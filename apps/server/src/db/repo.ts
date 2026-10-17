@@ -50,7 +50,14 @@ export class Repo {
     const text = (q.q ?? "").trim();
     if (text) {
       if (text.length >= 3) { w.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"); params.push(ftsPhrase(text)); }
-      else { w.push("(i.title LIKE ? OR IFNULL(i.shop_name,'') LIKE ? OR IFNULL(i.author,'') LIKE ? OR IFNULL(i.notes,'') LIKE ?)"); const l = `%${text}%`; params.push(l, l, l, l); }
+      else {
+        // <3 字符（trigram 索引不了）回退 LIKE，且**标签也参与匹配**：
+        // 用户的心智是"搜什么就找什么"，不该为了找一个 2 字标签再去开单独筛选。
+        const l = `%${text}%`;
+        w.push("(i.title LIKE ? OR IFNULL(i.shop_name,'') LIKE ? OR IFNULL(i.author,'') LIKE ? OR IFNULL(i.notes,'') LIKE ?" +
+          " OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name LIKE ?))");
+        params.push(l, l, l, l, l);
+      }
     }
     if (q.tag) { w.push("EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name = ?)"); params.push(q.tag); }
     if (q.container) { w.push("EXISTS (SELECT 1 FROM assets a WHERE a.item_id=i.id AND a.status<>'trashed' AND a.container = ?)"); params.push(q.container); }
