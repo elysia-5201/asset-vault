@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/src/categories/taxonomy";
 
-/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3（15 大分类 / 80 子分类 / 系统分类） */
-export const SCHEMA_VERSION = 3;
+/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心（预览/应用批次） */
+export const SCHEMA_VERSION = 4;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 

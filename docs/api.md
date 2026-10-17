@@ -299,3 +299,24 @@ v3 是 v2 之上的**增量**：一级分类 15 个（含系统分类「未分�
 - 两者都只统计 `status <> 'trashed'`；未分类 = `cat_id IS NULL OR cat_id = 'uncategorized'`。
 
 
+
+## 扫描变更中心（v4）
+
+持久化预览 + 确认应用。设计、状态与安全规则见 `docs/scan-preview.md`；这里只列表。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/scan/previews` `{rootId?|path, deep?}` | 建预览；**同 path+deep 已有活跃预览时返回 200 `{existing:true, previewId}`**，否则 202 `{previewId, state, jobId}`。预览生成是一个 `scan` 作业（payload.mode=preview） |
+| GET | `/scan/previews?limit=` | 预览列表（自动把超过 TTL 的 ready/partial 标 `expired`） |
+| GET | `/scan/previews/:id` | `{preview:{…, counts, itemCounts, scan, plan_hash}, applies:[…], errors:[…]}` |
+| GET | `/scan/previews/:id/items?cursor=&limit=&change=` | keyset 分页；`change` 可筛 new/changed/missing/duplicate_suspected/unchanged/unreadable/error |
+| POST | `/scan/previews/:id/items` `{keys[]|change, decision}` | 勾选（accept/skip/pending）；按 change 批量 |
+| POST | `/scan/previews/:id/apply` `{planHash?, mode:"all"?, itemKeys[]?, idempotencyKey?}` | 202 `{previewId, applyRunId, jobId, files, missing, stale, requested}`；`planHash` 不一致 409 `STALE_PREVIEW`；过期 410；applying 409；同 `idempotencyKey` 返回原批次 |
+| POST | `/scan/previews/:id/cancel` | → cancelled（applying 时 409） |
+| POST | `/scan/previews/:id/retry` | 只重试「applied=0 且有 error」的条目 → 202 |
+| DELETE | `/scan/previews/:id` | `{deleted}`；applying 时 409 |
+
+**apply 的实际动作**：只做 登记新文件 / 重新索引变化文件 / 把用户确认的缺失资产标 `missing`；
+复用 scan 作业的显式文件列表管线（建条目→登记→索引→匹配→分类）。**不移动、不删除源文件，不自动合并重复项**；
+应用前逐条重新 `stat`，与预览快照不一致即 `stale`（写进条目 error，不写库）。
+`marked missing` 由用户勾选触发，不再经过整轮扫描门控；整轮扫描本身仍遵守 M0 的"不完整不判缺"。

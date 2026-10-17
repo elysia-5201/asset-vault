@@ -11,12 +11,13 @@ import { walkCandidates, registerAssets } from "../services/scan";
 import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
+import { buildApplyPlan } from "../services/scanpreview";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
 import { listWatches, setWatches } from "../services/watcher";
 import type { InboxWatcher } from "../services/watcher";
-import { toInt } from "../util";
+import { now, toInt } from "../util";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
@@ -691,6 +692,170 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       }
       const j = repo.createJob("scan", null, { path: p, rootId: rootRow?.id ?? null, deep: !!b.deep }, 3);
       return { jobId: j.id, state: j.state };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  // ---------- 扫描变更中心（M1）：持久化预览 ----------
+  // 预览 = 一轮扫描的"会发生什么"快照；确认后 apply 只做 登记新文件 / 重索引变化文件 / 标记确认缺失，
+  // 不移动、不删除原始文件，也不自动合并重复项。设计见 docs/scan-preview.md。
+  const previewView = (p: any) => ({
+    ...p,
+    counts: p.counts_json ? JSON.parse(p.counts_json) : null,
+    scan: p.scan_json ? JSON.parse(p.scan_json) : null,
+    itemCounts: repo.scanPreviewItemCounts(p.id),
+  });
+  const previewOr404 = (id: number) => {
+    const p = repo.getScanPreview(id);
+    if (!p) return null;
+    return p;
+  };
+
+  app.post("/api/scan/previews", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const rootRow = b.rootId ? (repo.listRoots() as any[]).find((r) => r.id === toInt(b.rootId, 0)) : null;
+      const path = String(b.path ?? rootRow?.path ?? "").trim();
+      if (!path) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "需要 rootId 或 path" } });
+      const deep = !!b.deep;
+      const prior = repo.findActiveScanPreview(normalizePath(path), deep);
+      const preview = repo.createScanPreview({ rootId: rootRow?.id ?? null, path, deep });
+      if (prior) return { previewId: preview.id, state: preview.state, existing: true };
+      const job = repo.createJob("scan", null, { mode: "preview", previewId: preview.id, path: preview.path, rootId: preview.root_id, deep }, 3);
+      return reply.status(202).send({ previewId: preview.id, state: preview.state, jobId: job.id, existing: false });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/scan/previews", async (req, reply) => {
+    try {
+      repo.expireScanPreviews();
+      const q = req.query as any;
+      return { previews: (repo.listScanPreviews(toInt(q.limit, 50)) as any[]).map(previewView) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/scan/previews/:id", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      return {
+        preview: previewView(p),
+        applies: repo.listScanApplyRuns(id),
+        errors: repo.listScanPreviewErrors(id, 100),
+      };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/scan/previews/:id/items", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      const q = req.query as any;
+      const page = repo.listScanPreviewItems(id, { cursor: toInt(q.cursor, 0) || undefined, limit: toInt(q.limit, 100), change: q.change ? String(q.change) : undefined });
+      return { previewId: id, state: p.state, items: page.items, nextCursor: page.nextCursor, counts: repo.countScanPreviewItems(id), itemCounts: repo.scanPreviewItemCounts(id) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 勾选/取消：{keys:[path_norm...], decision:'accept'|'skip'|'pending'} 或 {change:'new', decision} 批量按类型。 */
+  app.post("/api/scan/previews/:id/items", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      if (!["ready", "partial"].includes(p.state)) return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "预览当前状态不可修改: " + p.state } });
+      const b = (req.body ?? {}) as any;
+      const decision = b.decision === "skip" ? "skip" : b.decision === "pending" ? "pending" : "accept";
+      let keys: string[] = Array.isArray(b.keys) ? b.keys.map(String) : [];
+      if (keys.length === 0 && b.change) {
+        const rows = repo.listScanPreviewItems(id, { limit: 500, change: String(b.change) });
+        keys = rows.items.map((x: any) => x.item_key);
+      }
+      const changed = repo.setScanPreviewDecisions(id, keys, decision);
+      return { updated: changed, itemCounts: repo.scanPreviewItemCounts(id) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 应用：可带 planHash（过期即 409）、idempotencyKey（重复提交返回同一批次）。 */
+  app.post("/api/scan/previews/:id/apply", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      if (p.state === "applying") return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "该预览正在应用中" } });
+      if (!["ready", "partial"].includes(p.state)) return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "预览当前状态不可应用: " + p.state } });
+      if (p.expires_at && p.expires_at < now()) { repo.updateScanPreview(id, { state: "expired", finished_at: now() }); return reply.status(410).send({ error: { code: "PREVIEW_EXPIRED", message: "预览已过期，请重新扫描" } }); }
+      const b = (req.body ?? {}) as any;
+      if (b.planHash && p.plan_hash && String(b.planHash) !== String(p.plan_hash)) {
+        return reply.status(409).send({ error: { code: "STALE_PREVIEW", message: "预览内容已变化（planHash 不一致），请重新扫描" } });
+      }
+      const idem = b.idempotencyKey ? String(b.idempotencyKey) : null;
+      if (idem) { const run = repo.findScanApplyRunByKey(id, idem); if (run) return { previewId: id, applyRunId: run.id, jobId: run.job_id, existing: true }; }
+      if (b.mode === "all") {
+        const rows = repo.listScanPreviewItems(id, { limit: 500 });
+        const keys = rows.items.filter((x: any) => ["new", "changed", "duplicate_suspected", "missing"].includes(x.change)).map((x: any) => x.item_key);
+        repo.setScanPreviewDecisions(id, keys, "accept");
+      } else if (Array.isArray(b.itemKeys) && b.itemKeys.length) {
+        repo.setScanPreviewDecisions(id, b.itemKeys.map(String), "accept");
+      }
+      const plan = buildApplyPlan(repo, id);
+      for (const s of plan.stale) repo.setScanPreviewItemResult(s.id, false, "stale: " + s.reason);
+      if (plan.files.length === 0 && plan.missingIds.length === 0) {
+        return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "没有可应用的条目（未勾选、或全部因文件变化而过期）", stale: plan.stale.length } });
+      }
+      const run = repo.createScanApplyRun({ previewId: id, idempotencyKey: idem, requested: plan.requested });
+      const job = repo.createJob("scan", null, {
+        mode: "apply", previewId: id, applyRunId: run.id, path: p.path, rootId: p.root_id, deep: !!p.deep,
+        files: plan.files, markMissing: plan.missingIds, applyItems: plan.items, staleCount: plan.stale.length,
+      }, 5);
+      repo.updateScanApplyRun(run.id, { job_id: job.id });
+      repo.updateScanPreview(id, { state: "applying", apply_job_id: job.id });
+      return reply.status(202).send({ previewId: id, applyRunId: run.id, jobId: job.id, files: plan.files.length, missing: plan.missingIds.length, stale: plan.stale.length, requested: plan.requested });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.post("/api/scan/previews/:id/cancel", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      if (p.state === "applying") return reply.status(409).send({ error: { code: "CONFLICT", message: "应用已开始，无法取消（可对失败项重试）" } });
+      if (!["ready", "partial", "scanning"].includes(p.state)) return reply.status(409).send({ error: { code: "CONFLICT", message: "当前状态不可取消: " + p.state } });
+      return { preview: previewView(repo.updateScanPreview(id, { state: "cancelled", finished_at: now() })) };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** 重试：把失败/未应用项重新勾选后走同一套 apply（已成功项不会重复写入）。 */
+  app.post("/api/scan/previews/:id/retry", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      const rows = repo.listScanPreviewItems(id, { limit: 500 });
+      const keys = rows.items.filter((x: any) => x.applied === 0 && x.error && ["new", "changed", "duplicate_suspected", "missing"].includes(x.change)).map((x: any) => x.item_key);
+      if (keys.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "没有可重试的条目" } });
+      repo.setScanPreviewDecisions(id, keys, "accept");
+      const plan = buildApplyPlan(repo, id);
+      for (const s of plan.stale) repo.setScanPreviewItemResult(s.id, false, "stale: " + s.reason);
+      if (plan.files.length === 0 && plan.missingIds.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "可重试的条目都已过期（文件变化），请重新扫描" } });
+      const run = repo.createScanApplyRun({ previewId: id, idempotencyKey: null, requested: plan.requested });
+      const job = repo.createJob("scan", null, {
+        mode: "apply", previewId: id, applyRunId: run.id, path: p.path, rootId: p.root_id, deep: !!p.deep,
+        files: plan.files, markMissing: plan.missingIds, applyItems: plan.items, staleCount: plan.stale.length,
+      }, 5);
+      repo.updateScanApplyRun(run.id, { job_id: job.id });
+      repo.updateScanPreview(id, { state: "applying", apply_job_id: job.id });
+      return reply.status(202).send({ previewId: id, applyRunId: run.id, jobId: job.id, files: plan.files.length, missing: plan.missingIds.length, stale: plan.stale.length, requested: plan.requested, retried: keys.length });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.delete("/api/scan/previews/:id", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const p = previewOr404(id);
+      if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      if (p.state === "applying") return reply.status(409).send({ error: { code: "CONFLICT", message: "应用进行中，不能删除预览" } });
+      return { deleted: repo.deleteScanPreview(id) };
     } catch (e) { return fail(reply, e); }
   });
 

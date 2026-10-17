@@ -1047,6 +1047,165 @@ export class Repo {
     return tx();
   }
 
+  // ---------- 扫描变更中心（M1）：持久化预览 ----------
+  /** 比 listPresentAssetsUnderPath 多带 size/mtime/item_id（预览判「变化/未变」要用）；边界条件与它完全一致。 */
+  presentAssetsUnderPath(prefixNorm: string): { id: number; path: string; path_norm: string; size: number; mtime: string | null; item_id: number }[] {
+    if (!prefixNorm) return [];
+    const n = normalizePath(prefixNorm);
+    const base = n.replace(/\/+$/, "");
+    const eq = base === "" ? "/" : base;
+    const lower = base === "" ? "/" : base + "/";
+    const upper = base === "" ? "0" : base + "0";
+    return this.db.prepare(
+      "SELECT id, path, path_norm, size, mtime, item_id FROM assets WHERE status='present' AND (path_norm = ? OR (path_norm >= ? AND path_norm < ?))"
+    ).all(eq, lower, upper) as any[];
+  }
+
+  /** 同一「根路径 + 深度」是否已有活跃预览（幂等键）。 */
+  findActiveScanPreview(pathNorm: string, deep: boolean): any {
+    return this.db.prepare(
+      "SELECT * FROM scan_previews WHERE path_norm=? AND deep=? AND state IN ('scanning','ready','partial','applying') ORDER BY id DESC LIMIT 1"
+    ).get(normalizePath(pathNorm), deep ? 1 : 0) ?? null;
+  }
+
+  /** 建预览（幂等：同参数已有活跃预览时直接返回它，不新建）。 */
+  createScanPreview(input: { rootId: number | null; path: string; deep: boolean; ttlMs?: number }): any {
+    const pn = normalizePath(input.path);
+    const active = this.findActiveScanPreview(pn, input.deep);
+    if (active) return active;
+    const t = now();
+    const ttl = input.ttlMs ?? 24 * 3600 * 1000;
+    const info = this.db.prepare(
+      "INSERT INTO scan_previews(uid, root_id, path, path_norm, deep, state, generator_version, created_at, expires_at) VALUES (?,?,?,?,?,'scanning',1,?,?)"
+    ).run(uid(), input.rootId, input.path, pn, input.deep ? 1 : 0, t, new Date(Date.now() + ttl).toISOString());
+    return this.getScanPreview(Number(info.lastInsertRowid));
+  }
+
+  getScanPreview(id: number): any { return this.db.prepare("SELECT * FROM scan_previews WHERE id=?").get(id) ?? null; }
+  listScanPreviews(limit = 50): any[] {
+    return this.db.prepare("SELECT * FROM scan_previews ORDER BY id DESC LIMIT ?").all(Math.min(200, Math.max(1, limit)));
+  }
+  updateScanPreview(id: number, patch: Record<string, unknown>): any {
+    const allowed = ["state", "plan_hash", "truncated", "complete", "files", "dirs", "bytes", "error_count",
+      "counts_json", "scan_json", "error", "apply_job_id", "finished_at", "expires_at"];
+    const sets: string[] = []; const params: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) { if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); params.push(v as any); } }
+    if (sets.length) { params.push(id); this.db.prepare("UPDATE scan_previews SET " + sets.join(", ") + " WHERE id=?").run(...params as any[]); }
+    return this.getScanPreview(id);
+  }
+
+  /** 整表替换预览条目（预览是快照语义，重新生成时全量覆盖）。分块写入避免大事务。 */
+  replaceScanPreviewItems(previewId: number, rows: { path: string; path_norm: string; change: string; size?: number | null; mtime?: string | null;
+    prevSize?: number | null; prevMtime?: string | null; assetId?: number | null; itemId?: number | null;
+    container?: string | null; kind?: string | null; detail?: unknown }[]): number {
+    const t = now();
+    const ins = this.db.prepare(
+      "INSERT OR REPLACE INTO scan_preview_items(preview_id, item_key, path, path_norm, change, size, mtime, prev_size, prev_mtime, asset_id, item_id, container, kind, decision, applied, detail_json, created_at) " +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',0,?,?)"
+    );
+    let n = 0;
+    const tx = this.db.transaction((batch: typeof rows) => {
+      for (const r of batch) {
+        ins.run(previewId, r.path_norm, r.path, r.path_norm, r.change, r.size ?? null, r.mtime ?? null, r.prevSize ?? null, r.prevMtime ?? null,
+          r.assetId ?? null, r.itemId ?? null, r.container ?? null, r.kind ?? null, r.detail === undefined ? null : JSON.stringify(r.detail), t);
+        n++;
+      }
+    });
+    this.db.prepare("DELETE FROM scan_preview_items WHERE preview_id=?").run(previewId);
+    for (let i = 0; i < rows.length; i += 500) tx(rows.slice(i, i + 500));
+    return n;
+  }
+
+  countScanPreviewItems(previewId: number): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const r of this.db.prepare("SELECT change, COUNT(*) c FROM scan_preview_items WHERE preview_id=? GROUP BY change").all(previewId) as any[]) out[r.change] = r.c;
+    return out;
+  }
+  scanPreviewItemCounts(previewId: number): { total: number; accepted: number; applied: number; pending: number } {
+    const one = (sql: string) => (this.db.prepare(sql).get(previewId) as any).c as number;
+    return {
+      total: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=?"),
+      accepted: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND decision='accept'"),
+      applied: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND applied=1"),
+      pending: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND applied=0 AND decision<>'skip'"),
+    };
+  }
+  /** 分页读预览条目（keyset 分页：cursor = 上一页最后一条 id）。 */
+  listScanPreviewItems(previewId: number, opts: { cursor?: number; limit?: number; change?: string } = {}): { items: any[]; nextCursor: number | null } {
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    const w = ["preview_id = ?"]; const p: unknown[] = [previewId];
+    if (opts.change) { w.push("change = ?"); p.push(opts.change); }
+    if (opts.cursor && opts.cursor > 0) { w.push("id > ?"); p.push(opts.cursor); }
+    const rows = this.db.prepare("SELECT * FROM scan_preview_items WHERE " + w.join(" AND ") + " ORDER BY id LIMIT ?").all(...p as any[], limit + 1) as any[];
+    const more = rows.length > limit;
+    const items = more ? rows.slice(0, limit) : rows;
+    return { items, nextCursor: more ? items[items.length - 1].id : null };
+  }
+
+  /** 设置条目决策（accept/skip/pending）。返回受影响行数。 */
+  setScanPreviewDecisions(previewId: number, keys: string[], decision: "accept" | "skip" | "pending"): number {
+    if (keys.length === 0) return 0;
+    const upd = this.db.prepare("UPDATE scan_preview_items SET decision=? WHERE preview_id=? AND item_key=?");
+    const tx = this.db.transaction(() => {
+      let n = 0;
+      for (const k of keys) n += upd.run(decision, previewId, k).changes;
+      return n;
+    });
+    return tx();
+  }
+
+  /** 待应用的条目：decision=accept 且尚未应用，且变化类型可应用（new/changed/missing）。 */
+  scanPreviewItemsForApply(previewId: number): any[] {
+    return this.db.prepare(
+      "SELECT * FROM scan_preview_items WHERE preview_id=? AND decision='accept' AND applied=0 AND change IN ('new','changed','duplicate_suspected','missing') ORDER BY id"
+    ).all(previewId) as any[];
+  }
+
+  setScanPreviewItemResult(itemId: number, applied: boolean, error: string | null): void {
+    this.db.prepare("UPDATE scan_preview_items SET applied=?, error=? WHERE id=?").run(applied ? 1 : 0, error, itemId);
+  }
+
+  addScanPreviewErrors(previewId: number, rows: { stage: string; path?: string | null; code?: string | null; message: string }[]): void {
+    if (rows.length === 0) return;
+    const t = now();
+    const ins = this.db.prepare("INSERT INTO scan_preview_errors(preview_id, at, stage, path, code, message) VALUES (?,?,?,?,?,?)");
+    const tx = this.db.transaction(() => { for (const r of rows) ins.run(previewId, t, r.stage, r.path ?? null, r.code ?? null, r.message); });
+    tx();
+  }
+  listScanPreviewErrors(previewId: number, limit = 100): any[] {
+    return this.db.prepare("SELECT * FROM scan_preview_errors WHERE preview_id=? ORDER BY id LIMIT ?").all(previewId, Math.min(500, limit));
+  }
+
+  createScanApplyRun(input: { previewId: number; idempotencyKey?: string | null; requested: number; jobId?: number | null }): any {
+    const info = this.db.prepare(
+      "INSERT INTO scan_apply_runs(preview_id, job_id, idempotency_key, state, requested, created_at) VALUES (?,?,?,'running',?,?)"
+    ).run(input.previewId, input.jobId ?? null, input.idempotencyKey ?? null, input.requested, now());
+    return this.db.prepare("SELECT * FROM scan_apply_runs WHERE id=?").get(Number(info.lastInsertRowid));
+  }
+  getScanApplyRun(id: number): any { return this.db.prepare("SELECT * FROM scan_apply_runs WHERE id=?").get(id) ?? null; }
+  listScanApplyRuns(previewId: number, limit = 20): any[] {
+    return this.db.prepare("SELECT * FROM scan_apply_runs WHERE preview_id=? ORDER BY id DESC LIMIT ?").all(previewId, Math.min(100, limit));
+  }
+  findScanApplyRunByKey(previewId: number, key: string): any {
+    return this.db.prepare("SELECT * FROM scan_apply_runs WHERE preview_id=? AND idempotency_key=?").get(previewId, key) ?? null;
+  }
+  updateScanApplyRun(id: number, patch: Record<string, unknown>): any {
+    const allowed = ["state", "job_id", "applied", "failed", "stale", "skipped", "detail_json", "finished_at"];
+    const sets: string[] = []; const params: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) { if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); params.push(v as any); } }
+    if (sets.length) { params.push(id); this.db.prepare("UPDATE scan_apply_runs SET " + sets.join(", ") + " WHERE id=?").run(...params as any[]); }
+    return this.getScanApplyRun(id);
+  }
+
+  deleteScanPreview(id: number): boolean { return this.db.prepare("DELETE FROM scan_previews WHERE id=?").run(id).changes > 0; }
+
+  /** 过期清理：ready/partial 超过 expires_at → expired（applying 不动，交给崩溃恢复）。 */
+  expireScanPreviews(): number {
+    return this.db.prepare(
+      "UPDATE scan_previews SET state='expired', finished_at=? WHERE state IN ('ready','partial') AND expires_at IS NOT NULL AND expires_at < ?"
+    ).run(now(), now()).changes;
+  }
+
   // ---------- stats / export ----------
   stats(): StatsShape {
     const one = (sql: string) => (this.db.prepare(sql).get() as any).v as number;

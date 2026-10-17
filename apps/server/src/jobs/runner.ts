@@ -8,7 +8,8 @@ import { importBoothUrl } from "../services/booth";
 import { indexAsset } from "../services/indexing";
 import { matchItem } from "../services/match";
 import { checkItemUpdate } from "../services/updates";
-import { walkCandidates, planFromFiles, registerAssets, missingWriteGate, type ScannedFile, type ScanStats } from "../services/scan";
+import { walkCandidates, planFromFiles, registerAssets, missingWriteGate, scannedFileOf, type ScannedFile, type ScanStats } from "../services/scan";
+import { generateScanPreview, finalizeApplyRun } from "../services/scanpreview";
 import { applyCategoryEvidence } from "../services/categories";
 import type { MediaStore } from "../services/media";
 
@@ -52,9 +53,18 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
       // import_file 可能直接指向单个文件（收件箱监听就是这种）；单文件不走目录遍历
       const isFile = statSync(scanPath).isFile();
       let filesOut: ScannedFile[];
-      /** M0/P1：目录扫描的可读性结果（errors/readability/complete）；单文件导入没有目录遍历，保持 null。 */
+      /** M0/P1：目录扫描的可读性结果（errors/readability/complete）；单文件导入 / 显式文件列表没有目录遍历，保持 null。 */
       let scan: ScanStats | null = null;
-      if (isFile) {
+      // M1：预览生成分支（只写 scan_preview_*，不建条目/资产）
+      if (payload.mode === "preview" && payload.previewId) {
+        const r = await generateScanPreview(repo, Number(payload.previewId), deps.log);
+        scratch.note = "preview " + payload.previewId + ": " + r.state + " files=" + r.counts.total + " new=" + r.counts.new + " changed=" + r.counts.changed + " missing=" + r.counts.missing;
+        filesOut = [];
+      } else if (Array.isArray(payload.files) && payload.files.length > 0) {
+        // M1 apply：只处理用户勾选的显式文件，不遍历目录 ⇒ 后续 missing 门控自然跳过（scan=null）
+        filesOut = (payload.files as string[]).map((p) => scannedFileOf(String(p))).filter((x): x is ScannedFile => !!x);
+        deps.log(`apply job ${jobId}: explicit files=${filesOut.length}/${(payload.files as string[]).length}`);
+      } else if (isFile) {
         const ext = extname(scanPath).toLowerCase();
         filesOut = [{ path: scanPath, size: statSync(scanPath).size, mtime: statSync(scanPath).mtime.toISOString(),
           container: ext.slice(1) as any, kind: ext === ".unitypackage" ? "unitypackage" : "archive" }];
@@ -128,6 +138,11 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         // scratch.errors 只统计真实的单条局部失败，否则末尾会再打印一次误导性的 "partial failures (1)"。
         deps.log(`job ${jobId} scan incomplete (${scanGate.reasons.join(",")}); skipped marking ${missingIds.length} asset(s) missing; root=${scanPath}`);
       }
+      }
+      // 用户确认过的"缺失"项：逐条写 missing（已有决策，不再经过整轮扫描的门控）
+      if (Array.isArray(payload.markMissing) && payload.markMissing.length > 0) {
+        const ids = (payload.markMissing as number[]).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
+        if (ids.length) { repo.markAssetsMissing(ids); deps.log(`apply job ${jobId}: marked ${ids.length} asset(s) missing (user-confirmed)`); }
       }
       scratch.note = `scan: files=${filesOut.length} newAssets=${scratch.assetIds.length} ${isFile ? "(single file)" : ""}` +
         (scanGate && !scanGate.allowed ? ` INCOMPLETE(${scanGate.reasons.join(",")})` : "");
@@ -206,6 +221,11 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         count: scratch.visibleFailures.length,
         sample: scratch.visibleFailures.slice(0, 10),
       }));
+    }
+    // M1：apply 收尾（在 matching 之后、succeed 之前；失败不得让作业崩掉，只记日志）
+    if (payload.applyRunId && payload.previewId) {
+      try { finalizeApplyRun(repo, payload as any, scratch.visibleFailures, deps.log); }
+      catch (e) { deps.log(`apply ${payload.applyRunId} finalize failed: ${asError(e).message}`); }
     }
     repo.transitionJob(jobId, "match_ok");
     repo.transitionJob(jobId, "succeed");

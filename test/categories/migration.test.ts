@@ -220,9 +220,9 @@ describe("migrate()：v1 → v3", () => {
     const f = openV1();
     try {
       migrate(f.db);
-      assert.equal(SCHEMA_VERSION, 3);
+      assert.ok(SCHEMA_VERSION >= 3, "schema 版本至少是 3（本次改动升到 4 也成立）");
       assert.equal(TAXONOMY_VERSION, "3");
-      assert.equal((f.db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as { value: string }).value, "3");
+      assert.equal((f.db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as { value: string }).value, String(SCHEMA_VERSION));
       assert.equal(readTaxonomyVersion(f.db), "3");
 
       const cols = itemColumns(f.db);
@@ -335,7 +335,7 @@ describe("migrate()：v2 → v3", () => {
     try {
       const before = count(f.db, "SELECT COUNT(*) n FROM categories");
       migrate(f.db);
-      assert.equal(SCHEMA_VERSION, 3);
+      assert.ok(SCHEMA_VERSION >= 3, "schema 版本至少是 3（本次改动升到 4 也成立）");
       assert.equal(readTaxonomyVersion(f.db), "3");
       assert.equal(before, 95, "v2 库：93 内置 + 2 自建");
       assert.equal(count(f.db, "SELECT COUNT(*) n FROM categories WHERE builtin=1"), V3_TOTAL);

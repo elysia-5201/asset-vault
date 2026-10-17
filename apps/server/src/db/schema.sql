@@ -275,6 +275,83 @@ CREATE TABLE IF NOT EXISTS audit_log (
   entity TEXT NOT NULL, entity_id TEXT, before_json TEXT, after_json TEXT
 );
 
+-- ===== 扫描变更中心（M1）：持久化预览 + 应用批次 =====
+-- 一轮扫描 = 一个 preview：先把「这次会变成什么」落库供确认，用户勾选后再 apply。
+-- 只做登记/索引/标记缺失，**不移动、不删除原始文件**，也不自动合并重复项。
+CREATE TABLE IF NOT EXISTS scan_previews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uid TEXT NOT NULL UNIQUE,
+  root_id INTEGER REFERENCES library_roots(id) ON DELETE SET NULL,
+  path TEXT NOT NULL,
+  path_norm TEXT NOT NULL,
+  deep INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'scanning',
+  plan_hash TEXT,
+  generator_version INTEGER NOT NULL DEFAULT 1,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  complete INTEGER NOT NULL DEFAULT 0,
+  files INTEGER NOT NULL DEFAULT 0,
+  dirs INTEGER NOT NULL DEFAULT 0,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  counts_json TEXT,
+  scan_json TEXT,
+  error TEXT,
+  apply_job_id INTEGER,
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  expires_at TEXT
+);
+-- 幂等：同一「根路径 + 深度」同时只允许一个活跃预览（重复创建返回已有的一条）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_preview_active ON scan_previews(path_norm, deep)
+  WHERE state IN ('scanning','ready','partial','applying');
+CREATE INDEX IF NOT EXISTS ix_preview_state ON scan_previews(state, id DESC);
+
+CREATE TABLE IF NOT EXISTS scan_preview_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  preview_id INTEGER NOT NULL REFERENCES scan_previews(id) ON DELETE CASCADE,
+  item_key TEXT NOT NULL,
+  path TEXT NOT NULL,
+  path_norm TEXT NOT NULL,
+  change TEXT NOT NULL,
+  size INTEGER, mtime TEXT,
+  prev_size INTEGER, prev_mtime TEXT,
+  asset_id INTEGER, item_id INTEGER,
+  container TEXT, kind TEXT,
+  decision TEXT NOT NULL DEFAULT 'pending',
+  applied INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  detail_json TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_preview_item ON scan_preview_items(preview_id, item_key);
+CREATE INDEX IF NOT EXISTS ix_preview_item_filter ON scan_preview_items(preview_id, change, id);
+CREATE INDEX IF NOT EXISTS ix_preview_item_applied ON scan_preview_items(preview_id, applied);
+
+CREATE TABLE IF NOT EXISTS scan_preview_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  preview_id INTEGER NOT NULL REFERENCES scan_previews(id) ON DELETE CASCADE,
+  at TEXT NOT NULL, stage TEXT NOT NULL, path TEXT, code TEXT, message TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_preview_err ON scan_preview_errors(preview_id, id);
+
+CREATE TABLE IF NOT EXISTS scan_apply_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  preview_id INTEGER NOT NULL REFERENCES scan_previews(id) ON DELETE CASCADE,
+  job_id INTEGER,
+  idempotency_key TEXT,
+  state TEXT NOT NULL DEFAULT 'running',
+  requested INTEGER NOT NULL DEFAULT 0,
+  applied INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  stale INTEGER NOT NULL DEFAULT 0,
+  skipped INTEGER NOT NULL DEFAULT 0,
+  detail_json TEXT,
+  created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_apply_idem ON scan_apply_runs(preview_id, IFNULL(idempotency_key,''));
+CREATE INDEX IF NOT EXISTS ix_apply_preview ON scan_apply_runs(preview_id, id DESC);
+
 -- 全文检索：trigram 支持中日文子串（>=3 字符走 FTS，<3 字符回退 LIKE）
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   title, shop_name, author, description, notes, tags_text,

@@ -122,6 +122,20 @@ export interface ScanPlanItem {
   evidence: string[]; assets: { file: ScannedFile }[];
 }
 
+/** 单路径 → ScannedFile（apply 阶段按显式文件列表重建 filesOut 时用；stat 失败返回 null）。 */
+export function scannedFileOf(p: string): ScannedFile | null {
+  try {
+    const st = statSync(p);
+    if (!st.isFile()) return null;
+    const ext = extname(p).toLowerCase();
+    const container: ContainerKind = ext === ".unitypackage" ? "unitypackage"
+      : ext === ".zip" ? "zip" : ext === ".7z" ? "7z" : ext === ".rar" ? "rar" : "file";
+    const kind: ScannedFile["kind"] = ext === ".unitypackage" ? "unitypackage"
+      : (ext === ".zip" || ext === ".7z" || ext === ".rar") ? "archive" : "loose_file";
+    return { path: p, size: st.size, mtime: st.mtime.toISOString(), container, kind };
+  } catch { return null; }
+}
+
 /** 把扫到的文件按"同目录/同 itemId"归组，产出建条目计划（不落库，便于测试）。 */
 export function planFromFiles(rootPath: string, files: ScannedFile[]): ScanPlanItem[] {
   const groups = new Map<string, ScanPlanItem>();
