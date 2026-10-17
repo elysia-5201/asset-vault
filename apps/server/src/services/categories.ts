@@ -12,6 +12,7 @@ import {
   type CategoryEvidenceInput, type CategoryRecommendation, type CategoryThresholds,
 } from "../../../../packages/core/src/categories/classify";
 import type { CategoryLevel } from "../../../../packages/core/src/categories/taxonomy";
+import type { ItemDetail } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 
 export interface CategoryServiceOptions { auto?: boolean; log?: (m: string) => void }
@@ -76,8 +77,9 @@ export function setCategoryConfig(repo: Repo, patch: { autoThreshold?: unknown; 
  * 收集分类证据：标题/日文标题/描述/备注/标签/BOOTH 分类/店铺 + 文件名/包内路径/unitypackage 路径。
  * 只读**已缓存**的包清单（archive_entries / unitypackage_assets），不解包、不落盘 —— 分类不得拖慢索引。
  */
-export function collectEvidence(repo: Repo, itemId: number): CategoryEvidenceInput {
-  const detail = repo.getItem(itemId);
+export function collectEvidence(repo: Repo, itemId: number, preloaded?: ItemDetail | null): CategoryEvidenceInput {
+  // 调用方（详情页/建议标签）通常已经读过这份 detail：传进来就复用，避免同一请求里重复读整条条目
+  const detail = preloaded ?? repo.getItem(itemId);
   if (!detail) throw Object.assign(new Error("条目不存在: " + itemId), { code: "NOT_FOUND", status: 404 });
   const item = detail.item;
   const fileNames: string[] = [];
@@ -297,11 +299,11 @@ const TAG_SUGGEST_RULES: readonly { name: string; keywords: readonly string[] }[
  *  - 已有该标签的条目不再建议（去噪）。
  *  - **永不抛**：任何异常 → 返回 []（标签建议不许阻断详情页）。
  */
-export function suggestTagsFor(repo: Repo, itemId: number, limit = 6): SuggestedTag[] {
+export function suggestTagsFor(repo: Repo, itemId: number, limit = 6, preloaded?: ItemDetail | null): SuggestedTag[] {
   try {
-    const detail = repo.getItem(itemId);
+    const detail = preloaded ?? repo.getItem(itemId);
     if (!detail) return [];
-    const ev = collectEvidence(repo, itemId);
+    const ev = collectEvidence(repo, itemId, detail);
     const hay = [
       ev.title, ev.titleJa, ev.description, ev.notes,
       ...(ev.fileNames ?? []), ...(ev.archivePaths ?? []), ...(ev.unitypackagePaths ?? []),

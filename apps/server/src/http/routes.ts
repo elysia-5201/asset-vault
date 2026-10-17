@@ -249,7 +249,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const d = repo.getItem(toInt((req.params as any).id, 0));
       if (!d) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
       // suggestedTags：自动分类的「建议标签」（契约 §7）——**只读派生**，绝不写 item_tags。本函数永不抛（失败返回 []）。
-      return { ...d, updates: repo.listUpdates(d.id), suggestedTags: suggestTagsFor(repo, d.id) };
+      // d 已经是一次完整读取：把同一份 detail 交给建议标签，别再让它自己 getItem 一遍（此前一次请求读 3 次）
+      return { ...d, updates: repo.listUpdates(d.id), suggestedTags: suggestTagsFor(repo, d.id, 6, d) };
     } catch (e) { return fail(reply, e); }
   });
 
@@ -300,9 +301,11 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const tagId = toInt((req.params as any).tagId, 0);
       const detail = repo.getItem(id);
       if (!detail) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
+      // 标签表在真实库里有几百条（596 实测）：循环外取一次，别在 filter 里按条目标签数重复查全表
+      const allTags = repo.listTags() as any[];
       const remaining = detail.tags.filter((t) => {
         const [ns, name] = t.includes(":") ? [t.slice(0, t.indexOf(":")), t.slice(t.indexOf(":") + 1)] : [null, t];
-        const row = (repo.listTags() as any[]).find((x: any) => x.name === name && (x.namespace ?? null) === ns);
+        const row = allTags.find((x: any) => x.name === name && (x.namespace ?? null) === ns);
         return !row || Number(row.id) !== tagId;
       });
       repo.setItemTags(id, remaining, "manual");
@@ -681,7 +684,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         const { planFromFiles } = await import("../services/scan");
         const stats = await walkCandidates(String(p), { maxDepth: b.deep ? 10 : 6 });
         const plans = planFromFiles(String(p), stats.filesOut);
+        // M0/P1：只读预览也把扫描完整性暴露出来（向后兼容——老字段全部保留，新增字段仅供判断"这轮看全了没有"）。
         return { dryRun: true, path: p, files: stats.files, dirs: stats.dirs, bytes: stats.bytes, truncated: stats.truncated,
+          complete: stats.complete, errorCount: stats.errorCount, readability: stats.readability, errors: stats.errors,
           items: plans.map((x) => ({ title: x.title, sourceSite: x.sourceSite, sourceItemId: x.sourceItemId, confidence: x.confidence, assets: x.assets.length })) };
       }
       const j = repo.createJob("scan", null, { path: p, rootId: rootRow?.id ?? null, deep: !!b.deep }, 3);
@@ -1437,14 +1442,22 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/admin/rematch", async (req, reply) => {
     try {
       const b = (req.body ?? {}) as any;
-      const limit = toInt(b?.limit, 100000);
-      const rows = repo.listItems({ limit: 100000, includeTrashed: false }) as any;
+      const limit = Math.max(1, toInt(b?.limit, 100000));
+      // repo.listItems 把单页 limit 夹在 500：以前这里传 100000，实际只会重匹配前 500 条却说 total=500。
+      // 先按 500 一页把 id 收全（收 id 期间不写库，排序稳定），再按 limit 逐条重匹配。
+      const page = 500;
+      const ids: number[] = [];
+      for (let offset = 0; ids.length < limit; offset += page) {
+        const res = repo.listItems({ limit: page, offset, includeTrashed: false });
+        for (const card of res.items) { if (ids.length >= limit) break; ids.push(card.id); }
+        if (res.items.length === 0 || offset + page >= res.total) break;
+      }
       let done = 0, errors = 0;
-      for (const card of rows.items.slice(0, limit)) {
-        try { await matchItem(repo, card.id, {}); done++; }
+      for (const id of ids) {
+        try { await matchItem(repo, id, {}); done++; }
         catch { errors++; }
       }
-      return { requeued: done, errors, total: rows.items.length };
+      return { requeued: done, errors, total: ids.length };
     } catch (e) { return fail(reply, e); }
   });
 

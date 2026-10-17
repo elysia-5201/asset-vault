@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
 import { listUnityPackage, readUnityPackagePreview } from "../../../../packages/core/src/unitypackage";
 import { sha256File } from "../../../../packages/core/src/hash";
+import type { ArchiveListing } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 import type { MediaStore } from "./media";
 
@@ -21,6 +22,8 @@ export async function indexAsset(repo: Repo, media: MediaStore, assetId: number,
   if (!asset) throw new Error(`asset ${assetId} not found`);
   const res: IndexResult = { container: asset.container, entries: 0, unityAssets: 0, images: 0, hashed: false };
   const itemId = asset.item_id;
+  /** 外层压缩包目录清单（只列一次，下钻复用它） */
+  let archiveListing: ArchiveListing | null = null;
 
   if (asset.container === "unitypackage") {
     const listing = await listUnityPackage(asset.path, { maxAssets: 20000 });
@@ -39,6 +42,7 @@ export async function indexAsset(repo: Repo, media: MediaStore, assetId: number,
     }
   } else if (asset.container === "zip" || asset.container === "7z" || asset.container === "rar") {
     const listing = await listArchive(asset.path, { maxEntries: 20000 });
+    archiveListing = listing; // 下面的"包里套包"下钻复用同一份清单（对 7z/rar 就是省一次工具 spawn）
     repo.replaceArchiveEntries(assetId, listing.entries.map((e) => ({ path: e.path, size: e.size, isDir: e.isDir, ext: (e.path.match(/\.[^./]+$/) ?? [""])[0].toLowerCase() })));
     res.entries = listing.entries.length;
     if (listing.truncated) res.note = "archive listing truncated";
@@ -63,8 +67,9 @@ export async function indexAsset(repo: Repo, media: MediaStore, assetId: number,
   if (res.images === 0 && (asset.container === "zip" || asset.container === "7z" || asset.container === "rar")) {
     try {
       const { listArchive: listNested, readArchiveEntry: readNested } = await import("../../../../packages/core/src/archive/list");
-      const outer = await listNested(asset.path, { maxEntries: 20000 });
-      const candidates = outer.entries
+      // 复用上面那次 listArchive 的结果（同文件、同 maxEntries）；只在没列过时才重列
+      const outerEntries = archiveListing ? archiveListing.entries : (await listNested(asset.path, { maxEntries: 20000 })).entries;
+      const candidates = outerEntries
         .filter((e) => !e.isDir && /\.(unitypackage|zip)$/i.test(e.path) && e.size > 4096 && e.size < MAX_NESTED_BYTES)
         .sort((a, b) => b.size - a.size)
         .slice(0, MAX_NESTED_PACKAGES);

@@ -267,8 +267,32 @@ export class Repo {
       VALUES (?,?,?,?,?,?,?,?, 'pending', 'present', ?, ?)`).run(input.item_id, input.kind, input.container, input.path, input.path_norm, input.root_id, input.size, input.mtime ?? null, input.discovered_by, now());
     return { asset: this.getAsset(Number(info.lastInsertRowid))!, created: true };
   }
+  /**
+   * 列出某路径（含其子孙）下 status='present' 的资产。
+   * M0/P1 修复旧写法 `path_norm LIKE prefix || '%'` 的两个前缀缺陷：
+   *   ① 没有路径段边界：prefix="c:/lib" 会命中 "c:/library/…"、"c:/lib2/…"（同层 sibling 根互相误伤）；
+   *   ② LIKE 通配符未转义：路径里的 `_` / `%` 被当通配符，prefix="c:/my_lib" 会命中 "c:/myXlib"。
+   * 现在改用明确的路径段边界 + 相等，全程不经过 LIKE：
+   *   [prefix + "/", prefix + "0") 恰好覆盖所有以 "prefix/" 开头的串
+   *   （'/'=0x2F < '0'=0x30 ⇒ 任何 "prefix/…" 都小于 "prefix0"；不以 "prefix/" 开头的串要么小于下界、要么不小于上界）。
+   * assets.path_norm 自带 UNIQUE 索引 ⇒ 该范围仍走索引扫描。
+   * 正/反例对照：prefix="c:/lib" ⇒ 命中 "c:/lib/a.zip" 与 "c:/lib/sub/a.zip"；
+   *   不命中 "c:/library/a.zip"、"c:/lib2/a.zip"、"c:/lib_x/a.zip"、"c:/li"。
+   */
   listPresentAssetsUnderPath(prefixNorm: string): { id: number; path: string; path_norm: string }[] {
-    return this.db.prepare("SELECT id, path, path_norm FROM assets WHERE status='present' AND path_norm LIKE ? || '%'").all(prefixNorm) as any[];
+    if (!prefixNorm) return [];
+    // normalizePath 会去掉尾斜杠，只有根 "/" 例外；这里统一按"去掉尾斜杠后的基路径 + /"算边界，
+    // 于是 "c:/lib/" 与 "c:/lib" 完全等价（相等分支也用基路径，不因尾斜杠漂移）。
+    // 入参必须先走 normalizePath：path_norm 列永远是小写、正斜杠、无尾斜杠。少了这一步，调用方传
+    // "C:\\lib" 或 "c:/lib/" 时，等值那半边会失配（范围那半边不会，但会漏掉前缀自身这条记录）。
+    const n = normalizePath(prefixNorm);
+    const base = n.replace(/\/+$/, "");
+    const eq = base === "" ? "/" : base;
+    const lower = base === "" ? "/" : base + "/";
+    const upper = base === "" ? "0" : base + "0";
+    return this.db.prepare(
+      "SELECT id, path, path_norm FROM assets WHERE status='present' AND (path_norm = ? OR (path_norm >= ? AND path_norm < ?))"
+    ).all(eq, lower, upper) as any[];
   }
   /**
    * 合并条目：把 source 的资产/图片/模型/标签/更新历史/导入登记迁到 target，source 软删（可恢复）。

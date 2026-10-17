@@ -8,13 +8,13 @@ import { importBoothUrl } from "../services/booth";
 import { indexAsset } from "../services/indexing";
 import { matchItem } from "../services/match";
 import { checkItemUpdate } from "../services/updates";
-import { walkCandidates, planFromFiles, registerAssets, type ScannedFile } from "../services/scan";
+import { walkCandidates, planFromFiles, registerAssets, missingWriteGate, type ScannedFile, type ScanStats } from "../services/scan";
 import { applyCategoryEvidence } from "../services/categories";
 import type { MediaStore } from "../services/media";
 
 export interface JobDeps { repo: Repo; media: MediaStore; booth: BoothClient; log: (msg: string) => void }
 
-interface Scratch { assetIds: number[]; itemIds: Set<number>; note?: string; errors: string[] }
+interface Scratch { assetIds: number[]; itemIds: Set<number>; note?: string; errors: string[]; visibleFailures: { kind: "index" | "match" | "category"; target: string; message: string }[] }
 
 const asError = (e: unknown): { message: string; code?: string } => {
   const err = e as any;
@@ -24,7 +24,7 @@ const asError = (e: unknown): { message: string; code?: string } => {
 /** 把一条 queued 作业按冻结状态机跑完；失败走 stop→fail（锁必释放）。 */
 export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
   const { repo } = deps;
-  const scratch: Scratch = { assetIds: [], itemIds: new Set(), errors: [] };
+  const scratch: Scratch = { assetIds: [], itemIds: new Set(), errors: [], visibleFailures: [] };
   const scratchByItem = new Map<number, { fileNames: string[] }>();
   const job = (): JobRow => repo.getJob(jobId)!;
 
@@ -52,14 +52,15 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
       // import_file 可能直接指向单个文件（收件箱监听就是这种）；单文件不走目录遍历
       const isFile = statSync(scanPath).isFile();
       let filesOut: ScannedFile[];
+      /** M0/P1：目录扫描的可读性结果（errors/readability/complete）；单文件导入没有目录遍历，保持 null。 */
+      let scan: ScanStats | null = null;
       if (isFile) {
         const ext = extname(scanPath).toLowerCase();
         filesOut = [{ path: scanPath, size: statSync(scanPath).size, mtime: statSync(scanPath).mtime.toISOString(),
           container: ext.slice(1) as any, kind: ext === ".unitypackage" ? "unitypackage" : "archive" }];
       } else {
-        const s = await walkCandidates(scanPath, { maxDepth: payload.deep ? 10 : 6 });
-        filesOut = s.filesOut;
-        var stats: any = s;
+        scan = await walkCandidates(scanPath, { maxDepth: payload.deep ? 10 : 6 });
+        filesOut = scan.filesOut;
       }
       const planRoot = isFile ? dirname(scanPath) : scanPath;
       const plans = planFromFiles(planRoot, filesOut);
@@ -99,8 +100,12 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         }
       }
       // D6 修复：扫描后把"本根下未再出现"的资产标 missing（有界深度内；单文件导入跳过此步）
+      // M0/P1 护栏：只有"完整可信"的一轮扫描才允许批量写 missing。截断 / 读取错误 / 根不可读 / 空树
+      // 一律跳过写入，并把原因写成结构化 job event（GET /api/jobs/:id/events 可查），绝不把不完整
+      // 的一轮伪装成完整成功。正常完整扫描里被真实删除的资产，仍然照旧翻 missing（AC7 不回退）。
       const maxDepth = payload.deep ? 10 : 6;
-      if (!isFile) {
+      let scanGate: { allowed: boolean; reasons: string[] } | null = null;
+      if (!isFile && scan) {
       const seen = new Set(filesOut.map((f) => normalizePath(f.path)));
       const existing = repo.listPresentAssetsUnderPath(normalizePath(scanPath));
       const depthOf = (p: string) => {
@@ -108,9 +113,24 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         return rel === "" ? 0 : rel.split("/").length - 1;
       };
       const missingIds = existing.filter((a) => depthOf(a.path) <= maxDepth && !seen.has(a.path_norm)).map((a) => a.id);
-      repo.markAssetsMissing(missingIds);
+      scanGate = missingWriteGate(scan);
+      if (scanGate.allowed) {
+        repo.markAssetsMissing(missingIds);
+      } else {
+        // 不完整的一轮：不写 missing，但必须留下可查询的证据（作业状态机不变，只追加诊断事件）。
+        const detail = JSON.stringify({
+          reasons: scanGate.reasons, skippedMissing: missingIds.length,
+          files: scan.files, dirs: scan.dirs, bytes: scan.bytes, truncated: scan.truncated,
+          errorCount: scan.errorCount, readability: scan.readability, sampleErrors: scan.errors.slice(0, 5),
+        });
+        repo.logJobEvent(jobId, null, job().state, "scan_incomplete", detail);
+        // 注意：这条诊断**不**并入 scratch.errors —— 它已由上面的 scan_incomplete 事件与下面这行日志承载；
+        // scratch.errors 只统计真实的单条局部失败，否则末尾会再打印一次误导性的 "partial failures (1)"。
+        deps.log(`job ${jobId} scan incomplete (${scanGate.reasons.join(",")}); skipped marking ${missingIds.length} asset(s) missing; root=${scanPath}`);
       }
-      scratch.note = `scan: files=${filesOut.length} newAssets=${scratch.assetIds.length} ${isFile ? "(single file)" : ""}`;
+      }
+      scratch.note = `scan: files=${filesOut.length} newAssets=${scratch.assetIds.length} ${isFile ? "(single file)" : ""}` +
+        (scanGate && !scanGate.allowed ? ` INCOMPLETE(${scanGate.reasons.join(",")})` : "");
     } else if (job().kind === "reindex") {
       scratch.assetIds = payload.assetId ? [payload.assetId] : [];
       const a = payload.assetId ? repo.getAsset(payload.assetId) : null;
@@ -150,6 +170,7 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
       } catch (e) {
         // 单个坏包/加密包/恶意条目路径不得让整个作业失败：记录后继续（可按需对单资产重跑 /reindex）
         scratch.errors.push(`asset ${id}: ${asError(e).message}`);
+        scratch.visibleFailures.push({ kind: "index", target: `asset:${id}`, message: asError(e).message });
         deps.log(`index asset ${id} skipped: ${asError(e).message}`);
       }
     }
@@ -160,15 +181,32 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
       try {
         const o = await matchItem(repo, itemId, scratchByItem.get(itemId) ?? {});
         if (o.addedItem + o.addedAsset > 0) deps.log(`avatars: item ${itemId} +${o.addedItem} item / +${o.addedAsset} asset (declared=${o.declared})`);
-      } catch (e) { scratch.errors.push(`match item ${itemId}: ${asError(e).message}`); }
+      } catch (e) {
+        scratch.errors.push(`match item ${itemId}: ${asError(e).message}`);
+        scratch.visibleFailures.push({ kind: "match", target: `item:${itemId}`, message: asError(e).message });
+      }
     }
     // ---- 自动分类（§5-1/§5-3：扫库建档 / Inbox 入库在 indexing+matching 完成后；manual/confirmed 由
     //      repo.applyAutoCategory 保护）。单条失败只记日志，绝不影响作业状态机。----
     for (const itemId of scratch.itemIds) {
       try { applyCategoryEvidence(repo, itemId, { log: deps.log }); }
-      catch (e) { deps.log(`category item ${itemId} skipped: ${asError(e).message}`); }
+      catch (e) {
+        // M0/P1：分类单条失败过去只有一行日志（作业事件流里查不到）。这里并入可见失败清单。
+        scratch.visibleFailures.push({ kind: "category", target: `item:${itemId}`, message: asError(e).message });
+        deps.log(`category item ${itemId} skipped: ${asError(e).message}`);
+      }
     }
     if (scratch.errors.length > 0) deps.log(`job ${jobId} partial failures (${scratch.errors.length}): ${scratch.errors.slice(0, 3).join(" | ")}`);
+    // M0/P1：单条索引/匹配/分类失败在**现有** job event 机制里留一条可查询记录（GET /api/jobs/:id/events），
+    // 不新建状态、不改状态机、不伪造成功：作业仍照旧先走 index_ok/match_ok/succeed；没有失败则不记事件。
+    if (scratch.visibleFailures.length > 0) {
+      // from=null：这是"诊断事件"，不是状态转移（与上面的 scan_incomplete 一致），
+      // 否则 matching→matching 会伪造一条自环转移。
+      repo.logJobEvent(jobId, null, job().state, "partial_failures", JSON.stringify({
+        count: scratch.visibleFailures.length,
+        sample: scratch.visibleFailures.slice(0, 10),
+      }));
+    }
     repo.transitionJob(jobId, "match_ok");
     repo.transitionJob(jobId, "succeed");
     if (scratch.note) deps.log(`job ${jobId} ok: ${scratch.note}`);
