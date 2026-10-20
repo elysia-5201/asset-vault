@@ -170,6 +170,100 @@ export interface JobIdResponse {
   itemId?: number;
 }
 
+// ---------------- 索引流水线（v0.6.0 §13） ----------------
+/**
+ * 阶段顺序即流水线真实顺序（hash → archive → unitypackage → thumbs → meta → categorize → fts）。
+ * 服务端给的是字符串，这里保留字面量便于穷举渲染，遇到未知值按原样显示（不吞）。
+ */
+export type PipelineStage = "hash" | "archive" | "unitypackage" | "thumbs" | "meta" | "categorize" | "fts";
+export type PipelineTaskState = "queued" | "running" | "waiting_retry" | "failed" | "done" | "cancelled" | "skipped";
+
+export interface PipelineStageStat {
+  stage: PipelineStage;
+  queued: number;
+  running: number;
+  waitingRetry: number;
+  failed: number;
+  done: number;
+  skipped: number;
+  avgMs: number | null;
+}
+export interface PipelineCache {
+  entries: number;
+  bytes: number;
+  hits: number;
+  /** 服务端可能给 0..1 也可能给 0..100，渲染层统一归一化 */
+  hitRate: number;
+  maxBytes: number;
+}
+export interface PipelineMemory {
+  rss: number;
+  heapUsed: number;
+  heapTotal: number;
+  external: number;
+}
+export interface PipelineLastError {
+  at: string;
+  stage: string;
+  assetId: number;
+  message: string;
+}
+/** GET /api/pipeline */
+export interface PipelineOverview {
+  started: boolean;
+  paused: boolean;
+  startedAt: string;
+  running: number;
+  queued: number;
+  waitingRetry: number;
+  failed: number;
+  done: number;
+  cancelled: number;
+  skipped: number;
+  stages: PipelineStageStat[];
+  cache: PipelineCache;
+  memory: PipelineMemory;
+  processed: number;
+  failures: number;
+  lastError: PipelineLastError | null;
+  limits: Record<string, unknown>;
+  nonDefaultLimits: Record<string, unknown>;
+}
+/** GET /api/pipeline/tasks —— path/size 是服务端 join 出来的可选便利字段 */
+export interface PipelineTask {
+  id: number;
+  asset_id: number;
+  item_id: number | null;
+  stage: PipelineStage | string;
+  state: PipelineTaskState | string;
+  priority: number;
+  attempts: number;
+  max_attempts: number;
+  bytes_done: number;
+  bytes_total: number | null;
+  items_done: number;
+  items_total: number | null;
+  error_code: string | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  next_retry_at: string | null;
+  path?: string | null;
+  size?: number | null;
+}
+/** GET /api/pipeline/events —— task/asset/item 三个 id 都可能为 null（GC、守卫类事件） */
+export interface PipelineEvent {
+  id: number;
+  at: string;
+  task_id: number | null;
+  asset_id: number | null;
+  item_id: number | null;
+  stage: string | null;
+  event: string;
+  detail: string | null;
+}
+
 /** api.md: GET /booth/peek → 只读预览（不落库）：BoothItemMeta 摘要 */
 export interface BoothPeekResponse extends BoothItemMeta {
   inLibrary?: { itemId: number; title: string } | null;

@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/src/categories/taxonomy";
 
-/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心（预览/应用批次） */
-export const SCHEMA_VERSION = 4;
+/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心；v5=深度索引流水线/派生缓存 */
+export const SCHEMA_VERSION = 5;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 
@@ -28,6 +28,11 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   { table: "items", column: "cat_suggest_reason", ddl: "TEXT" },
   { table: "items", column: "cat_suggest_evidence", ddl: "TEXT" },
   { table: "items", column: "cat_suggest_at", ddl: "TEXT" },
+  // v5：深度索引状态（老库补列；新库由 schema.sql 直接建）
+  { table: "assets", column: "index_state", ddl: "TEXT NOT NULL DEFAULT 'pending'" },
+  { table: "assets", column: "index_error", ddl: "TEXT" },
+  { table: "assets", column: "indexed_at", ddl: "TEXT" },
+  { table: "assets", column: "content_version", ddl: "TEXT" },
 ];
 
 function tableColumns(db: Database.Database, table: string): Set<string> {

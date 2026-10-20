@@ -12,8 +12,9 @@ import { walkCandidates, planFromFiles, registerAssets, missingWriteGate, scanne
 import { generateScanPreview, finalizeApplyRun } from "../services/scanpreview";
 import { applyCategoryEvidence } from "../services/categories";
 import type { MediaStore } from "../services/media";
+import type { IndexPipeline } from "../services/pipeline/pipeline";
 
-export interface JobDeps { repo: Repo; media: MediaStore; booth: BoothClient; log: (msg: string) => void }
+export interface JobDeps { repo: Repo; media: MediaStore; booth: BoothClient; log: (msg: string) => void; pipeline?: IndexPipeline }
 
 interface Scratch { assetIds: number[]; itemIds: Set<number>; note?: string; errors: string[]; visibleFailures: { kind: "index" | "match" | "category"; target: string; message: string }[] }
 
@@ -29,18 +30,37 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
   const scratchByItem = new Map<number, { fileNames: string[] }>();
   const job = (): JobRow => repo.getJob(jobId)!;
 
+  /**
+   * 失败收尾必须**状态感知**（verifier A2）：
+   *  - releasing → fail 是合法边；releasing_done 没有 fail 边 → 记诊断事件后按 succeed 收尾；
+   *  - paused 没有 fail 边 → 保持暂停并留证据，绝不把作业永久卡在"在飞"。
+   * 另外：领取已改为 CAS（repo.claimNextJob），竞争失败者根本不会进入这里。
+   */
   const stopFail = (e: unknown): void => {
     const { message } = asError(e);
     const cur = job();
     if (!cur) return;
     if (cur.state === "failed" || cur.state === "cancelled" || cur.state === "abandoned" || cur.state === "done") return;
-    try { repo.transitionJob(jobId, "stop"); } catch { return; }
-    try { repo.transitionJob(jobId, "fail", message); } catch { /* 并发取消等：忽略 */ }
+    try {
+      if (cur.state === "releasing") { repo.transitionJob(jobId, "fail", message); }
+      else if (cur.state === "releasing_done") {
+        repo.logJobEvent(jobId, null, cur.state, "error_after_release", message);
+        repo.transitionJob(jobId, "succeed");
+      } else if (cur.state === "paused") {
+        repo.logJobEvent(jobId, null, cur.state, "error_while_paused", message);
+      } else {
+        repo.transitionJob(jobId, "stop");
+        repo.transitionJob(jobId, "fail", message);
+      }
+    } catch (err2) {
+      repo.logJobEvent(jobId, null, job()?.state ?? "failed", "fail_transition_error", String((err2 as Error)?.message ?? err2));
+    }
     deps.log(`job ${jobId} failed: ${message}`);
   };
 
   try {
-    repo.transitionJob(jobId, "start");
+    // 领取时已是 resolving（CAS），只有在旧路径（直接调用 runJob）才需要 start。
+    if (job().state === "queued") repo.transitionJob(jobId, "start");
     const payload: any = job().payload ? JSON.parse(job().payload!) : {};
 
     // ---- resolving ----
@@ -103,7 +123,8 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
         scratch.itemIds.add(itemId);
         for (const a of plan.assets) {
           const reg = registerAssets(repo, rootId, scanPath, itemId, a.file, "scan");
-          if (reg.created) scratch.assetIds.push(reg.id);
+          // 新建或内容变化（size/mtime）都要进深度索引；未变的资产不重复解析
+          if (reg.created || reg.changed) scratch.assetIds.push(reg.id);
           const s = scratchByItem.get(itemId) ?? { fileNames: [] };
           s.fileNames.push(basename(a.file.path));
           scratchByItem.set(itemId, s);
@@ -177,16 +198,30 @@ export async function runJob(deps: JobDeps, jobId: number): Promise<void> {
     }
     repo.transitionJob(jobId, "commit");
 
-    // ---- indexing ----
-    for (const id of scratch.assetIds) {
-      try {
-        const r = await indexAsset(repo, deps.media, id, { hashMaxBytes: payload.deep ? 8 * 1024 * 1024 * 1024 : 512 * 1024 * 1024 });
-        deps.log(`indexed asset ${id}: entries=${r.entries} upkg=${r.unityAssets} images=${r.images}`);
-      } catch (e) {
-        // 单个坏包/加密包/恶意条目路径不得让整个作业失败：记录后继续（可按需对单资产重跑 /reindex）
-        scratch.errors.push(`asset ${id}: ${asError(e).message}`);
-        scratch.visibleFailures.push({ kind: "index", target: `asset:${id}`, message: asError(e).message });
-        deps.log(`index asset ${id} skipped: ${asError(e).message}`);
+    // ---- indexing（v0.6.0：深度解析拆到后台流水线）----
+    // 作业只负责"入队 + 有界等待"：大包不会把队列卡死，小文件的基础建档在 resolving 阶段就已可见。
+    // 没有 pipeline（嵌入式/单测/未取得单写入者锁）时退回旧的同步索引，行为与 0.5.1 一致。
+    if (deps.pipeline && scratch.assetIds.length > 0) {
+      for (const id of scratch.assetIds) {
+        try { deps.pipeline.enqueueAsset(id, { priority: 50 }); }
+        catch (e) {
+          scratch.errors.push(`asset ${id} enqueue: ${asError(e).message}`);
+          scratch.visibleFailures.push({ kind: "index", target: `asset:${id}`, message: asError(e).message });
+        }
+      }
+      const waited = await deps.pipeline.drainAssets(scratch.assetIds, Number(payload.indexWaitMs ?? 8000));
+      deps.log(`job ${jobId}: ${scratch.assetIds.length} asset(s) queued to pipeline` + (waited ? " (settled)" : " (still running in background)"));
+    } else {
+      for (const id of scratch.assetIds) {
+        try {
+          const r = await indexAsset(repo, deps.media, id, { hashMaxBytes: payload.deep ? 8 * 1024 * 1024 * 1024 : 512 * 1024 * 1024 });
+          deps.log(`indexed asset ${id}: entries=${r.entries} upkg=${r.unityAssets} images=${r.images}`);
+        } catch (e) {
+          // 单个坏包/加密包/恶意条目路径不得让整个作业失败：记录后继续（可按需对单资产重跑 /reindex）
+          scratch.errors.push(`asset ${id}: ${asError(e).message}`);
+          scratch.visibleFailures.push({ kind: "index", target: `asset:${id}`, message: asError(e).message });
+          deps.log(`index asset ${id} skipped: ${asError(e).message}`);
+        }
       }
     }
     repo.transitionJob(jobId, "index_ok");
@@ -248,7 +283,8 @@ export class JobRunner {
   stop(): void { if (this.timer) { clearInterval(this.timer); this.timer = null; } }
   async tick(): Promise<boolean> {
     if (this.busy) return false;
-    const job = this.deps.repo.nextQueuedJob();
+    // CAS 领取：多 runner 竞争时只有赢家拿到，输家绝不能去 stopFail 别人的作业（verifier A1）
+    const job = this.deps.repo.claimNextJob();
     if (!job) return false;
     this.busy = true;
     try { await runJob(this.deps, job.id); } catch (e) { this.deps.log(`runner error: ${asError(e).message}`); } finally { this.busy = false; }

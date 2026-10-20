@@ -389,3 +389,28 @@ input[type=color] { background: #0f141b; border: 1px solid var(--line); border-r
   .tag-bar { align-items: flex-start; }
   .cat-bar { padding-bottom: 5px; }
 }
+
+/* ---------- 索引流水线（作业面板 → 流水线子页，v0.6.0 §13） ---------- */
+.pipe-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.pipe-stat { border: 1px solid var(--line); background: var(--bg-card); border-radius: 8px; padding: 5px 7px; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.pipe-stat b { font-size: 15px; line-height: 1.2; font-weight: 650; font-variant-numeric: tabular-nums; }
+.pipe-stat span { font-size: 10.5px; color: var(--fg-mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pipe-stat.busy b { color: var(--accent); }
+.pipe-stat.ok b { color: var(--ok); }
+.pipe-stat.warn b { color: var(--warn); }
+.pipe-stat.bad b { color: var(--bad); }
+.pipe-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.pipe-table th { font-weight: 500; color: var(--fg-mute); padding: 2px 3px; text-align: right; border-bottom: 1px solid var(--line); }
+.pipe-table td { padding: 2px 3px; text-align: right; font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--line-soft); }
+.pipe-table th:first-child, .pipe-table td:first-child { text-align: left; }
+.pipe-table tr.hot td { color: #ffb9ae; }
+.pipe-bar { height: 5px; border-radius: 3px; background: var(--bg-hi); border: 1px solid var(--line-soft); overflow: hidden; margin: 2px 0; }
+.pipe-bar > i { display: block; height: 100%; background: var(--accent); transition: width .25s ease; }
+.pipe-kv { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  font-size: 10.5px; padding: 1px 3px 1px 0; }
+.pipe-task { border: 1px solid var(--line); border-radius: 9px; background: var(--bg-card); padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.pipe-task .top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pipe-task .err-text { font-size: 11px; color: #ffb9ae; word-break: break-word; }
+.pipe-ev { font-family: var(--mono); font-size: 10.5px; max-height: 150px; overflow: auto; background: #0d1219; border: 1px solid var(--line-soft); border-radius: 7px; padding: 6px; }
+.pipe-kv > span, .pipe-kv > b { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pipe-fail { border: 1px solid rgba(232,98,79,.45); background: rgba(232,98,79,.1); border-radius: 8px; padding: 6px 8px; font-size: 11px; color: #ffb9ae; display: flex; flex-direction: column; gap: 2px; }

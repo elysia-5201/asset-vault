@@ -29,8 +29,18 @@ import { relateItems } from "../../../../packages/core/src/related";
 import { compareVersions, parseVersion, stripVersionPrefix } from "../../../../packages/core/src/version";
 import { evidenceToJson } from "../../../../packages/core/src/categories/classify";
 import { applyCategoryEvidence, getCategoryConfig, recommendForItem, reclassifyCategories, setCategoryConfig, suggestTagsFor } from "../services/categories";
+import type { IndexPipeline } from "../services/pipeline/pipeline";
+import type { DerivedCache } from "../services/pipeline/cache";
+import { nonDefaultLimits, resolveLimits, type PipelineLimits } from "../services/pipeline/limits";
 
-export interface RouteDeps { repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher; log: (m: string) => void; version: string; dbPath: string; dataDir: string }
+export interface RouteDeps {
+  repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher;
+  log: (m: string) => void; version: string; dbPath: string; dataDir: string;
+  /** v0.6.0：后台索引流水线（未取得单写入者锁时为 null） */
+  pipeline?: IndexPipeline | null;
+  cache?: DerivedCache;
+  limits?: PipelineLimits;
+}
 
 const DEFAULT_DOWNLOAD_SUBDIR = "downloads";
 function downloadRootOf(repo: Repo, dataDir: string): string {
@@ -888,6 +898,114 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/jobs/:id/run", async (req, reply) => {
     try { const n = await deps.runner.drain(1); return { processed: n, jobs: repo.listJobs(undefined, 10) }; }
     catch (e) { return fail(reply, e); }
+  });
+
+
+  // ---------- v0.6.0 深度索引流水线（诊断 / 控制）----------
+  const pipelineStats = () => {
+    const pl = deps.pipeline ?? null;
+    const limits = deps.limits ?? resolveLimits(null);
+    const base = pl ? pl.stats() : (() => {
+      const rows = repo.countIndexTasks();
+      const sum = (state: string) => rows.filter((r: any) => r.state === state).reduce((n: number, r: any) => n + Number(r.count), 0);
+      const stages = (["hash", "archive", "unitypackage", "thumbs", "meta", "categorize", "fts"] as const).map((stage) => {
+        const s = rows.filter((r: any) => r.stage === stage);
+        const at = (state: string) => s.filter((r: any) => r.state === state).reduce((n: number, r: any) => n + Number(r.count), 0);
+        return { stage, queued: at("queued"), running: at("running"), waitingRetry: at("waiting_retry"), failed: at("failed"), done: at("done"), skipped: at("skipped"), avgMs: null as number | null };
+      });
+      return {
+        started: false, paused: false, startedAt: "", running: sum("running"), queued: sum("queued"),
+        waitingRetry: sum("waiting_retry"), failed: sum("failed"), done: sum("done"),
+        cancelled: sum("cancelled"), skipped: sum("skipped"), stages,
+        cache: deps.cache ? deps.cache.stats(limits.cacheMaxBytes) : { entries: 0, bytes: 0, hits: 0, hitRate: 0, maxBytes: limits.cacheMaxBytes, oldest: null },
+        memory: { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed, heapTotal: process.memoryUsage().heapTotal, external: process.memoryUsage().external },
+        processed: 0, failures: 0, lastError: null,
+      };
+    })();
+    return { ...base, limits, nonDefaultLimits: nonDefaultLimits(limits) };
+  };
+
+  app.get("/api/pipeline", async () => pipelineStats());
+
+  app.get("/api/pipeline/tasks", async (req, reply) => {
+    try {
+      const q = req.query as any;
+      const tasks = repo.listIndexTasks({ state: q.state, stage: q.stage, assetId: q.assetId ? toInt(q.assetId, 0) : undefined, limit: toInt(q.limit, 100) });
+      const withAsset = tasks.map((t: any) => {
+        const a = t.asset_id ? repo.getAsset(Number(t.asset_id)) : null;
+        return { ...t, path: a?.path ?? null, size: a?.size ?? null };
+      });
+      return { tasks: withAsset };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/pipeline/events", async (req) => {
+    const q = req.query as any;
+    return { events: repo.listPipelineEvents(toInt(q.limit, 100), toInt(q.after, 0)) };
+  });
+  app.get("/api/pipeline/tasks/:id", async (req, reply) => {
+    try {
+      const t = repo.getIndexTask(toInt((req.params as any).id, 0));
+      if (!t) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "任务不存在" } });
+      const a = t.asset_id ? repo.getAsset(Number(t.asset_id)) : null;
+      return { task: { ...t, path: a?.path ?? null, size: a?.size ?? null }, asset: a };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.post("/api/pipeline/tasks/:id/retry", async (req, reply) => {
+    try { return { task: repo.requeueIndexTask(toInt((req.params as any).id, 0)) }; }
+    catch (e) { return fail(reply, e); }
+  });
+  app.post("/api/pipeline/tasks/:id/cancel", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const t = repo.getIndexTask(id);
+      if (!t) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "任务不存在" } });
+      if (t.state === "running" && deps.pipeline) deps.pipeline.cancelAsset(Number(t.asset_id));
+      return { task: repo.cancelIndexTask(id) };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.post("/api/pipeline/assets/:id/reindex", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const a = repo.getAsset(id);
+      if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
+      const priority = toInt((req.body as any)?.priority, 100);
+      if (deps.pipeline) {
+        const tasks = deps.pipeline.enqueueAsset(id, { priority });
+        deps.pipeline.boost(id, priority);
+        return { queued: tasks.length, assetId: id, tasks };
+      }
+      const r = await indexAsset(repo, deps.media, id, { hashMaxBytes: 8 * 1024 * 1024 * 1024 });
+      return { queued: 0, assetId: id, result: r };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.post("/api/pipeline/assets/:id/boost", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const n = deps.pipeline ? deps.pipeline.boost(id, toInt((req.body as any)?.priority, 100)) : 0;
+      return { boosted: n };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.post("/api/pipeline/pause", async () => { deps.pipeline?.pause(); return { paused: true, enabled: !!deps.pipeline }; });
+  app.post("/api/pipeline/resume", async () => { deps.pipeline?.resume(); return { paused: false, enabled: !!deps.pipeline }; });
+  app.post("/api/pipeline/gc", async (req, reply) => {
+    try {
+      if (!deps.cache) return reply.status(409).send({ error: { code: "CONFLICT", message: "缓存未启用" } });
+      const l = deps.limits ?? resolveLimits(null);
+      return deps.cache.gc({ maxBytes: l.cacheMaxBytes, maxAgeDays: l.cacheMaxAgeDays, keepEntries: l.cacheKeepEntries });
+    } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/pipeline/limits", async () => {
+    const l = deps.limits ?? resolveLimits(null);
+    return { limits: l, nonDefault: nonDefaultLimits(l) };
+  });
+  app.put("/api/pipeline/limits", async (req, reply) => {
+    try {
+      const body = req.body ?? {};
+      if (typeof body !== "object" || Array.isArray(body)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "需要对象" } });
+      const resolved = resolveLimits(body);
+      repo.setSetting("pipeline_limits", JSON.stringify(resolved));
+      return { saved: true, restartRequired: true, limits: resolved, nonDefault: nonDefaultLimits(resolved) };
+    } catch (e) { return fail(reply, e); }
   });
 
   // ---------- roots / tags / projects ----------

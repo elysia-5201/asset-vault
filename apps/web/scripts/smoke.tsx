@@ -10,6 +10,7 @@ import { ItemCardView } from "../src/components/ItemCardView";
 import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
 import { CategoryManager } from "../src/components/CategoryManager";
+import { PipelinePanel } from "../src/components/PipelinePanel";
 
 type Fail = string;
 const fails: Fail[] = [];
@@ -338,6 +339,49 @@ expect(mgr.includes("mark") && mgr.includes("系统") && mgr.includes("未分类
 
 const editor = render("CategoryEditor", createElement(CategoryEditor, { detail: req("GET", "/items/6").body, onToast: () => {}, onSaved: () => {} } as any));
 expect(editor.includes("主分类") === false && editor.includes("载入分类树"), "详情页分类编辑区：SSR 阶段（未跑 useEffect）渲染载入态而非报错");
+
+// ---- ③ 索引流水线（v0.6.0 §13）：mock 形状 + 状态迁移 + SSR ----
+const pipe = req("GET", "/pipeline");
+expect(pipe.status === 200, "GET /pipeline → 200");
+has(pipe.body, ["started", "paused", "startedAt", "running", "queued", "waitingRetry", "failed", "done", "cancelled", "skipped", "stages", "cache", "memory", "processed", "failures", "lastError", "limits", "nonDefaultLimits"], "PipelineOverview");
+expect(Array.isArray(pipe.body.stages) && pipe.body.stages.length === 7, "GET /pipeline：stages 是 7 个阶段（实际 " + (pipe.body.stages?.length ?? "?") + "）");
+expect(pipe.body.stages.every((s: any) => ["stage", "queued", "running", "waitingRetry", "failed", "done", "skipped", "avgMs"].every((k) => k in s)), "stages[]：每行含 stage/queued/running/waitingRetry/failed/done/skipped/avgMs");
+has(pipe.body.cache, ["entries", "bytes", "hits", "hitRate", "maxBytes"], "PipelineCache");
+has(pipe.body.memory, ["rss", "heapUsed", "heapTotal", "external"], "PipelineMemory");
+
+const pFailed = req("GET", "/pipeline/tasks?state=failed");
+expect(pFailed.status === 200 && pFailed.body.tasks.length > 0, "GET /pipeline/tasks?state=failed → 有失败任务（" + pFailed.body.tasks.length + " 条）");
+has(pFailed.body.tasks[0], ["id", "asset_id", "item_id", "stage", "state", "priority", "attempts", "max_attempts", "bytes_done", "bytes_total", "items_done", "items_total", "error_code", "error", "created_at", "started_at", "finished_at", "next_retry_at"], "PipelineTask");
+expect(pFailed.body.tasks.every((t: any) => t.state === "failed"), "GET /pipeline/tasks?state=failed 只返回 failed");
+
+const tasksAll = req("GET", "/pipeline/tasks?limit=50").body.tasks as any[];
+const retryId = tasksAll.find((t) => t.state === "failed").id;
+// 注意：mock 是就地改对象，必须先把 attempts 取成数字快照，否则读到的永远是改后的值
+const beforeAttempts = (tasksAll.find((t) => t.id === retryId) as any)?.attempts ?? 0;
+const plRetry = req("POST", "/pipeline/tasks/" + retryId + "/retry");
+expect(plRetry.status === 200 && plRetry.body.task.state === "queued" && plRetry.body.task.attempts === beforeAttempts + 1, "POST /pipeline/tasks/:id/retry → {task} state=queued 且 attempts+1");
+expect(req("GET", "/pipeline/tasks?state=queued").body.tasks.some((t: any) => t.id === retryId), "重试后该任务出现在 queued 列表");
+const plCancel = req("POST", "/pipeline/tasks/" + retryId + "/cancel");
+expect(plCancel.status === 200 && plCancel.body.task.state === "cancelled", "POST /pipeline/tasks/:id/cancel → {task} state=cancelled");
+
+const pz = req("POST", "/pipeline/pause");
+expect(pz.status === 200 && pz.body.paused === true && req("GET", "/pipeline").body.paused === true, "POST /pipeline/pause → {paused:true} 且总览跟随");
+const rz = req("POST", "/pipeline/resume");
+expect(rz.status === 200 && rz.body.paused === false, "POST /pipeline/resume → {paused:false}");
+
+const reix = req("POST", "/pipeline/assets/3/reindex");
+expect(reix.status === 200 && typeof reix.body.queued === "number" && reix.body.queued > 0, "POST /pipeline/assets/:id/reindex → {queued:" + reix.body.queued + "}");
+const boost = req("POST", "/pipeline/assets/3/boost");
+expect(boost.status === 200 && typeof boost.body.boosted === "number", "POST /pipeline/assets/:id/boost → {boosted:" + boost.body.boosted + "}");
+const gc = req("POST", "/pipeline/gc");
+expect(gc.status === 200 && typeof gc.body.removed === "number" && typeof gc.body.bytes === "number", "POST /pipeline/gc → {removed,bytes}");
+const pev = req("GET", "/pipeline/events?limit=200");
+expect(pev.status === 200 && Array.isArray(pev.body.events), "GET /pipeline/events → {events[]}");
+
+const pipeHtml = render("PipelinePanel", createElement(PipelinePanel, { onToast: () => {} } as any));
+for (const needle of ["阶段", "缓存 / 内存", "最近失败", "执行中", "等待重试", "哈希", "全文索引", "载入流水线"]) {
+  expect(pipeHtml.includes(needle), "PipelinePanel SSR 含「" + needle + "」");
+}
 
 // ---- ② SSR 冒烟 ----
 let html = "";

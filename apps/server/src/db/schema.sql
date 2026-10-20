@@ -93,7 +93,12 @@ CREATE TABLE IF NOT EXISTS assets (
   status TEXT NOT NULL DEFAULT 'present',
   discovered_by TEXT NOT NULL,
   first_seen TEXT NOT NULL,
-  last_verified_at TEXT
+  last_verified_at TEXT,
+  -- v5：深度索引状态（pending|queued|running|partial|done|failed|limited）+ 索引时的内容版本（size:mtime）
+  index_state TEXT NOT NULL DEFAULT 'pending',
+  index_error TEXT,
+  indexed_at TEXT,
+  content_version TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_assets_item ON assets(item_id);
 CREATE INDEX IF NOT EXISTS ix_assets_sha ON assets(sha256) WHERE sha256 IS NOT NULL;
@@ -351,6 +356,69 @@ CREATE TABLE IF NOT EXISTS scan_apply_runs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_apply_idem ON scan_apply_runs(preview_id, IFNULL(idempotency_key,''));
 CREATE INDEX IF NOT EXISTS ix_apply_preview ON scan_apply_runs(preview_id, id DESC);
+
+-- ===== 深度索引流水线（v5）=====
+-- 一条 = 一个资产的一个处理阶段（hash/archive/unitypackage/thumbs/meta/categorize/fts）。
+-- pipeline worker 用 CAS 领取；depends_on 显式表达阶段依赖，避免隐式等待死锁。
+CREATE TABLE IF NOT EXISTS index_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  item_id INTEGER,
+  stage TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  priority INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  depends_on INTEGER,
+  fingerprint TEXT,
+  version_key TEXT,
+  bytes_done INTEGER NOT NULL DEFAULT 0,
+  bytes_total INTEGER NOT NULL DEFAULT 0,
+  items_done INTEGER NOT NULL DEFAULT 0,
+  items_total INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  next_retry_at TEXT
+);
+-- 同一资产的同一阶段同时只允许一条活跃任务（排队/运行/等待重试）→ 天然去重
+CREATE UNIQUE INDEX IF NOT EXISTS ux_index_task_active ON index_tasks(asset_id, stage)
+  WHERE state IN ('queued','running','waiting_retry');
+CREATE INDEX IF NOT EXISTS ix_index_task_pick ON index_tasks(state, stage, priority DESC, id);
+CREATE INDEX IF NOT EXISTS ix_index_task_asset ON index_tasks(asset_id, stage);
+CREATE INDEX IF NOT EXISTS ix_index_task_dep ON index_tasks(depends_on);
+
+-- 流水线诊断事件（崩溃恢复、取消、超限降级、缓存命中/失效都留痕；只增不改）
+CREATE TABLE IF NOT EXISTS pipeline_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  task_id INTEGER,
+  asset_id INTEGER,
+  item_id INTEGER,
+  stage TEXT,
+  event TEXT NOT NULL,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_pipeline_events_at ON pipeline_events(id DESC);
+CREATE INDEX IF NOT EXISTS ix_pipeline_events_asset ON pipeline_events(asset_id, id);
+
+-- 派生缓存索引（v5）：缓存本体是 data/cache/<kind>/<key>.json；这里只存元数据，
+-- 便于统计命中率、按 LRU 淘汰与"写到一半不算有效"的原子替换审计。
+CREATE TABLE IF NOT EXISTS cache_entries (
+  key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  content_sha TEXT,
+  version_key TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  hits INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'ready',
+  created_at TEXT NOT NULL,
+  last_used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_cache_kind ON cache_entries(kind, last_used_at);
 
 -- 全文检索：trigram 支持中日文子串（>=3 字符走 FTS，<3 字符回退 LIKE）
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(

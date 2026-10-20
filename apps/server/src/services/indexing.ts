@@ -1,141 +1,87 @@
-import { statSync, writeFileSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
-import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
-import { listUnityPackage, readUnityPackagePreview } from "../../../../packages/core/src/unitypackage";
-import { sha256File } from "../../../../packages/core/src/hash";
-import type { ArchiveListing } from "../../../../packages/core/src/contracts";
+/**
+ * 单资产索引（同步入口，v0.6.0 起与流水线共用同一套阶段实现）
+ *
+ * 用途：
+ *  - 用户点「重新索引」/ POST /api/assets/:id/reindex（单条、可接受同步等待）；
+ *  - 没有启用流水线的嵌入式实例（listen:false / 未取得单写入者锁）作为回退路径；
+ *  - 单元测试与诊断脚本。
+ *
+ * 扫描 / 导入 / 应用 走 IndexPipeline（后台、有界并发、可取消），不调用这里。
+ * 两边共用 stage* 实现，避免"两条索引路径行为不一致"。
+ */
+import type { AssetRow } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 import type { MediaStore } from "./media";
-
-const IMAGE_EXT = /(^|\.)(png|jpe?g|webp|gif|bmp|tga|psd)$/i;
-const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
-const MAX_IMAGES = 8;
-const MAX_NESTED_PACKAGES = 2;
-const MAX_NESTED_BYTES = 256 * 1024 * 1024;
+import type { CacheLike, CacheMeta } from "./pipeline/cache";
+import { DEFAULT_LIMITS, type PipelineLimits } from "./pipeline/limits";
+import { stageArchive, stageHash, stageMeta, stageThumbs, stageUnityPackage, type StageCtx } from "./pipeline/stages";
 
 export interface IndexResult { container: string; entries: number; unityAssets: number; images: number; hashed: boolean; note?: string }
 
-/** 列目录 / 解析 unitypackage / 抽取缩略图。不启动 Unity，不搬动素材本体。 */
-export async function indexAsset(repo: Repo, media: MediaStore, assetId: number, opts: { hashMaxBytes?: number } = {}): Promise<IndexResult> {
-  const asset = repo.getAsset(assetId);
+export interface IndexOptions {
+  /** 兼容旧调用：超过这个大小不哈希（覆盖 limits.maxHashBytes） */
+  hashMaxBytes?: number;
+  limits?: Partial<PipelineLimits>;
+  cache?: CacheLike;
+  signal?: AbortSignal;
+  log?: (m: string) => void;
+}
+
+/** 单次索引用的内存缓存（不落盘；缓存系统只服务后台流水线）。 */
+class MemoryCache implements CacheLike {
+  private map = new Map<string, unknown>();
+  async get<T>(_kind: string, key: string): Promise<T | null> { return (this.map.get(key) as T) ?? null; }
+  async put(_kind: string, key: string, value: unknown, _meta: CacheMeta): Promise<{ bytes: number }> { this.map.set(key, value); return { bytes: 0 }; }
+}
+
+/** 列目录 / 解析 unitypackage / 抽取缩略图 / 哈希 / 结构签名。不启动 Unity，不搬动素材本体。 */
+export async function indexAsset(repo: Repo, media: MediaStore, assetId: number, opts: IndexOptions = {}): Promise<IndexResult> {
+  const asset = repo.getAsset(assetId) as AssetRow | null;
   if (!asset) throw new Error(`asset ${assetId} not found`);
+  const limits: PipelineLimits = { ...DEFAULT_LIMITS, ...(opts.limits ?? {}) };
+  if (opts.hashMaxBytes !== undefined) limits.maxHashBytes = Math.max(0, opts.hashMaxBytes);
+  const ctx: StageCtx = {
+    repo, media, limits,
+    cache: opts.cache ?? new MemoryCache(),
+    log: opts.log ?? (() => {}),
+    signal: opts.signal ?? new AbortController().signal,
+    progress: () => {},
+  };
   const res: IndexResult = { container: asset.container, entries: 0, unityAssets: 0, images: 0, hashed: false };
-  const itemId = asset.item_id;
-  /** 外层压缩包目录清单（只列一次，下钻复用它） */
-  let archiveListing: ArchiveListing | null = null;
+  const notes: string[] = [];
 
   if (asset.container === "unitypackage") {
-    const listing = await listUnityPackage(asset.path, { maxAssets: 20000 });
-    repo.replaceUnityPackageAssets(assetId, listing.assets);
-    res.unityAssets = listing.assets.length;
-    if (listing.truncated) res.note = "unitypackage listing truncated";
-    const withPreview = listing.assets.filter((a) => a.hasPreview).slice(0, MAX_IMAGES);
-    for (const a of withPreview) {
-      try {
-        const buf = await readUnityPackagePreview(asset.path, a.guid);
-        if (!buf) continue;
-        const saved = await media.saveImage(itemId, buf, "png");
-        repo.addImage(itemId, { role: "package_preview", origin: "archive", file_path: saved.filePath, thumb_path: saved.thumbPath, width: saved.width, height: saved.height, bytes: saved.bytes, sha256: saved.sha256 });
-        res.images++;
-      } catch { /* 单张失败不影响整体 */ }
-    }
+    const r = await stageUnityPackage(ctx, asset);
+    res.unityAssets = r.itemsTotal ?? 0;
+    if (r.limited) notes.push(r.limited.code + ":" + r.limited.message);
   } else if (asset.container === "zip" || asset.container === "7z" || asset.container === "rar") {
-    const listing = await listArchive(asset.path, { maxEntries: 20000 });
-    archiveListing = listing; // 下面的"包里套包"下钻复用同一份清单（对 7z/rar 就是省一次工具 spawn）
-    repo.replaceArchiveEntries(assetId, listing.entries.map((e) => ({ path: e.path, size: e.size, isDir: e.isDir, ext: (e.path.match(/\.[^./]+$/) ?? [""])[0].toLowerCase() })));
-    res.entries = listing.entries.length;
-    if (listing.truncated) res.note = "archive listing truncated";
-    if (listing.passwordProtected) res.note = "password protected";
-    if (asset.container === "zip") {
-      const imgs = listing.entries.filter((e) => !e.isDir && IMAGE_EXT.test(e.path) && e.size > 1024 && e.size < MAX_IMAGE_BYTES)
-        .sort((a, b) => b.size - a.size).slice(0, MAX_IMAGES);
-      for (const e of imgs) {
-        try {
-          const buf = await readArchiveEntry(asset.path, e.path, MAX_IMAGE_BYTES);
-          if (buf.length === 0) continue;
-          const saved = await media.saveImage(itemId, buf, "png");
-          repo.addImage(itemId, { role: "archive_frame", origin: "archive", file_path: saved.filePath, thumb_path: saved.thumbPath, width: saved.width, height: saved.height, bytes: saved.bytes, sha256: saved.sha256 });
-          res.images++;
-        } catch { /* ignore single entry */ }
-      }
+    const r = await stageArchive(ctx, asset);
+    res.entries = r.itemsTotal ?? 0;
+    if (r.limited) notes.push(r.limited.code + ":" + r.limited.message);
+  }
+
+  if (asset.container === "unitypackage" || res.entries > 0) {
+    try {
+      const t = await stageThumbs(ctx, asset);
+      res.images = t.itemsTotal ?? 0;
+      if (t.limited) notes.push(t.limited.code + ":" + t.limited.message);
+      if (t.note) notes.push(t.note);
+    } catch (e) {
+      notes.push("thumbs failed: " + String((e as Error)?.message ?? e));
     }
   }
 
-  // 包里套包：zip 里通常是 .unitypackage（有的还再套一层 zip）→ 下钻一层抽包内 preview.png 当缩略图。
-  // 这是"扫库建出来的条目没图"的主因（实测 Danzai_Bunny / NoemHoodie / Milky-Way 都是这种）。
-  if (res.images === 0 && (asset.container === "zip" || asset.container === "7z" || asset.container === "rar")) {
-    try {
-      const { listArchive: listNested, readArchiveEntry: readNested } = await import("../../../../packages/core/src/archive/list");
-      // 复用上面那次 listArchive 的结果（同文件、同 maxEntries）；只在没列过时才重列
-      const outerEntries = archiveListing ? archiveListing.entries : (await listNested(asset.path, { maxEntries: 20000 })).entries;
-      const candidates = outerEntries
-        .filter((e) => !e.isDir && /\.(unitypackage|zip)$/i.test(e.path) && e.size > 4096 && e.size < MAX_NESTED_BYTES)
-        .sort((a, b) => b.size - a.size)
-        .slice(0, MAX_NESTED_PACKAGES);
-      for (const cand of candidates) {
-        const tmp = join(tmpdir(), "av-nested-" + process.pid + "-" + Date.now() + "-" + basename(cand.path).replace(/[^\w.\-]+/g, "_"));
-        try {
-          const buf = await readNested(asset.path, cand.path, MAX_NESTED_BYTES);
-          if (buf.length === 0) continue;
-          let inner = tmp;
-          if (/\.zip$/i.test(cand.path)) {
-            writeFileSync(tmp, buf);
-            const innerEntries = await listNested(tmp, { maxEntries: 5000 });
-            const pkg = innerEntries.entries.find((e) => !e.isDir && /\.unitypackage$/i.test(e.path) && e.size > 4096 && e.size < MAX_NESTED_BYTES);
-            if (!pkg) {
-              // 内层 zip 里没有 unitypackage（常见：直接放图片）→ 抽图片当缩略图
-              const innerImgs = innerEntries.entries
-                .filter((e) => !e.isDir && IMAGE_EXT.test(e.path) && e.size > 1024 && e.size < MAX_IMAGE_BYTES)
-                .sort((a, b) => b.size - a.size).slice(0, MAX_IMAGES);
-              for (const ie of innerImgs) {
-                try {
-                  const b2 = await readNested(tmp, ie.path, MAX_IMAGE_BYTES);
-                  if (b2.length === 0) continue;
-                  const saved2 = await media.saveImage(itemId, b2, "png");
-                  repo.addImage(itemId, { role: "archive_frame", origin: "archive", file_path: saved2.filePath, thumb_path: saved2.thumbPath, width: saved2.width, height: saved2.height, bytes: saved2.bytes, sha256: saved2.sha256 });
-                  res.images++;
-                } catch { /* ignore */ }
-              }
-              if (res.images > 0) { res.note = (res.note ? res.note + "; " : "") + "nested-zip images:" + res.images; break; }
-              continue;
-            }
-            inner = tmp + ".unitypackage";
-            writeFileSync(inner, await readNested(tmp, pkg.path, MAX_NESTED_BYTES));
-          } else {
-            writeFileSync(tmp, buf);
-          }
-          const upkg = await listUnityPackage(inner, { maxAssets: 20000 });
-          const withPreview = upkg.assets.filter((a) => a.hasPreview).slice(0, MAX_IMAGES);
-          for (const a of withPreview) {
-            try {
-              const p = await readUnityPackagePreview(inner, a.guid);
-              if (!p) continue;
-              const saved = await media.saveImage(itemId, p, "png");
-              repo.addImage(itemId, { role: "package_preview", origin: "archive", file_path: saved.filePath, thumb_path: saved.thumbPath, width: saved.width, height: saved.height, bytes: saved.bytes, sha256: saved.sha256 });
-              res.images++;
-            } catch { /* 单张失败忽略 */ }
-          }
-          res.note = (res.note ? res.note + "; " : "") + "nested:" + basename(cand.path) + " previews=" + withPreview.length;
-          if (res.images > 0) break;
-        } catch { /* 单个内层包失败不影响整条 */ }
-        finally { for (const f of [tmp, tmp + ".unitypackage"]) { try { unlinkSync(f); } catch { /* ignore */ } } }
-      }
-    } catch { /* 下钻失败不影响索引结果 */ }
+  try {
+    const h = await stageHash(ctx, asset);
+    res.hashed = !h.limited && !h.skipped;
+    if (h.limited) notes.push(h.limited.code + ":" + h.limited.message);
+  } catch (e) {
+    repo.setAssetSha(assetId, null, "error");
+    notes.push("hash failed: " + String((e as Error)?.message ?? e));
   }
 
-  const hashMax = opts.hashMaxBytes ?? 512 * 1024 * 1024;
-  try {
-    const st = statSync(asset.path);
-    if (st.size <= hashMax) { const sha = await sha256File(asset.path); repo.setAssetSha(assetId, sha, "ok"); res.hashed = true; }
-  } catch { repo.setAssetSha(assetId, null, "error"); }
-
+  try { await stageMeta(ctx, asset); } catch { /* 签名失败不影响索引结果 */ }
   repo.touchAsset(assetId);
-  // 去重签名：只读已缓存的目录清单，失败（坏包/抽内层包超时）绝不能影响索引结果。
-  // 必须放在 touchAsset 之后：computed_at < last_verified_at 会被判 stale，每次都要重算。
-  try {
-    const { computeSignature } = await import("./dedupe");
-    await computeSignature(repo, assetId);
-  } catch { /* 签名失败不影响索引 */ }
+  res.note = notes.length ? notes.join("; ") : undefined;
   return res;
 }

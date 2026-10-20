@@ -39,13 +39,41 @@ export interface ScanStats {
   complete: boolean;
 }
 
+/** 单批回调看到的累计计数（不是本批增量）。 */
+export interface WalkBatchStats { files: number; dirs: number; bytes: number; truncated: boolean }
+
+/**
+ * v0.6.0 阶段 A：有界批次/流式遍历参数（向后兼容：不传 onBatch 时行为与旧版完全一致）。
+ *  - batchSize   每批最多多少条 ScannedFile（默认 500）
+ *  - onBatch     逐批回调（可以是 async）；**传入时 filesOut 恒为空数组**以省内存
+ *  - signal      每批开始 + 每 256 个目录项检查一次；已中止 → 抛 code="CANCELLED"
+ */
+export interface WalkOptions {
+  maxDepth?: number;
+  limit?: number;
+  signal?: AbortSignal;
+  batchSize?: number;
+  onBatch?: (files: ScannedFile[], stats: WalkBatchStats) => Promise<void> | void;
+}
+
 /** errors 明细保留上限（坏盘/大目录不至于撑爆内存与日志）；errorCount 仍记真值。 */
 const MAX_SCAN_ISSUES = 100;
+/** 流式模式默认批大小。 */
+const DEFAULT_BATCH_SIZE = 500;
+/** 非候选目录项的中途让出频率（防"整棵树几乎没有压缩包"时长时间不给事件循环）。 */
+const ENTRY_YIELD_EVERY = 2000;
+/** AbortSignal 检查频率（目录项）。 */
+const ABORT_CHECK_EVERY = 256;
 
 const errCode = (e: unknown): string | null => {
   const c = (e as { code?: unknown } | null)?.code;
   return typeof c === "string" ? c : null;
 };
+
+/** 取消错误：统一 code="CANCELLED"（调用方据此区分"被取消"与"读失败"）。 */
+export function walkCancelledError(): Error {
+  return Object.assign(new Error("walk cancelled by AbortSignal"), { code: "CANCELLED" });
+}
 
 /**
  * 缺文件判定门控（M0/P1）：只有"完整可信"的一轮扫描才允许把本轮未见的资产批量标 missing。
@@ -70,14 +98,28 @@ export function missingWriteGate(s: Pick<ScanStats, "truncated" | "errorCount" |
 }
 
 /**
- * 有界递归扫描：默认深 6、上限 20000 个候选项，超出置 truncated；每 200 项让出事件循环（不阻塞 HTTP）。
- * M0/P1：readdirSync/statSync 的异常逐条记进 errors/readability，不再静默吞；深度越界与 SKIP_DIR
- * 属于**有意**裁剪（缺失判定侧同样按深度设界），不计为错误。
+ * 有界目录扫描：默认深 6、上限 20000 个候选项，超出置 truncated。
+ *
+ * v0.6.0 阶段 A 改造：
+ *  - **显式栈（非递归）**：不再用 await walk(dir, depth+1) 自递归，深目录不会爆栈；遍历顺序仍是
+ *    DFS 前序 + readdirSync 的原始顺序（与旧递归实现逐条一致，见 test/scan/walk.test.ts 的顺序对照）。
+ *  - **有界批次**：传 onBatch 时每 batchSize 条回调一次并 filesOut=[]，调用方不必把全量路径堆在内存里；
+ *    每批之间 setImmediate 让出事件循环。
+ *  - **可取消**：传 signal；每批开始 + 每 256 个目录项检查，已中止抛 code="CANCELLED"。
+ *  - SKIP_DIR / maxDepth / limit / errors / readability / complete 语义**未变**（冻结契约）。
+ *
+ * 语义细节（与旧版一一对应，测试钉死）：
+ *  - dirs 只统计"作为目录项被看到的目录"（不含根本身；深度越界的目录仍计入但不再下沉）；
+ *  - files/bytes 只统计候选压缩包；limit 只压制候选数；
+ *  - 顺序 = 每个目录项按 readdir 顺序处理，遇到子目录立刻整棵子树（DFS 前序）。
  */
-export async function walkCandidates(rootPath: string, opts: { maxDepth?: number; limit?: number } = {}): Promise<ScanStats> {
-  if (!existsSync(rootPath)) throw Object.assign(new Error(`路径不存在: ${rootPath}`), { code: "NOT_FOUND", status: 404 });
+export async function walkCandidates(rootPath: string, opts: WalkOptions = {}): Promise<ScanStats> {
+  if (!existsSync(rootPath)) throw Object.assign(new Error("路径不存在: " + rootPath), { code: "NOT_FOUND", status: 404 });
   const maxDepth = opts.maxDepth ?? 6;
   const limit = opts.limit ?? 20000;
+  const batchSize = Math.max(1, Math.floor(opts.batchSize ?? DEFAULT_BATCH_SIZE));
+  const signal = opts.signal;
+  const streaming = typeof opts.onBatch === "function";
   const out: ScannedFile[] = [];
   const errors: ScanIssue[] = [];
   const readability: ScanReadability = { rootReadable: false, dirsRead: 0, dirsFailed: 0, entriesStatFailed: 0 };
@@ -86,35 +128,83 @@ export async function walkCandidates(rootPath: string, opts: { maxDepth?: number
     errorCount++;
     if (errors.length < MAX_SCAN_ISSUES) errors.push({ path, op, code: errCode(e), message: String((e as Error | null)?.message ?? e) });
   };
-  const walk = async (dir: string, depth: number): Promise<void> => {
-    if (truncated || depth > maxDepth) return;
-    let entries: string[] = [];
-    try { entries = readdirSync(dir); }
-    catch (e) { readability.dirsFailed++; noteError(dir, "readdir", e); return; }
-    readability.dirsRead++;
-    if (depth === 0) readability.rootReadable = true;
-    for (const name of entries) {
-      if (truncated) return;
-      if (SKIP_DIR.has(name)) continue;
-      const p = join(dir, name);
-      let st;
-      try { st = statSync(p); }
-      catch (e) { readability.entriesStatFailed++; noteError(p, "stat", e); continue; }
-      if (st.isDirectory()) { dirs++; await walk(p, depth + 1); continue; }
-      const ext = extname(name).toLowerCase();
-      if (!ARCHIVE_EXT.has(ext)) continue;
-      if (out.length >= limit) { truncated = true; return; }
-      files++; bytes += st.size;
-      out.push({ path: p, size: st.size, mtime: st.mtime.toISOString(), container: ext.slice(1) as ContainerKind, kind: ext === ".unitypackage" ? "unitypackage" : "archive" });
+  let batch: ScannedFile[] = [];
+  const flushBatch = async (): Promise<void> => {
+    if (!streaming || batch.length === 0) return;
+    const b = batch;
+    batch = [];
+    await opts.onBatch!(b, { files, dirs, bytes, truncated });
+    await new Promise<void>((r) => setImmediate(r));
+  };
+  const makeStats = (): ScanStats => ({
+    files, dirs, bytes,
+    filesOut: streaming ? [] : out,
+    truncated, errors, errorCount, readability,
+    complete: !truncated && errorCount === 0 && readability.rootReadable,
+  });
+
+  // 根不是目录：等价于旧版 readdirSync 抛 ENOTDIR（记 readdir 错误后返回，绝不静默当成空树）。
+  let rootIsDir = true;
+  try { rootIsDir = statSync(rootPath).isDirectory(); } catch { /* 让下面的逻辑按目录处理，readdir 会报错 */ }
+  if (!rootIsDir) {
+    readability.dirsFailed++;
+    noteError(rootPath, "readdir", Object.assign(new Error("ENOTDIR: not a directory: " + rootPath), { code: "ENOTDIR" }));
+    return makeStats();
+  }
+
+  // 显式栈：存"待检查的条目"（文件或目录），弹出顺序即 DFS 前序。
+  const stack: { path: string; depth: number }[] = [{ path: rootPath, depth: 0 }];
+  let entriesSinceCheck = 0;
+  while (stack.length > 0 && !truncated) {
+    if (signal?.aborted) throw walkCancelledError();
+    const item = stack.pop()!;
+    let st;
+    try { st = statSync(item.path); }
+    catch (e) { readability.entriesStatFailed++; noteError(item.path, "stat", e); continue; }
+    if (st.isDirectory()) {
+      if (item.depth > 0) dirs++;              // 根本身不计入 dirs（与旧版一致）
+      if (item.depth > maxDepth) continue;     // 越界目录：计数但不下沉
+      let entries: string[];
+      try { entries = readdirSync(item.path); }
+      catch (e) { readability.dirsFailed++; noteError(item.path, "readdir", e); continue; }
+      readability.dirsRead++;
+      if (item.depth === 0) readability.rootReadable = true;
+      // 逆序入栈 → 弹出顺序与 readdir 顺序一致
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const name = entries[i];
+        if (SKIP_DIR.has(name)) continue;
+        stack.push({ path: join(item.path, name), depth: item.depth + 1 });
+      }
+      continue;
+    }
+    const ext = extname(item.path).toLowerCase();
+    if (!ARCHIVE_EXT.has(ext)) {
+      if (++entriesSinceCheck >= ENTRY_YIELD_EVERY) { entriesSinceCheck = 0; await new Promise<void>((r) => setImmediate(r)); }
+      continue;
+    }
+    if (files >= limit) { truncated = true; break; }
+    const sf: ScannedFile = {
+      path: item.path, size: st.size, mtime: st.mtime.toISOString(),
+      container: ext.slice(1) as ContainerKind,
+      kind: ext === ".unitypackage" ? "unitypackage" : "archive",
+    };
+    files++; bytes += st.size;
+    if (streaming) {
+      batch.push(sf);
+      if (batch.length >= batchSize) await flushBatch();
+    } else {
+      out.push(sf);
       if (++sinceYield >= 200) { sinceYield = 0; await new Promise<void>((r) => setImmediate(r)); }
     }
-  };
-  await walk(rootPath, 0);
-  return {
-    files, dirs, bytes, filesOut: out, truncated,
-    errors, errorCount, readability,
-    complete: !truncated && errorCount === 0 && readability.rootReadable,
-  };
+    if (++entriesSinceCheck >= ABORT_CHECK_EVERY) {
+      entriesSinceCheck = 0;
+      if (signal?.aborted) throw walkCancelledError();
+    }
+  }
+  // 收尾：把不足一批的尾巴交出去（中止优先，不把"取消前的一瞬"当成功）
+  if (signal?.aborted) throw walkCancelledError();
+  await flushBatch();
+  return makeStats();
 }
 
 export interface ScanPlanItem {
@@ -148,7 +238,7 @@ export function planFromFiles(rootPath: string, files: ScannedFile[]): ScanPlanI
     const id = identifyFromNames([fileName, ...ancestors], []);
     const best = id.best;
     // 有商品号 → 按商品号归并；无商品号 → 一个压缩包一个条目（不再把整个目录当一个商品）
-    const key = best ? `booth:${best.itemId}` : `local:${normalizePath(f.path)}`;
+    const key = best ? "booth:" + best.itemId : "local:" + normalizePath(f.path);
     let g = groups.get(key);
     if (!g) {
       const idDir = best ? ancestors.find((p) => p.includes(best.itemId)) : undefined;
@@ -169,12 +259,20 @@ export function planFromFiles(rootPath: string, files: ScannedFile[]): ScanPlanI
   return [...groups.values()];
 }
 
-/** 把文件登记为资产（path_norm 去重），返回新建/更新的资产与新增数。 */
-export function registerAssets(repo: Repo, rootId: number, path: string, itemId: number, f: ScannedFile, discoveredBy: "scan" | "watch" | "download" | "manual"): { id: number; created: boolean } {
+/**
+ * 把文件登记为资产（path_norm 去重）。
+ * changed = 已存在且 size/mtime 变了 —— 扫描应用必须把这类资产重新入队深度索引，
+ * 否则"已变化的文件"只更新了 size/mtime，包内目录与缩略图仍是旧快照（v0.6.0 修复）。
+ */
+export function registerAssets(repo: Repo, rootId: number, path: string, itemId: number, f: ScannedFile, discoveredBy: "scan" | "watch" | "download" | "manual"): { id: number; created: boolean; changed: boolean } {
+  const pn = normalizePath(f.path);
+  const before = repo.getAssetByPathNorm(pn);
+  const changed = !!before && (Number(before.size) !== Number(f.size) || String(before.mtime ?? "") !== String(f.mtime ?? ""));
   const r = repo.upsertAsset({
     item_id: itemId, kind: f.kind, container: f.container, path: f.path,
-    path_norm: normalizePath(f.path), root_id: rootId, size: f.size, mtime: f.mtime, discovered_by: discoveredBy,
+    path_norm: pn, root_id: rootId, size: f.size, mtime: f.mtime, discovered_by: discoveredBy,
   });
-  void extOf; void extractItemIds;
-  return { id: r.asset.id, created: r.created };
+  void extOf; void extractItemIds; void path; void basename;
+  if (changed) { try { repo.setAssetIndexState(r.asset.id, "pending", null); } catch { /* ignore */ } }
+  return { id: r.asset.id, created: r.created, changed };
 }

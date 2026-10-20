@@ -27,7 +27,15 @@ export interface StatsShape {
 }
 
 export class Repo {
+  /** 预编译语句缓存：热路径（claim/finish/syncFts/transition）每次 prepare 实测占索引 CPU 的 ~20%。 */
+  private stmtCache = new Map<string, any>();
   constructor(private db: Database.Database) {}
+
+  private stmt(sql: string): any {
+    let s = this.stmtCache.get(sql);
+    if (!s) { s = this.db.prepare(sql); this.stmtCache.set(sql, s); }
+    return s;
+  }
 
   // ---------- roots ----------
   listRoots() { return this.db.prepare("SELECT * FROM library_roots ORDER BY id").all(); }
@@ -223,11 +231,11 @@ export class Repo {
 
   /** FTS 与 tags_text 同步（幂等）。 */
   syncFts(itemId: number): void {
-    const r = this.db.prepare("SELECT title, shop_name, author, description, notes FROM items WHERE id = ?").get(itemId) as any;
+    const r = this.stmt("SELECT title, shop_name, author, description, notes FROM items WHERE id = ?").get(itemId) as any;
     if (!r) return;
     const tags = this.itemTagsFor([itemId]).get(itemId) ?? [];
-    this.db.prepare("DELETE FROM items_fts WHERE rowid = ?").run(itemId);
-    this.db.prepare("INSERT INTO items_fts(rowid, title, shop_name, author, description, notes, tags_text) VALUES (?,?,?,?,?,?,?)")
+    this.stmt("DELETE FROM items_fts WHERE rowid = ?").run(itemId);
+    this.stmt("INSERT INTO items_fts(rowid, title, shop_name, author, description, notes, tags_text) VALUES (?,?,?,?,?,?,?)")
       .run(itemId, r.title ?? "", r.shop_name ?? "", r.author ?? "", r.description ?? "", r.notes ?? "", tags.join(" "));
   }
 
@@ -398,10 +406,23 @@ export class Repo {
     const r = this.db.prepare("UPDATE assets SET item_id = ? WHERE item_id = ?").run(toItemId, fromItemId);
     return r.changes;
   }
+  /**
+   * 批量标缺失。SQLite 变量上限 32766：必须分块，否则大库（>3.2 万资产）整轮 scan 在写完资产后失败（verifier A4）。
+   * 单事务 + 每块 500：原子且不会长时间持有写锁。
+   */
   markAssetsMissing(ids: number[]): void {
     if (ids.length === 0) return;
-    const ph = ids.map(() => "?").join(",");
-    this.db.prepare(`UPDATE assets SET status='missing' WHERE id IN (${ph})`).run(...ids);
+    const unique = [...new Set(ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    if (unique.length === 0) return;
+    const CHUNK = 500;
+    const tx = this.db.transaction(() => {
+      for (let i = 0; i < unique.length; i += CHUNK) {
+        const part = unique.slice(i, i + CHUNK);
+        const ph = part.map(() => "?").join(",");
+        this.db.prepare(`UPDATE assets SET status='missing' WHERE id IN (${ph})`).run(...part);
+      }
+    });
+    tx();
   }
   touchAsset(id: number): void { this.db.prepare("UPDATE assets SET last_verified_at=? WHERE id=?").run(now(), id); }
   setAssetSha(id: number, sha: string | null, state: "ok" | "error"): void { this.db.prepare("UPDATE assets SET sha256=?, sha256_state=? WHERE id=?").run(sha, state, id); }
@@ -544,12 +565,27 @@ export class Repo {
       .run(kind, itemId, payload === undefined ? null : JSON.stringify(payload), priority, now());
     return this.getJob(Number(info.lastInsertRowid))!;
   }
-  getJob(id: number): JobRow | null { return (this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id) as JobRow) ?? null; }
+  getJob(id: number): JobRow | null { return (this.stmt("SELECT * FROM jobs WHERE id=?").get(id) as JobRow) ?? null; }
   listJobs(state?: string, limit = 100): JobRow[] {
     if (state) return this.db.prepare("SELECT * FROM jobs WHERE state=? ORDER BY priority DESC, id DESC LIMIT ?").all(state, limit) as JobRow[];
     return this.db.prepare("SELECT * FROM jobs ORDER BY id DESC LIMIT ?").all(limit) as JobRow[];
   }
   nextQueuedJob(): JobRow | null { return (this.db.prepare("SELECT * FROM jobs WHERE state='queued' ORDER BY priority DESC, id ASC LIMIT 1").get() as JobRow) ?? null; }
+  /**
+   * CAS 领取：queued → resolving 原子完成（verifier A1）。
+   * 多 runner / 多进程抢同一条时，只有 changes=1 的那个拿到；失败者返回 null，绝不能 stopFail 别人的作业。
+   */
+  claimNextJob(): JobRow | null {
+    const pick = this.stmt("SELECT id FROM jobs WHERE state='queued' ORDER BY priority DESC, id ASC LIMIT 1").get() as { id: number } | undefined;
+    if (!pick) return null;
+    const tx = this.db.transaction(() => {
+      const info = this.stmt("UPDATE jobs SET state='resolving', started_at=?, attempts=attempts+1 WHERE id=? AND state='queued'").run(now(), pick.id);
+      if (info.changes !== 1) return null;
+      this.stmt("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)").run(pick.id, now(), "queued", "resolving", "start", null);
+      return this.getJob(pick.id);
+    });
+    return tx();
+  }
   /** CAS 转移：只允许冻结转移表里的边；非法事件 409；失败态复读由调用方处理。 */
   transitionJob(id: number, event: JobEvent, detail?: string): JobRow {
     const job = this.getJob(id);
@@ -560,27 +596,41 @@ export class Repo {
     const started = job.started_at ?? (to === "resolving" ? now() : null);
     const finished = (to === "done" || to === "cancelled" || to === "abandoned" || to === "failed") ? now() : null;
     const errorValue = to === "failed" ? (detail ?? job.error ?? null) : (to === "done" ? null : job.error);
-    const info = this.db.prepare("UPDATE jobs SET state=?, attempts=?, started_at=?, finished_at=?, error=? WHERE id=? AND state=?")
-      .run(to, attempts, started, finished, errorValue, id, job.state);
-    if (info.changes !== 1) throw Object.assign(new Error("状态已被并发修改"), { code: "CONFLICT", status: 409 });
-    this.db.prepare("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)").run(id, now(), job.state, to, event, detail ?? null);
+    // 状态与事件必须原子：崩溃窗口里"状态已前进、事件丢失"会让崩溃取证断链（verifier R5）
+    const tx = this.db.transaction(() => {
+      const info = this.stmt("UPDATE jobs SET state=?, attempts=?, started_at=?, finished_at=?, error=? WHERE id=? AND state=?")
+        .run(to, attempts, started, finished, errorValue, id, job.state);
+      if (info.changes !== 1) throw Object.assign(new Error("状态已被并发修改"), { code: "CONFLICT", status: 409 });
+      this.stmt("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)").run(id, now(), job.state, to, event, detail ?? null);
+    });
+    tx();
     return this.getJob(id)!;
   }
   logJobEvent(id: number, from: JobState | null, to: JobState, event: string, detail?: string): void {
-    this.db.prepare("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)").run(id, now(), from, to, event, detail ?? null);
+    this.stmt("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)").run(id, now(), from, to, event, detail ?? null);
   }
   listJobEvents(id: number) { return this.db.prepare("SELECT * FROM job_events WHERE job_id=? ORDER BY id").all(id); }
   /** 启动恢复：把在飞作业退回 queued（无锁泄漏）。 */
   recoverInFlight(): number {
     const rows = this.db.prepare(`SELECT * FROM jobs WHERE state IN ('resolving','fetching','materializing','indexing','matching','releasing','releasing_done')`).all() as JobRow[];
+    let requeued = 0;
     const tx = this.db.transaction(() => {
       for (const j of rows) {
-        this.db.prepare("UPDATE jobs SET state='queued', started_at=NULL WHERE id=?").run(j.id);
+        // 反复崩溃的"毒作业"不能让服务无限重启循环：同一作业恢复 >=3 次即放弃并留证据。
+        const rec = this.db.prepare("SELECT COUNT(*) c FROM job_events WHERE job_id=? AND event='recovered'").get(j.id) as any;
+        if (Number(rec?.c) >= 3) {
+          this.db.prepare("UPDATE jobs SET state='failed', finished_at=?, error=? WHERE id=?")
+            .run(now(), "反复崩溃（已恢复 " + Number(rec.c) + " 次），自动放弃以免无限重启", j.id);
+          this.logJobEvent(j.id, j.state, "failed", "abandoned_after_recoveries", "too many recoveries");
+          continue;
+        }
+        this.db.prepare("UPDATE jobs SET state='queued', started_at=NULL, error=NULL WHERE id=?").run(j.id);
         this.logJobEvent(j.id, j.state, "queued", "recovered", "service restart");
+        requeued++;
       }
     });
     tx();
-    return rows.length;
+    return requeued;
   }
 
   // ---------- snapshots / updates ----------
@@ -1215,6 +1265,235 @@ export class Repo {
     return this.db.prepare(
       "UPDATE scan_previews SET state='expired', finished_at=? WHERE state IN ('ready','partial') AND expires_at IS NOT NULL AND expires_at < ?"
     ).run(now(), now()).changes;
+  }
+
+
+  // ---------- 深度索引流水线（v5）----------
+  // 一条 index_task = 一个资产的一个阶段；worker 用 CAS 领取，depends_on 显式声明阶段依赖。
+  // 不改变 jobs 状态机：jobs 仍是顶层作业，流水线是它派生出的子任务。
+
+  getAssetIndexSummary(): { state: string; count: number }[] {
+    return this.db.prepare("SELECT index_state state, COUNT(*) count FROM assets WHERE status<>'trashed' GROUP BY 1").all() as any[];
+  }
+  setAssetIndexState(assetId: number, state: string, error: string | null = null): void {
+    this.db.prepare("UPDATE assets SET index_state=?, index_error=?, indexed_at=? WHERE id=?").run(state, error, state === "done" ? now() : null, assetId);
+  }
+  setAssetContentVersion(assetId: number, version: string | null): void {
+    this.db.prepare("UPDATE assets SET content_version=? WHERE id=?").run(version, assetId);
+  }
+
+  /** 入队（幂等）：同一 asset+stage 已有活跃任务时复用，必要时提升优先级/补 depends_on。 */
+  enqueueIndexTask(input: { assetId: number; itemId?: number | null; stage: string; priority?: number; maxAttempts?: number; dependsOn?: number | null; fingerprint?: string | null; versionKey?: string | null }): number {
+    // check-then-insert 必须在事务里（多进程下唯一活跃索引仍是最终防线；撞了就当已存在处理）
+    const tx = this.db.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT * FROM index_tasks WHERE asset_id=? AND stage=? AND state IN ('queued','running','waiting_retry')"
+      ).get(input.assetId, input.stage) as any;
+      if (existing) {
+        const priority = Math.max(Number(existing.priority) || 0, input.priority ?? 0);
+        if (priority !== existing.priority || (input.dependsOn && !existing.depends_on)) {
+          this.db.prepare("UPDATE index_tasks SET priority=?, depends_on=COALESCE(depends_on, ?) WHERE id=?").run(priority, input.dependsOn ?? null, existing.id);
+        }
+        return Number(existing.id);
+      }
+      const info = this.db.prepare(
+        "INSERT INTO index_tasks(asset_id, item_id, stage, state, priority, max_attempts, depends_on, fingerprint, version_key, created_at) VALUES (?,?,?,'queued',?,?,?,?,?,?)"
+      ).run(input.assetId, input.itemId ?? null, input.stage, input.priority ?? 0, input.maxAttempts ?? 3, input.dependsOn ?? null, input.fingerprint ?? null, input.versionKey ?? null, now());
+      return Number(info.lastInsertRowid);
+    });
+    try { return tx(); }
+    catch (e) {
+      if (String((e as any)?.code ?? "").includes("SQLITE_CONSTRAINT")) {
+        const ex = this.db.prepare("SELECT id FROM index_tasks WHERE asset_id=? AND stage=? AND state IN ('queued','running','waiting_retry')").get(input.assetId, input.stage) as any;
+        if (ex) return Number(ex.id);
+      }
+      throw e;
+    }
+  }
+
+  getIndexTask(id: number): any { return this.db.prepare("SELECT * FROM index_tasks WHERE id=?").get(id) ?? null; }
+
+  /**
+   * CAS 领取一条可运行任务：queued + 依赖已 done/skipped + 退避到期。
+   * 返回 null 表示该阶段当前没有可领取的任务（不是错误）。
+   */
+  claimIndexTask(stage: string): any {
+    const pick = this.stmt(
+      `SELECT t.* FROM index_tasks t
+        WHERE t.state='queued' AND t.stage=?
+          AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?)
+          AND (t.depends_on IS NULL OR EXISTS (
+            SELECT 1 FROM index_tasks d WHERE d.id=t.depends_on AND d.state IN ('done','skipped')))
+        ORDER BY t.priority DESC, t.id ASC LIMIT 1`
+    );
+    const upd = this.stmt("UPDATE index_tasks SET state='running', started_at=?, attempts=attempts+1, next_retry_at=NULL WHERE id=? AND state='queued'");
+    for (let i = 0; i < 8; i++) {
+      const row = pick.get(stage, now()) as any;
+      if (!row) return null;
+      const info = upd.run(now(), row.id);
+      if (info.changes === 1) return this.getIndexTask(row.id);
+    }
+    return null;
+  }
+
+  updateIndexTask(id: number, patch: { bytesDone?: number; bytesTotal?: number; itemsDone?: number; itemsTotal?: number; error?: string | null; errorCode?: string | null }): void {
+    const sets: string[] = []; const params: unknown[] = [];
+    if (patch.bytesDone !== undefined) { sets.push("bytes_done = ?"); params.push(Math.max(0, Math.floor(patch.bytesDone))); }
+    if (patch.bytesTotal !== undefined) { sets.push("bytes_total = ?"); params.push(Math.max(0, Math.floor(patch.bytesTotal))); }
+    if (patch.itemsDone !== undefined) { sets.push("items_done = ?"); params.push(Math.max(0, Math.floor(patch.itemsDone))); }
+    if (patch.itemsTotal !== undefined) { sets.push("items_total = ?"); params.push(Math.max(0, Math.floor(patch.itemsTotal))); }
+    if (patch.error !== undefined) { sets.push("error = ?"); params.push(patch.error); }
+    if (patch.errorCode !== undefined) { sets.push("error_code = ?"); params.push(patch.errorCode); }
+    if (!sets.length) return;
+    params.push(id);
+    this.stmt("UPDATE index_tasks SET " + sets.join(", ") + " WHERE id=?").run(...params as any[]);
+  }
+
+  /** 终态：done / skipped（不适用或被限制降级）/ failed（不可重试）/ cancelled。 */
+  /**
+   * 终态写入。requireRunning=true 时带 CAS（WHERE state='running'）：任务被 recover/重领后，
+   * 旧 worker 的迟到结果不会覆盖新终态（lost update）。
+   */
+  finishIndexTask(id: number, state: "done" | "skipped" | "failed" | "cancelled", detail: { errorCode?: string | null; error?: string | null } = {}, opts: { requireRunning?: boolean } = {}): any {
+    if (opts.requireRunning) {
+      this.stmt("UPDATE index_tasks SET state=?, finished_at=?, error_code=?, error=? WHERE id=? AND state='running'")
+        .run(state, now(), detail.errorCode ?? null, detail.error ?? null, id);
+    } else {
+      this.stmt("UPDATE index_tasks SET state=?, finished_at=?, error_code=?, error=? WHERE id=?")
+        .run(state, now(), detail.errorCode ?? null, detail.error ?? null, id);
+    }
+    return this.getIndexTask(id);
+  }
+  /** 把退避到期的 waiting_retry 提升回 queued（worker 定时调用；否则运行期重试永远不执行）。 */
+  promoteDueRetries(): number {
+    return this.stmt("UPDATE index_tasks SET state='queued', started_at=NULL, next_retry_at=NULL WHERE state='waiting_retry' AND (next_retry_at IS NULL OR next_retry_at <= ?)").run(now()).changes;
+  }
+
+  /** 失败但可重试：进入 waiting_retry（attempts 已在领取时 +1，超过 max_attempts 由调用方判 failed）。 */
+  retryIndexTask(id: number, detail: { errorCode?: string | null; error?: string | null; backoffMs?: number } = {}): any {
+    const at = new Date(Date.now() + (detail.backoffMs ?? 1000)).toISOString();
+    this.db.prepare("UPDATE index_tasks SET state='waiting_retry', started_at=NULL, next_retry_at=?, error_code=?, error=? WHERE id=?")
+      .run(at, detail.errorCode ?? null, detail.error ?? null, id);
+    return this.getIndexTask(id);
+  }
+
+  /** 人工重试：清掉退避与错误，重新排队（attempts 归零，给用户一次干净的重跑机会）。 */
+  requeueIndexTask(id: number): any {
+    this.db.prepare("UPDATE index_tasks SET state='queued', attempts=0, started_at=NULL, finished_at=NULL, next_retry_at=NULL, error=NULL, error_code=NULL WHERE id=?").run(id);
+    return this.getIndexTask(id);
+  }
+  cancelIndexTask(id: number): any {
+    this.db.prepare("UPDATE index_tasks SET state='cancelled', finished_at=? WHERE id=? AND state IN ('queued','waiting_retry')").run(now(), id);
+    return this.getIndexTask(id);
+  }
+  cancelIndexTasksForAsset(assetId: number): number {
+    return this.db.prepare("UPDATE index_tasks SET state='cancelled', finished_at=? WHERE asset_id=? AND state IN ('queued','waiting_retry')").run(now(), assetId).changes;
+  }
+
+  /** 启动恢复：running → queued（不增 attempts），到期 waiting_retry → queued；返回恢复条数。 */
+  recoverIndexTasks(): number {
+    const rows = this.db.prepare("SELECT id, asset_id, stage, state FROM index_tasks WHERE state='running'").all() as any[];
+    const due = this.db.prepare("SELECT id, asset_id, stage FROM index_tasks WHERE state='waiting_retry' AND (next_retry_at IS NULL OR next_retry_at <= ?)").all(now()) as any[];
+    const tx = this.db.transaction(() => {
+      for (const r of rows) {
+        this.db.prepare("UPDATE index_tasks SET state='queued', started_at=NULL WHERE id=?").run(r.id);
+        this.logPipelineEvent({ taskId: r.id, assetId: r.asset_id, stage: r.stage, event: "recovered", detail: "service restart (was running)" });
+      }
+      for (const r of due) {
+        this.db.prepare("UPDATE index_tasks SET state='queued', started_at=NULL, next_retry_at=NULL WHERE id=?").run(r.id);
+        this.logPipelineEvent({ taskId: r.id, assetId: r.asset_id, stage: r.stage, event: "recovered", detail: "retry backoff due" });
+      }
+    });
+    tx();
+    return rows.length + due.length;
+  }
+
+  countIndexTasks(): { stage: string; state: string; count: number }[] {
+    return this.stmt("SELECT stage, state, COUNT(*) count FROM index_tasks GROUP BY stage, state").all() as any[];
+  }
+  listIndexTasks(filter: { state?: string; stage?: string; assetId?: number; limit?: number } = {}): any[] {
+    const where: string[] = []; const params: unknown[] = [];
+    if (filter.state) { where.push("state = ?"); params.push(filter.state); }
+    if (filter.stage) { where.push("stage = ?"); params.push(filter.stage); }
+    if (filter.assetId) { where.push("asset_id = ?"); params.push(filter.assetId); }
+    const sql = "SELECT * FROM index_tasks" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY priority DESC, id DESC LIMIT ?";
+    params.push(Math.min(1000, Math.max(1, filter.limit ?? 100)));
+    return this.stmt(sql).all(...params as any[]);
+  }
+  /** 最近失败（诊断面板）：带资产路径与阶段。 */
+  recentIndexFailures(limit = 20): any[] {
+    return this.db.prepare(
+      `SELECT t.id, t.asset_id, t.item_id, t.stage, t.state, t.attempts, t.error_code, t.error, t.finished_at, a.path, a.size
+         FROM index_tasks t LEFT JOIN assets a ON a.id=t.asset_id
+        WHERE t.state='failed' ORDER BY t.id DESC LIMIT ?`
+    ).all(Math.min(100, limit)) as any[];
+  }
+  /** 某资产的活跃任务（用于取消/跳转诊断）。 */
+  activeIndexTasks(assetId: number): any[] {
+    return this.db.prepare("SELECT * FROM index_tasks WHERE asset_id=? AND state IN ('queued','running','waiting_retry') ORDER BY id").all(assetId) as any[];
+  }
+
+
+  /** 上游失败/取消后，把直接依赖它的排队任务一并跳过（避免永久 queued 的“假等待”）。 */
+  skipDependentTasks(taskId: number, code: string, error: string): number {
+    return this.db.prepare("UPDATE index_tasks SET state='skipped', finished_at=?, error_code=?, error=? WHERE depends_on=? AND state IN ('queued','waiting_retry')")
+      .run(now(), code, error, taskId).changes;
+  }
+  cancelDependentTasks(taskId: number): number {
+    return this.db.prepare("UPDATE index_tasks SET state='cancelled', finished_at=? WHERE depends_on=? AND state IN ('queued','waiting_retry','running')")
+      .run(now(), taskId).changes;
+  }
+  /** 交互式优先级提升：用户打开的包不必排在 2 万个小文件后面。 */
+  boostIndexTasks(assetId: number, priority: number): number {
+    return this.db.prepare("UPDATE index_tasks SET priority=MAX(priority, ?) WHERE asset_id=? AND state IN ('queued','waiting_retry')").run(priority, assetId).changes;
+  }
+  queueDepths(): { stage: string; state: string; count: number }[] { return this.countIndexTasks(); }
+
+  /** 这些资产还有多少活跃（排队/运行/待重试）任务——作业的"有界等待"用它，分块避免变量上限。 */
+  countActiveIndexTasks(assetIds: number[]): number {
+    const ids = [...new Set(assetIds.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    let n = 0;
+    for (let i = 0; i < ids.length; i += 500) {
+      const part = ids.slice(i, i + 500);
+      const ph = part.map(() => "?").join(",");
+      const r = this.db.prepare(
+        "SELECT COUNT(*) c FROM index_tasks WHERE asset_id IN (" + ph + ") AND state IN ('queued','running','waiting_retry')"
+      ).get(...part) as any;
+      n += Number(r?.c ?? 0);
+    }
+    return n;
+  }
+
+  logPipelineEvent(e: { taskId?: number | null; assetId?: number | null; itemId?: number | null; stage?: string | null; event: string; detail?: string | null }): void {
+    this.stmt("INSERT INTO pipeline_events(at, task_id, asset_id, item_id, stage, event, detail) VALUES (?,?,?,?,?,?,?)")
+      .run(now(), e.taskId ?? null, e.assetId ?? null, e.itemId ?? null, e.stage ?? null, e.event, e.detail ?? null);
+  }
+  listPipelineEvents(limit = 100, afterId = 0): any[] {
+    return this.db.prepare("SELECT * FROM pipeline_events WHERE id > ? ORDER BY id DESC LIMIT ?").all(afterId, Math.min(500, limit));
+  }
+
+  // ---------- 派生缓存（v5）----------
+  getCacheEntry(key: string): any { return this.db.prepare("SELECT * FROM cache_entries WHERE key=?").get(key) ?? null; }
+  upsertCacheEntry(e: { key: string; kind: string; contentSha?: string | null; versionKey: string; filePath: string; bytes: number }): void {
+    this.db.prepare(
+      `INSERT INTO cache_entries(key, kind, content_sha, version_key, file_path, bytes, hits, state, created_at, last_used_at)
+       VALUES (?,?,?,?,?,?,0,'ready',?,?)
+       ON CONFLICT(key) DO UPDATE SET file_path=excluded.file_path, bytes=excluded.bytes, content_sha=excluded.content_sha,
+         version_key=excluded.version_key, state='ready', last_used_at=excluded.last_used_at`
+    ).run(e.key, e.kind, e.contentSha ?? null, e.versionKey, e.filePath, e.bytes, now(), now());
+  }
+  touchCacheEntry(key: string): void { this.db.prepare("UPDATE cache_entries SET hits=hits+1, last_used_at=? WHERE key=?").run(now(), key); }
+  deleteCacheEntry(key: string): void { this.db.prepare("DELETE FROM cache_entries WHERE key=?").run(key); }
+  listCacheEntries(kind?: string, limit = 1000): any[] {
+    if (kind) return this.db.prepare("SELECT * FROM cache_entries WHERE kind=? ORDER BY last_used_at DESC LIMIT ?").all(kind, limit) as any[];
+    return this.db.prepare("SELECT * FROM cache_entries ORDER BY last_used_at DESC LIMIT ?").all(limit) as any[];
+  }
+  cacheStats(): { entries: number; bytes: number; hits: number } {
+    const r = this.db.prepare("SELECT COUNT(*) entries, COALESCE(SUM(bytes),0) bytes, COALESCE(SUM(hits),0) hits FROM cache_entries WHERE state='ready'").get() as any;
+    return { entries: Number(r.entries), bytes: Number(r.bytes), hits: Number(r.hits) };
+  }
+  oldestCacheEntries(limit: number): any[] {
+    return this.db.prepare("SELECT * FROM cache_entries WHERE state='ready' ORDER BY last_used_at ASC, key ASC LIMIT ?").all(Math.max(1, limit)) as any[];
   }
 
   // ---------- stats / export ----------

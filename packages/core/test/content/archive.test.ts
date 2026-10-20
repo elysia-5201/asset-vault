@@ -10,6 +10,7 @@ import {
   readArchiveEntryWith7zip,
 } from "../../src/archive/list";
 import { unrarAvailable } from "../../src/archive/rar";
+import { AppError } from "../../src/contracts";
 import { sha256Buffer } from "../../src/hash";
 import { SAMPLES, buildZip, cleanup, crc32, has, SHIFT_JIS_TEST_NAME, tmpDir } from "./fixtures";
 
@@ -286,8 +287,9 @@ test("readArchiveEntry: 参数校验（空路径/超大上限）", async (t) => 
   await assert.rejects(() => readArchiveEntry(SAMPLES.zipSmall, ""), (err: any) => err?.name === "AppError" && err.code === "INVALID_INPUT");
   await assert.rejects(() => readArchiveEntry(SAMPLES.zipSmall, "KawaiiPosing_Ver.3.0.3/readme.txt", 0), (err: any) => err?.name === "AppError" && err.code === "INVALID_INPUT");
   // maxBytes 小于条目实际大小 → 拒绝而不是 OOM
+  // v0.6.0：超限码从 INVALID_INPUT 改为可判别的 "BYTES"（流水线按 code 决策，见 stages.ts 的 BYTES 分支）
   await assert.rejects(
     () => readArchiveEntry(SAMPLES.zipSmall, "KawaiiPosing_Ver.3.0.3/readme.txt", 16),
-    (err: any) => err?.name === "AppError" && err.code === "INVALID_INPUT" && /too large/.test(err.message),
+    (err: any) => err instanceof AppError && err.code === "BYTES" && /too large/.test(err.message),
   );
 });

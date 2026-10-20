@@ -320,3 +320,49 @@ v3 是 v2 之上的**增量**：一级分类 15 个（含系统分类「未分�
 复用 scan 作业的显式文件列表管线（建条目→登记→索引→匹配→分类）。**不移动、不删除源文件，不自动合并重复项**；
 应用前逐条重新 `stat`，与预览快照不一致即 `stale`（写进条目 error，不写库）。
 `marked missing` 由用户勾选触发，不再经过整轮扫描门控；整轮扫描本身仍遵守 M0 的"不完整不判缺"。
+
+## 深度索引流水线（v5）
+
+扫描 / 应用 / 导入作业在 `indexing` 阶段把资产交给后台流水线，然后照常走
+`index_ok → matching → releasing_done → done`。流水线是 `jobs` 的派生子任务队列
+（`index_tasks`），不是第二套作业状态机。完整设计见 `docs/pipeline-v06.md`。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/pipeline` | 总览：计数、每阶段（queued/running/waitingRetry/failed/done/skipped/avgMs）、缓存、内存、最近失败、limits 与 nonDefaultLimits |
+| GET | `/pipeline/tasks?state=&stage=&assetId=&limit=` | 任务列表；每条额外带资产 `path`/`size` |
+| GET | `/pipeline/tasks/:id` | `{task, asset}`；404 `NOT_FOUND` |
+| GET | `/pipeline/events?after=&limit=` | 诊断事件（`stale / limited / retry / failed / cancelled / recovered`），`after` 为事件 id 游标 |
+| POST | `/pipeline/tasks/:id/retry` | 人工重排：`attempts=0`、清错误与退避 |
+| POST | `/pipeline/tasks/:id/cancel` | 排队任务直接取消；运行中触发协作取消（`AbortSignal`） |
+| POST | `/pipeline/assets/:id/reindex` `{priority?}` | 入队整条阶段链；有流水线时返回 `{queued, tasks[]}`，否则同步索引返回 `{result}` |
+| POST | `/pipeline/assets/:id/boost` `{priority?}` | 提升排队任务优先级（交互式打开详情页时用） |
+| POST | `/pipeline/pause` / `/pipeline/resume` | 暂停/继续领取（`{paused, enabled}`） |
+| POST | `/pipeline/gc` | 手动缓存回收 `{removed, bytes, expired}` |
+| GET | `/pipeline/limits` | 当前生效限制 + 非默认项 |
+| PUT | `/pipeline/limits` | 保存到 `settings.pipeline_limits`；返回 `{saved, restartRequired:true, limits}` |
+
+### 任务状态
+
+`queued → running → done | skipped | waiting_retry | failed | cancelled`
+
+- `skipped` 不是失败：`error_code` ∈ `NOT_APPLICABLE / BYTES / ENTRIES / PIXELS / RATIO / UPSTREAM_FAILED / STALE / ASSET_GONE`。
+- `waiting_retry` 的 `next_retry_at` 到期后由 worker 每秒提升回 `queued`（无需重启）。
+- `attempts` 在领取时 +1；退避 `min(retryMaxMs, retryBaseMs * 2^(attempts-1))`；超过 `max_attempts` → `failed`。
+- 进程崩溃后启动时 `running → queued`（不增 attempts），并写 `pipeline_events(event='recovered')`。
+
+### 数据表
+
+- `index_tasks`：唯一活跃索引 `(asset_id, stage)`（queued/running/waiting_retry），`depends_on` 显式依赖。
+- `pipeline_events`：只增诊断事件（崩溃恢复/取消/超限/重试/失败）。
+- `cache_entries`：缓存元数据；文件在 `<dataDir>/cache/<kind>/<key>.json`（tmp + rename 原子写）。
+- `assets`：`index_state`（pending/queued/running/done/failed/limited）、`index_error`、`indexed_at`、`content_version`。
+
+### 迁移
+
+`SCHEMA_VERSION 4 → 5`，幂等；只新增表/列，不改既有语义。
+v0.5.1 可打开 v5 库（多出的表/列被忽略），但不会消费 `index_tasks`；回滚前请备份
+`vault.db` + `vault.db-wal` + `vault.db-shm`（只复制主库会因 WAL 重放不一致）。
+

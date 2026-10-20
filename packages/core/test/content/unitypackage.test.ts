@@ -128,7 +128,10 @@ test("合成包: 顺序/目录资产/缺 pathname/非 GUID 条目 全部按预�
 test("listUnityPackage: 冻结接口形态 + maxAssets 截断", async (t) => {
   if (!has(SAMPLES.unitypackage)) return t.skip("unitypackage sample missing");
   const l = await listUnityPackage(SAMPLES.unitypackage);
-  assert.equal(Object.keys(l).sort().join(","), "assets,truncated"); // 只有冻结字段
+  // v0.6.0：冻结字段（assets/truncated）保留，新增 limited/bytesRead（lead 契约 m00344）
+  assert.deepEqual(Object.keys(l).sort(), ["assets", "bytesRead", "limited", "truncated"]);
+  assert.equal(l.limited, null);
+  assert.ok(l.bytesRead > 80 * 1024 * 1024, "bytesRead 应接近包体 91MB，实际 " + l.bytesRead);
   assert.equal(l.assets.length, SAMPLES.manuka.guids);
   const cut = await listUnityPackage(SAMPLES.unitypackage, { maxAssets: 10 });
   assert.equal(cut.truncated, true);

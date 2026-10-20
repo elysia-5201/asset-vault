@@ -12,6 +12,10 @@ import { InboxWatcher } from "./services/watcher";
 import { registerRoutes } from "./http/routes";
 import { BoothClient } from "../../../packages/core/src/source/booth";
 import { DEFAULT_TAGS, TAGS_SEED_VERSION } from "../../../packages/core/src/categories/default-tags";
+import { DerivedCache } from "./services/pipeline/cache";
+import { IndexPipeline } from "./services/pipeline/pipeline";
+import { resolveLimits, limitsHash } from "./services/pipeline/limits";
+import { acquirePipelineLock, type PipelineLock } from "./services/pipeline/lock";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -38,6 +42,8 @@ export interface AssetVaultHandle {
   booth: BoothClient;
   runner: JobRunner;
   watcher: InboxWatcher;
+  pipeline: IndexPipeline | null;
+  cache: DerivedCache;
   dataDir: string;
   port: number;
   url: string;
@@ -68,15 +74,26 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   const seededTags = repo.seedDefaultTags(DEFAULT_TAGS, TAGS_SEED_VERSION);
   const media = new MediaStore(mediaDir);
   const booth = new BoothClient({ minIntervalMs: 700 });
-  const recovered = repo.recoverInFlight();
+
+  // ---- v0.6.0 流水线：限制 → 缓存 → 单写入者锁 → pipeline ----
+  let limitsRaw: unknown = null;
+  try { limitsRaw = JSON.parse(repo.getSetting("pipeline_limits") ?? "null"); } catch { limitsRaw = null; }
+  const limits = resolveLimits(limitsRaw);
+  const cache = new DerivedCache(join(dataDir, "cache"), repo, log);
+  const lock: PipelineLock = opts.listen === false ? { acquired: false, reason: "embedded mode", release: () => {} } : acquirePipelineLock(dataDir);
+  const pipeline = lock.acquired ? new IndexPipeline({ repo, media, cache, limits, log }) : null;
+  if (!lock.acquired) log("pipeline disabled: " + (lock.reason ?? "lock not acquired") + "（本实例不启动后台索引）");
+  log("pipeline limits v" + limitsHash(limits) + " hash=" + limits.hashConcurrency + " archive=" + limits.archiveConcurrency + " thumbs=" + limits.thumbConcurrency + " cache=" + limits.cacheMaxBytes + "B");
+
+  const recovered = lock.acquired ? repo.recoverInFlight() : 0;
 
   let app: FastifyInstance | null = null;
   const watcher = new InboxWatcher(repo, log);
-  const runner = new JobRunner({ repo, media, booth, log });
+  const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined });
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
-    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir });
+    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits });
     const distDir = opts.webDistDir ?? join(repoRoot, "apps", "web", "dist");
     if (existsSync(join(distDir, "index.html"))) {
       // wildcard 默认 true：否则 /assets/* 不注册，全部落到 SPA 兜底 → JS 以 text/html 返回导致白屏
@@ -97,17 +114,21 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     await fastify.listen({ port, host });
     app = fastify;
     runner.start(400);
+    pipeline?.start();
     watcher.sync();
     log("AssetVault up on http://" + host + ":" + port + " (db=" + dbPath + ", seeded=" + seeded + ", recovered=" + recovered + ")");
     if (seededTags > 0) log("default tags seeded: " + seededTags + " (v" + TAGS_SEED_VERSION + ")");
     if (process.env.ASSETVAULT_VERBOSE) console.log("AssetVault up on http://" + host + ":" + port);
     return {
-      app, repo, media, booth, runner, watcher, dataDir, port, url: "http://" + host + ":" + port, log,
+      app, repo, media, booth, runner, watcher, pipeline, cache, dataDir, port, url: "http://" + host + ":" + port, log,
       close: async () => {
         runner.stop();
+        try { await pipeline?.stop(); } catch { /* noop */ }
         try { await watcher.close(); } catch { /* noop */ }
         try { await app?.close(); } catch { /* noop */ }
+        try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* noop */ }
         try { db.close(); } catch { /* noop */ }
+        lock.release();
         logStream.end();
       },
     };
@@ -115,7 +136,14 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
 
   log("AssetVault embedded mode (db=" + dbPath + ", seeded=" + seeded + ", tagsSeeded=" + seededTags + ")");
   return {
-    app: null, repo, media, booth, runner, watcher, dataDir, port: 0, url: "", log,
-    close: async () => { runner.stop(); try { await watcher.close(); } catch { /* noop */ } try { db.close(); } catch { /* noop */ } logStream.end(); },
+    app: null, repo, media, booth, runner, watcher, pipeline, cache, dataDir, port: 0, url: "", log,
+    close: async () => {
+      runner.stop();
+      try { await pipeline?.stop(); } catch { /* noop */ }
+      try { await watcher.close(); } catch { /* noop */ }
+      try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* noop */ }
+      try { db.close(); } catch { /* noop */ }
+      lock.release(); logStream.end();
+    },
   };
 }

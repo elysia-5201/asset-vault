@@ -12,6 +12,7 @@ import {
   addJob, archiveEntries, assetAvatars, assets, avatars, images, itemAvatars, itemTags,
   items, jobs, nextId, projects, roots, svgCover, tags, unityPackageAssets, updates,
 } from "./seed";
+import { mockPipelineHandle } from "./pipeline";
 import {
   NO_CAT, assignmentOf, catById, catChildren, catMatches, catTops, categoryConfig,
   categoryDefs, countsOf, deleteInMock, impactOf, mergeInMock, moveCategoryTo,
@@ -289,6 +290,9 @@ export function mockHandle(method: string, rawPath: string, query: URLSearchPara
   const b = (body ?? {}) as Record<string, unknown>;
   const M = method.toUpperCase();
   const now = new Date().toISOString();
+
+  // 索引流水线（v0.6.0 §13）单独一个模块，别让这个文件继续膨胀
+  if (seg[0] === "pipeline") return mockPipelineHandle(method, rawPath, query, body);
 
   if (seg[0] === "health" && M === "GET") {
     return { status: 200, body: { ok: true, version: "0.1.0-mock", dbPath: "<repo>/data/mock.db", roots, counts: { items: items.length, assets: assets.length, images: images.length, avatars: avatars.length, jobs: jobs.length } } };

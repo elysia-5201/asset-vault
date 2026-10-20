@@ -4,6 +4,7 @@ import type { JobRow, JobState } from "@core/contracts";
 import { describeError, jobEvents } from "../api";
 import { formatDate, stateTone } from "../util";
 import { Badge, Spinner } from "./ui";
+import { PipelinePanel } from "./PipelinePanel";
 
 type Action = "pause" | "resume" | "cancel" | "retry" | "abandon";
 
@@ -36,6 +37,8 @@ export function JobsPanel(props: {
   const [openEvents, setOpenEvents] = useState<number | null>(null);
   const [events, setEvents] = useState<Record<number, { at: string; from_state: JobState | null; to_state: JobState; event: string; detail: string | null }[]>>({});
   const [busy, setBusy] = useState<number[]>([]);
+  /** 子页切换：「作业」= 条目级任务（原有行为不动），「流水线」= 资产级分阶段队列（v0.6.0 §13）。 */
+  const [tab, setTab] = useState<"jobs" | "pipeline">("jobs");
 
   const toggleEvents = (id: number) => {
     if (openEvents === id) { setOpenEvents(null); return; }
@@ -56,13 +59,25 @@ export function JobsPanel(props: {
   return (
     <>
       <div className="pane-head">
-        <h2>作业</h2>
-        <span className="hint">{inFlight} 进行中 / {props.jobs.length}</span>
-        <label className="chk" title="每 3 秒 GET /jobs">
-          <input type="checkbox" checked={props.auto} onChange={(e) => props.onAuto(e.target.checked)} />自动
-        </label>
-        <button className="btn tiny" onClick={props.onRefresh}>刷新</button>
+        <div className="seg">
+          <button className={tab === "jobs" ? "on" : ""} onClick={() => setTab("jobs")}>作业</button>
+          <button className={tab === "pipeline" ? "on" : ""} onClick={() => setTab("pipeline")}>流水线</button>
+        </div>
+        <span className="spacer" />
+        {tab === "jobs" ? (
+          <>
+            <span className="hint">{inFlight} 进行中 / {props.jobs.length}</span>
+            <label className="chk" title="每 3 秒 GET /jobs">
+              <input type="checkbox" checked={props.auto} onChange={(e) => props.onAuto(e.target.checked)} />自动
+            </label>
+            <button className="btn tiny" onClick={props.onRefresh}>刷新</button>
+          </>
+        ) : (
+          <span className="hint">资产级分阶段队列</span>
+        )}
       </div>
+      {tab === "pipeline" && <PipelinePanel onToast={props.onToast} />}
+      {tab === "jobs" && (
       <div className="col-scroll">
         <div className="pane-body" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
           {props.loading && !props.jobs.length && <div className="hint"><Spinner /> 载入作业…</div>}
@@ -103,6 +118,7 @@ export function JobsPanel(props: {
           <div className="hint">可选状态：{IN_FLIGHT_STATES.join(" / ")} / {TERMINAL_STATES.join(" / ")} / paused / failed</div>
         </div>
       </div>
+      )}
     </>
   );
 }

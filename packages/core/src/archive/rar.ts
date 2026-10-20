@@ -6,11 +6,17 @@
  * 因此 RAR 走 node-unrar-js（纯 WASM，可选依赖，无系统二进制）。
  *
  * 未安装时：抛可判别的 AppError，绝不静默返回空目录（那会把"读不了"污染成"包是空的"）。
+ *
+ * v0.6.0：listRar 支持 deadline + 上限（与 list.ts 同一套语义：命中上限返回 limited，不抛）；
+ * readRarEntry 支持 deadline（解包写入临时目录，无法中断 WASM 内部的单条目解码，
+ * 但每条目之间都有检查点；超时/取消后临时目录仍会被 finally 清掉）。
  */
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppError } from "../contracts";
+import type { Deadline } from "../abort";
+import { LimitError, type ListingLimit } from "../limits";
 
 /** 动态 import 的模块名（变量写法：让 tsc 不要求该可选依赖存在）。 */
 const UNRAR_SPEC = "node-unrar-js";
@@ -55,23 +61,44 @@ export async function unrarAvailable(): Promise<boolean> {
   try { await loadUnrar(); return true; } catch { return false; }
 }
 
-/** 兼容不同版本字段名：name/unpSize/flags.directory/crc。 */
-function normalizeHeader(h: any): { path: string; size: number; isDir: boolean; crc: number | null } {
+interface NormalizedHeader { path: string; size: number; isDir: boolean; crc: number | null; packedSize: number | null; encrypted: boolean }
+
+/** 兼容不同版本字段名：name/unpSize/flags.directory/crc/packSize。 */
+function normalizeHeader(h: any): NormalizedHeader {
   const name = String(h?.name ?? h?.fileName ?? "");
   const flags = h?.flags ?? {};
   const isDir = Boolean(flags.directory ?? flags.isDirectory ?? h?.isDirectory) || name.endsWith("/") || name.endsWith("\\");
   const rawSize = h?.unpSize ?? h?.size ?? h?.unpackedSize ?? 0;
   const size = Number(rawSize);
   const crcVal = h?.crc;
+  const rawPacked = h?.packSize ?? h?.packedSize;
+  const packedNum = Number(rawPacked);
   return {
     path: name.replace(/\\/g, "/"),
     size: Number.isFinite(size) ? size : 0,
     isDir,
     crc: typeof crcVal === "number" ? crcVal >>> 0 : null,
+    packedSize: Number.isFinite(packedNum) && packedNum > 0 ? packedNum : null,
+    encrypted: Boolean(flags.encrypted ?? h?.encrypted),
   };
 }
 
-export interface RarListResult { entries: { path: string; size: number; isDir: boolean; crc: number | null }[]; truncated: boolean; passwordProtected: boolean; note?: string }
+export interface RarListResult {
+  entries: { path: string; size: number; isDir: boolean; crc: number | null }[];
+  truncated: boolean;
+  passwordProtected: boolean;
+  note?: string;
+  limited: ListingLimit | null;
+  bytesListed: number;
+}
+
+export interface RarListOptions {
+  deadline?: Deadline | null;
+  maxEntries?: number;
+  maxTotalBytes?: number | null;
+  maxEntryBytes?: number | null;
+  maxCompressionRatio?: number | null;
+}
 
 async function createExtractor(file: string): Promise<any> {
   const mod = await loadUnrar();
@@ -80,31 +107,63 @@ async function createExtractor(file: string): Promise<any> {
   return factory({ filepath: file });
 }
 
-/** 列出 rar 条目（最大 maxEntries，超出截断）。 */
-export async function listRar(file: string, maxEntries: number): Promise<RarListResult> {
+/**
+ * 列出 rar 条目（默认最多 20000，超出截断）。
+ * 第二参数兼容旧调用：数字 = maxEntries（旧签名），对象 = 新选项。
+ */
+export async function listRar(file: string, opts: number | RarListOptions = {}): Promise<RarListResult> {
+  const o: RarListOptions = typeof opts === "number" ? { maxEntries: opts } : opts;
+  const deadline = o.deadline ?? null;
+  const maxEntries = Math.max(1, Math.floor(o.maxEntries ?? 20000));
+  const maxTotalBytes = typeof o.maxTotalBytes === "number" ? Math.max(1, Math.floor(o.maxTotalBytes)) : null;
+  const maxEntryBytes = typeof o.maxEntryBytes === "number" ? Math.max(1, Math.floor(o.maxEntryBytes)) : null;
+  const maxRatio = typeof o.maxCompressionRatio === "number" ? Math.max(1, o.maxCompressionRatio) : null;
+  const entries: RarListResult["entries"] = [];
+  let truncated = false;
+  let passwordProtected = false;
+  let limited: ListingLimit | null = null;
+  let bytesListed = 0;
   try {
+    deadline?.check();
     const extractor = await createExtractor(file);
     const listed = extractor.getFileList();
     const headers = listed?.fileHeaders ?? listed;
-    const entries: RarListResult["entries"] = [];
-    let truncated = false;
-    let passwordProtected = false;
     for (const h of headers as Iterable<any>) {
+      // 检查点：每条头部一次（9 万条 rar 也能及时刹车）
+      deadline?.check();
       const n = normalizeHeader(h);
-      if (h?.flags?.encrypted) passwordProtected = true;
-      if (entries.length >= maxEntries) { truncated = true; continue; }
-      entries.push(n);
+      if (n.encrypted) passwordProtected = true;
+      if (entries.length >= maxEntries) {
+        truncated = true;
+        if (!limited) limited = { code: "ENTRIES", message: `stopped at maxEntries=${maxEntries}` };
+        break;
+      }
+      if (maxTotalBytes !== null && bytesListed + n.size > maxTotalBytes) {
+        truncated = true;
+        if (!limited) limited = { code: "BYTES", message: `bytesListed ${bytesListed} + entry ${n.size} > maxTotalBytes ${maxTotalBytes}` };
+        break;
+      }
+      if (maxEntryBytes !== null && n.size > maxEntryBytes && !limited) {
+        limited = { code: "BYTES", message: `entry ${n.path.slice(0, 80)} declared ${n.size} > maxEntryBytes ${maxEntryBytes}` };
+      }
+      if (maxRatio !== null && n.packedSize !== null && n.size / n.packedSize > maxRatio && !limited) {
+        limited = { code: "RATIO", message: `entry ${n.path.slice(0, 80)} ratio ${(n.size / n.packedSize).toFixed(1)}:1 > maxCompressionRatio ${maxRatio}` };
+      }
+      entries.push({ path: n.path, size: n.size, isDir: n.isDir, crc: n.crc });
+      bytesListed += n.size;
     }
     const note = passwordProtected ? "rar has encrypted entries (headers only)" : undefined;
-    return { entries, truncated, passwordProtected, ...(note ? { note } : {}) };
+    return { entries, truncated, passwordProtected, ...(note ? { note } : {}), limited, bytesListed };
   } catch (err) {
     const t = translateUnrarError(err, file);
     if (t.code === "ARCHIVE_PASSWORD") {
-      return { entries: [], truncated: false, passwordProtected: true, note: t.message };
+      return { entries: [], truncated: false, passwordProtected: true, note: t.message, limited: null, bytesListed: 0 };
     }
     throw t;
   }
 }
+
+export interface RarReadOptions { deadline?: Deadline | null }
 
 /**
  * 只取一个条目内容。
@@ -115,10 +174,12 @@ export async function listRar(file: string, maxEntries: number): Promise<RarList
  * 对 627 MB 的样本会 OOM。所以这里：解到 mkdtemp 的临时目录 → 读回 → 删目录。
  * 解包前先只用头信息校验存在性/目录/大小，避免解出超大文件。
  */
-export async function readRarEntry(file: string, entryPath: string, maxBytes: number): Promise<Buffer> {
+export async function readRarEntry(file: string, entryPath: string, maxBytes: number, opts: RarReadOptions = {}): Promise<Buffer> {
+  const deadline = opts.deadline ?? null;
   const wanted = entryPath.replace(/\\/g, "/");
   const target = mkdtempSync(join(tmpdir(), "assetvault-rar-"));
   try {
+    deadline?.check();
     const mod = await loadUnrar();
     const factory = mod.createExtractorFromFile ?? mod.default?.createExtractorFromFile;
     if (typeof factory !== "function") throw new AppError("INVALID_INPUT", "node-unrar-js: createExtractorFromFile not found", 400);
@@ -131,22 +192,25 @@ export async function readRarEntry(file: string, entryPath: string, maxBytes: nu
     // 第一遍：只看头（不解压）判定存在性/类型/声明大小
     let header: any = null;
     for (const h of (extractor.getFileList()?.fileHeaders ?? []) as Iterable<any>) {
+      deadline?.check();
       if (normalizeHeader(h).path === wanted) { header = h; break; }
     }
     if (!header) throw new AppError("NOT_FOUND", `entry not found in rar: ${entryPath}`, 404);
     if (header?.flags?.directory) throw new AppError("INVALID_INPUT", `entry is a directory: ${entryPath}`, 400);
     const declared = Number(header?.unpSize ?? 0);
     if (Number.isFinite(declared) && declared > maxBytes) {
-      throw new AppError("INVALID_INPUT", `entry too large: ${declared} bytes > maxBytes ${maxBytes}`, 400);
+      throw new LimitError("BYTES", `entry too large: ${declared} bytes > maxBytes ${maxBytes}`);
     }
+    deadline?.check();
     // 第二遍：驱动生成器把匹配条目写到 target
     const stream = extractor.extract({ files: (h: any) => normalizeHeader(h).path === wanted });
-    for (const _f of stream.files as Iterable<any>) { void _f; }
+    for (const _f of stream.files as Iterable<any>) { deadline?.check(); void _f; }
+    deadline?.check();
     const written = readdirSync(target);
     if (written.length === 0) throw new AppError("NOT_FOUND", `entry not found in rar: ${entryPath}`, 404);
     const buf = readFileSync(join(target, written[0]));
     if (buf.length > maxBytes) {
-      throw new AppError("INVALID_INPUT", `entry too large: ${buf.length} bytes > maxBytes ${maxBytes}`, 400);
+      throw new LimitError("BYTES", `entry too large: ${buf.length} bytes > maxBytes ${maxBytes}`);
     }
     return buf;
   } catch (err) {

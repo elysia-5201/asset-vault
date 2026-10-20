@@ -34,14 +34,14 @@ const seedAsset = (repo: Repo, file: { path: string; size: number; mtime: string
     path_norm: normalizePath(file.path), root_id: rootId, size: file.size, mtime: file.mtime, discovered_by: "scan" });
 };
 
-describe("schema v4：扫描变更中心", () => {
-  test("四张表 + 索引 + 版本号 4；重复 migrate 幂等", () => {
+describe("schema v4+：扫描变更中心", () => {
+  test("四张表 + 索引 + 版本号（v4 起）；重复 migrate 幂等", () => {
     const db = new Database(":memory:"); db.pragma("foreign_keys = ON");
     migrate(db);
     const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'scan_%' ORDER BY name").all() as any[]).map((r) => r.name);
     assert.deepEqual(tables, ["scan_apply_runs", "scan_preview_errors", "scan_preview_items", "scan_previews"]);
     assert.equal((db.prepare("SELECT value v FROM schema_meta WHERE key='version'").get() as any).v, String(SCHEMA_VERSION));
-    assert.equal(SCHEMA_VERSION, 4);
+    assert.ok(SCHEMA_VERSION >= 4, "scan preview 自 v4 引入；后续版本继续保留这些表");
     migrate(db);
     assert.equal((db.prepare("SELECT COUNT(*) c FROM scan_previews").get() as any).c, 0);
     db.close();

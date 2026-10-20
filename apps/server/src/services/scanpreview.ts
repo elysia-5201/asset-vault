@@ -8,6 +8,9 @@
  *  - 判缺沿用 M0 门控：只有完整可信的扫描才提出 missing 项；
  *  - 应用前逐条重新 stat（path + size + mtime），与预览时不一致即标 stale，绝不按旧快照写库；
  *  - 同名同尺寸只能产生"疑似重复"提示，不构成合并依据。
+ *
+ * v0.6.0 阶段 A：分类改为**可流式喂入**（createPreviewClassifier），走 walkCandidates 的 onBatch，
+ * 避免"全量 ScannedFile 数组 + 全量 rows 数组"同时驻留；行序与语义与旧的 classifyPreview 完全一致。
  */
 import { statSync } from "node:fs";
 import { basename } from "node:path";
@@ -28,56 +31,110 @@ export interface PreviewRow {
 
 const emptyCounts = (): PreviewCounts => ({ total: 0, new: 0, unchanged: 0, changed: 0, missing: 0, duplicate_suspected: 0, unreadable: 0, error: 0 });
 
-/** 把扫描结果与库内现有资产对齐，产出逐条变化（纯函数式，便于单测）。 */
-export function classifyPreview(
-  repo: Repo,
-  scanPath: string,
-  files: ScannedFile[],
-  scan: Pick<ScanStats, "truncated" | "errorCount" | "readability" | "errors">,
-): { rows: PreviewRow[]; counts: PreviewCounts; gate: { allowed: boolean; reasons: string[] } } {
+/** 预览生成进度（v0.6.0 阶段 A：给上层报进度，不改变任何落库语义）。 */
+export interface PreviewProgress {
+  phase: "walk" | "classify" | "commit";
+  /** 已扫到的候选文件数（累计）。 */
+  files: number;
+  /** 已枚举目录数（累计）。 */
+  dirs: number;
+  /** 已扫到候选的字节数（累计）。 */
+  bytes: number;
+  /** 已分类出的预览行数（累计）。 */
+  rows: number;
+}
+
+export interface PreviewGenerateOptions {
+  /** 每批扫描回调后、分类完成时、落库完成时各调一次；异常被吞掉（进度不许拖垮预览）。 */
+  onProgress?: (p: PreviewProgress) => void;
+  /** 透传给 walkCandidates 的批大小。 */
+  batchSize?: number;
+  /** 取消信号；中止会抛 code="CANCELLED"。 */
+  signal?: AbortSignal;
+}
+
+/** 可流式喂入的预览分类器：先按批 push(文件)，最后 finish(扫描统计) 收尾得到完整 rows/counts/gate。 */
+export interface PreviewClassifier {
+  readonly rows: PreviewRow[];
+  /** 喂入一批候选文件（行序 = 喂入顺序，与一次性 classifyPreview 完全一致）。 */
+  push(files: ScannedFile[]): void;
+  /** 收尾：判缺（过 missingWriteGate）+ 读取失败行 + 计数。 */
+  finish(scan: Pick<ScanStats, "truncated" | "errorCount" | "readability" | "errors">): { rows: PreviewRow[]; counts: PreviewCounts; gate: { allowed: boolean; reasons: string[] } };
+}
+
+/**
+ * 建一个预览分类器（读一次库内 existing 资产，之后逐批分类）。
+ * 性能：疑似重复提示用「size + 小写 basename」建索引，避免旧写法 O(新文件 × 已有资产) 的 filter
+ * （实测 2000×2000 已 24ms，20000×20000 会到秒级并卡住事件循环）。
+ */
+export function createPreviewClassifier(repo: Repo, scanPath: string): PreviewClassifier {
   const root = normalizePath(scanPath);
   const existing = repo.presentAssetsUnderPath(root);
   const byPath = new Map(existing.map((a) => [a.path_norm, a]));
+  const existingByNameSize = new Map<string, typeof existing>();
+  for (const a of existing) {
+    const key = Number(a.size) + "|" + basename(normalizePath(a.path));
+    const list = existingByNameSize.get(key);
+    if (list) list.push(a);
+    else existingByNameSize.set(key, [a]);
+  }
   const seen = new Set<string>();
   const rows: PreviewRow[] = [];
-  const counts = emptyCounts();
 
-  for (const f of files) {
-    const pn = normalizePath(f.path);
-    seen.add(pn);
-    const cur = byPath.get(pn);
-    if (cur) {
-      const same = Number(cur.size) === f.size && (cur.mtime ?? "") === f.mtime;
-      rows.push({
-        path: f.path, path_norm: pn, change: same ? "unchanged" : "changed",
-        size: f.size, mtime: f.mtime, prevSize: cur.size, prevMtime: cur.mtime,
-        assetId: cur.id, itemId: cur.item_id, container: f.container, kind: f.kind,
-      });
-    } else {
+  const push = (files: ScannedFile[]): void => {
+    for (const f of files) {
+      const pn = normalizePath(f.path);
+      seen.add(pn);
+      const cur = byPath.get(pn);
+      if (cur) {
+        const same = Number(cur.size) === f.size && (cur.mtime ?? "") === f.mtime;
+        rows.push({
+          path: f.path, path_norm: pn, change: same ? "unchanged" : "changed",
+          size: f.size, mtime: f.mtime, prevSize: cur.size, prevMtime: cur.mtime,
+          assetId: cur.id, itemId: cur.item_id, container: f.container, kind: f.kind,
+        });
+        continue;
+      }
       // 弱重复提示：同名 + 同尺寸的已有资产。**只提示**，用户接受后仍按新文件登记。
-      const dup = existing.filter((a) => Number(a.size) === f.size && basename(normalizePath(a.path)) === basename(pn));
+      const dup = existingByNameSize.get(Number(f.size) + "|" + basename(pn)) ?? [];
       rows.push({
         path: f.path, path_norm: pn, change: dup.length ? "duplicate_suspected" : "new",
         size: f.size, mtime: f.mtime, assetId: null, itemId: null, container: f.container, kind: f.kind,
         detail: dup.length ? { hint: "存在同名同尺寸的已有资产（仅供参考，不会自动合并）", matches: dup.slice(0, 5).map((a) => a.path) } : undefined,
       });
     }
-  }
+  };
 
-  // 判缺沿用 M0 门控：不完整的一轮不提出 missing（"没看到"可能只是"没读到"）
-  const gate = missingWriteGate(scan);
-  if (gate.allowed) {
-    for (const a of existing) {
-      if (seen.has(a.path_norm)) continue;
-      rows.push({ path: a.path, path_norm: a.path_norm, change: "missing", prevSize: a.size, prevMtime: a.mtime, assetId: a.id, itemId: a.item_id });
+  const finish = (scan: Pick<ScanStats, "truncated" | "errorCount" | "readability" | "errors">) => {
+    // 判缺沿用 M0 门控：不完整的一轮不提出 missing（"没看到"可能只是"没读到"）
+    const gate = missingWriteGate(scan);
+    if (gate.allowed) {
+      for (const a of existing) {
+        if (seen.has(a.path_norm)) continue;
+        rows.push({ path: a.path, path_norm: a.path_norm, change: "missing", prevSize: a.size, prevMtime: a.mtime, assetId: a.id, itemId: a.item_id });
+      }
     }
-  }
+    // 读取失败：readdir 失败记 error（目录），stat 失败记 unreadable（条目存在但读不到）
+    for (const e of scan.errors) pushIssue(rows, e);
 
-  // 读取失败：readdir 失败记 error（目录），stat 失败记 unreadable（条目存在但读不到）
-  for (const e of scan.errors) pushIssue(rows, e);
+    const counts = emptyCounts();
+    for (const r of rows) { counts.total++; counts[r.change] = (counts[r.change] ?? 0) + 1; }
+    return { rows, counts, gate };
+  };
 
-  for (const r of rows) { counts.total++; counts[r.change] = (counts[r.change] ?? 0) + 1; }
-  return { rows, counts, gate };
+  return { rows, push, finish };
+}
+
+/** 把扫描结果与库内现有资产对齐，产出逐条变化（一次性版本；行序/语义与 createPreviewClassifier 一致）。 */
+export function classifyPreview(
+  repo: Repo,
+  scanPath: string,
+  files: ScannedFile[],
+  scan: Pick<ScanStats, "truncated" | "errorCount" | "readability" | "errors">,
+): { rows: PreviewRow[]; counts: PreviewCounts; gate: { allowed: boolean; reasons: string[] } } {
+  const c = createPreviewClassifier(repo, scanPath);
+  c.push(files);
+  return c.finish(scan);
 }
 
 function pushIssue(rows: PreviewRow[], e: ScanIssue): void {
@@ -87,17 +144,33 @@ function pushIssue(rows: PreviewRow[], e: ScanIssue): void {
   });
 }
 
-/** 生成预览（在 scan job 里跑）：遍历 → 对齐 → 落库 → 状态 ready/partial/failed + planHash。 */
+/**
+ * 生成预览（在 scan job 里跑）：遍历 → 对齐 → 落库 → 状态 ready/partial/failed + planHash。
+ * v0.6.0 阶段 A：走 walkCandidates 的 onBatch 流式分类（每批一次 push），可选 onProgress 报进度；
+ * 落库仍是一次 replaceScanPreviewItems（预览是快照语义，repo 不做增量接口）。
+ */
 export async function generateScanPreview(
   repo: Repo,
   previewId: number,
   log: (m: string) => void = () => {},
+  opts: PreviewGenerateOptions = {},
 ): Promise<{ state: string; counts: PreviewCounts; gate: { allowed: boolean; reasons: string[] } }> {
   const p = repo.getScanPreview(previewId);
   if (!p) throw new Error("预览不存在: " + previewId);
   const deep = !!p.deep;
-  const scan = await walkCandidates(p.path, { maxDepth: deep ? 10 : 6 });
-  const { rows, counts, gate } = classifyPreview(repo, p.path, scan.filesOut, scan);
+  const notify = (q: PreviewProgress): void => { try { opts.onProgress?.(q); } catch { /* 进度回调不许拖垮预览 */ } };
+  const classifier = createPreviewClassifier(repo, p.path);
+  const scan = await walkCandidates(p.path, {
+    maxDepth: deep ? 10 : 6,
+    batchSize: opts.batchSize,
+    signal: opts.signal,
+    onBatch: (files, st) => {
+      classifier.push(files);
+      notify({ phase: "walk", files: st.files, dirs: st.dirs, bytes: st.bytes, rows: classifier.rows.length });
+    },
+  });
+  const { rows, counts, gate } = classifier.finish(scan);
+  notify({ phase: "classify", files: scan.files, dirs: scan.dirs, bytes: scan.bytes, rows: rows.length });
   repo.replaceScanPreviewItems(previewId, rows);
   if (scan.errors.length) {
     repo.addScanPreviewErrors(previewId, scan.errors.map((e) => ({ stage: "walk:" + e.op, path: e.path, code: e.code, message: e.message })));
@@ -117,6 +190,7 @@ export async function generateScanPreview(
     error: rootReadable ? null : "根目录不可读（readdir 失败），本轮结果不可用于判缺",
     finished_at: now(),
   });
+  notify({ phase: "commit", files: scan.files, dirs: scan.dirs, bytes: scan.bytes, rows: rows.length });
   log("preview " + previewId + ": state=" + state + " files=" + scan.files + " counts=" + JSON.stringify(counts) + (gate.allowed ? "" : " missingSkipped(" + gate.reasons.join(",") + ")"));
   return { state, counts, gate };
 }

@@ -15,6 +15,7 @@ import type {
   DuplicateDiff, DuplicateFileDiff, DuplicateGroup, DuplicateGroupItem, DuplicateGroupsResponse,
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
+  PipelineEvent, PipelineOverview, PipelineStage, PipelineTask,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
@@ -710,6 +711,121 @@ export async function jobAction(id: number, action: "pause" | "resume" | "cancel
   const r = rec(raw);
   const job = (r.job && typeof r.job === "object" ? r.job : raw) as JobRow;
   return { job };
+}
+
+// ---------------- 索引流水线（v0.6.0 §13）----------------
+/**
+ * 端点固定形状见 lead 的冻结契约（GET /api/pipeline）。缺字段一律补默认值：
+ * 面板宁可显示 0 / 「—」，也不能因为后端少一个键就整块崩掉。
+ */
+function numOrNull(x: unknown): number | null { return x === null || x === undefined ? null : numOr(x, 0); }
+
+/** 单条任务归一化：{task:{...}} 与裸任务两种都吃（服务端历史上两种都返回过）。 */
+function taskOf(raw: unknown): PipelineTask {
+  const outer = rec(raw);
+  const o = outer.task && typeof outer.task === "object" ? rec(outer.task) : outer;
+  return {
+    id: numOr(o.id, 0), asset_id: numOr(o.asset_id, 0), item_id: numOrNull(o.item_id),
+    stage: String(o.stage ?? ""), state: String(o.state ?? ""),
+    priority: numOr(o.priority, 0), attempts: numOr(o.attempts, 0), max_attempts: numOr(o.max_attempts, 0),
+    bytes_done: numOr(o.bytes_done, 0), bytes_total: numOrNull(o.bytes_total),
+    items_done: numOr(o.items_done, 0), items_total: numOrNull(o.items_total),
+    error_code: typeof o.error_code === "string" ? o.error_code : null,
+    error: typeof o.error === "string" ? o.error : null,
+    created_at: String(o.created_at ?? ""),
+    started_at: typeof o.started_at === "string" ? o.started_at : null,
+    finished_at: typeof o.finished_at === "string" ? o.finished_at : null,
+    next_retry_at: typeof o.next_retry_at === "string" ? o.next_retry_at : null,
+    path: typeof o.path === "string" ? o.path : null,
+    size: numOrNull(o.size),
+  };
+}
+
+export async function getPipeline(): Promise<PipelineOverview> {
+  const r = rec(await request<unknown>("GET", "/pipeline"));
+  const stages = arr<unknown>(r.stages).map((s) => {
+    const o = rec(s);
+    return {
+      stage: String(o.stage ?? "") as PipelineStage,
+      queued: numOr(o.queued, 0), running: numOr(o.running, 0), waitingRetry: numOr(o.waitingRetry, 0),
+      failed: numOr(o.failed, 0), done: numOr(o.done, 0), skipped: numOr(o.skipped, 0),
+      avgMs: numOrNull(o.avgMs),
+    };
+  });
+  const cache = rec(r.cache);
+  const mem = rec(r.memory);
+  const le = r.lastError ? rec(r.lastError) : null;
+  return {
+    started: r.started === true,
+    paused: r.paused === true,
+    startedAt: typeof r.startedAt === "string" ? r.startedAt : "",
+    running: numOr(r.running, 0), queued: numOr(r.queued, 0), waitingRetry: numOr(r.waitingRetry, 0),
+    failed: numOr(r.failed, 0), done: numOr(r.done, 0), cancelled: numOr(r.cancelled, 0), skipped: numOr(r.skipped, 0),
+    stages,
+    cache: {
+      entries: numOr(cache.entries, 0), bytes: numOr(cache.bytes, 0), hits: numOr(cache.hits, 0),
+      hitRate: numOr(cache.hitRate, 0), maxBytes: numOr(cache.maxBytes, 0),
+    },
+    memory: {
+      rss: numOr(mem.rss, 0), heapUsed: numOr(mem.heapUsed, 0),
+      heapTotal: numOr(mem.heapTotal, 0), external: numOr(mem.external, 0),
+    },
+    processed: numOr(r.processed, 0), failures: numOr(r.failures, 0),
+    lastError: le
+      ? { at: String(le.at ?? ""), stage: String(le.stage ?? ""), assetId: numOr(le.assetId, 0), message: String(le.message ?? "") }
+      : null,
+    limits: rec(r.limits), nonDefaultLimits: rec(r.nonDefaultLimits),
+  };
+}
+
+export async function listPipelineTasks(q: { state?: string; stage?: string; assetId?: number; limit?: number } = {}): Promise<PipelineTask[]> {
+  const raw = await request<unknown>("GET", "/pipeline/tasks" + queryString({
+    state: q.state, stage: q.stage, assetId: q.assetId, limit: q.limit ?? 50,
+  }));
+  return pickArray<unknown>(raw, "tasks").map(taskOf);
+}
+
+export async function listPipelineEvents(after = 0, limit = 200): Promise<PipelineEvent[]> {
+  const raw = await request<unknown>("GET", "/pipeline/events" + queryString({ after, limit }));
+  return pickArray<unknown>(raw, "events").map((e) => {
+    const o = rec(e);
+    return {
+      id: numOr(o.id, 0), at: String(o.at ?? ""),
+      task_id: numOrNull(o.task_id), asset_id: numOrNull(o.asset_id), item_id: numOrNull(o.item_id),
+      stage: typeof o.stage === "string" ? o.stage : null,
+      event: String(o.event ?? ""),
+      detail: typeof o.detail === "string" ? o.detail : null,
+    };
+  });
+}
+
+export async function retryPipelineTask(id: number): Promise<PipelineTask> {
+  return taskOf(await request<unknown>("POST", "/pipeline/tasks/" + id + "/retry", {}));
+}
+export async function cancelPipelineTask(id: number): Promise<PipelineTask> {
+  return taskOf(await request<unknown>("POST", "/pipeline/tasks/" + id + "/cancel", {}));
+}
+/** 单个资产重排全部阶段 → {queued} */
+export async function reindexPipelineAsset(assetId: number, priority?: number): Promise<{ queued: number }> {
+  const r = rec(await request<unknown>("POST", "/pipeline/assets/" + assetId + "/reindex", priority === undefined ? {} : { priority }));
+  return { queued: numOr(r.queued, 0) };
+}
+/** 把该资产的排队任务提到队头 → {boosted} */
+export async function boostPipelineAsset(assetId: number): Promise<{ boosted: number }> {
+  const r = rec(await request<unknown>("POST", "/pipeline/assets/" + assetId + "/boost", {}));
+  return { boosted: numOr(r.boosted, 0) };
+}
+export async function pausePipeline(): Promise<{ paused: boolean }> {
+  const r = rec(await request<unknown>("POST", "/pipeline/pause", {}));
+  return { paused: r.paused !== false };
+}
+export async function resumePipeline(): Promise<{ paused: boolean }> {
+  const r = rec(await request<unknown>("POST", "/pipeline/resume", {}));
+  return { paused: r.paused === true };
+}
+export async function gcPipeline(): Promise<{ removed: number; bytes: number }> {
+  const r = rec(await request<unknown>("POST", "/pipeline/gc", {}));
+  return { removed: numOr(r.removed, 0), bytes: numOr(r.bytes, 0) };
 }
 
 // ---------------- 工程 ----------------
