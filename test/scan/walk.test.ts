@@ -13,8 +13,12 @@ import { join, extname } from "node:path";
 import Database from "better-sqlite3";
 import { migrate } from "../../apps/server/src/db/migrate";
 import { Repo } from "../../apps/server/src/db/repo";
-import { walkCandidates, missingWriteGate, type ScannedFile, type ScanStats } from "../../apps/server/src/services/scan";
+import {
+  walkCandidates, missingWriteGate, createMemoryManifest, createBackpressureGate,
+  type ScannedFile, type ScanManifest, type ScanStats,
+} from "../../apps/server/src/services/scan";
 import { classifyPreview, createPreviewClassifier, generateScanPreview } from "../../apps/server/src/services/scanpreview";
+import { normalizePath } from "../../packages/core/src/pathnorm";
 
 const ROOT = mkdtempSync(join(tmpdir(), "av-walk-"));
 after(() => { try { rmSync(ROOT, { recursive: true, force: true }); } catch { /* ignore */ } });
@@ -294,6 +298,215 @@ describe("scanpreview：流式分类与一次性分类完全等价", () => {
     const rows = repo.listScanPreviewItems(preview.id, { limit: 10 }).items;
     assert.equal(rows.length, 2);
     assert.ok(repo.getScanPreview(preview.id).plan_hash, "planHash 已写入");
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------- v0.6.1-A：扫描清单 / 背压闸门 / 提交边界
+
+describe("v0.6.1-A：扫描清单（manifest）与旧 seen 等价", () => {
+  test("T1 流式 + manifest：清单集合 == 旧 seen（filesOut）集合，filesOut 为空，顺序一致", async () => {
+    const root = mkDir("manifest/eq");
+    mkFile("manifest/eq/x.zip", 1);
+    mkFile("manifest/eq/sub/y.zip", 2);
+    mkFile("manifest/eq/sub/deep/z.unitypackage", 3);
+    mkFile("manifest/eq/other.rar", 4);
+    mkFile("manifest/eq/plain.txt", 5); // 非候选：不得进清单
+    const plain = await walkCandidates(root, {});
+    const oldSeen = new Set(plain.filesOut.map((f) => normalizePath(f.path)));
+    const m = createMemoryManifest();
+    const order: string[] = [];
+    const streamed = await walkCandidates(root, {
+      batchSize: 2, manifest: m,
+      onBatch: (files) => { for (const f of files) order.push(normalizePath(f.path)); },
+    });
+    assert.equal(streamed.filesOut.length, 0, "流式模式 filesOut 必须为空");
+    assert.equal(streamed.manifest, m, "stats 回传同一个清单实例");
+    assert.equal(m.size, oldSeen.size);
+    for (const p of oldSeen) assert.equal(m.has(p), true, "清单缺条目: " + p);
+    assert.deepEqual(order, plain.filesOut.map((f) => normalizePath(f.path)), "清单/批次顺序 == 全量顺序");
+  });
+
+  test("T1 非流式 + manifest 也等价；每批只调一次 addMany（批边界记账）", async () => {
+    const root = mkDir("manifest/batch");
+    for (let i = 0; i < 4; i++) mkFile("manifest/batch/b" + i + ".zip", 10 + i);
+    const plain = await walkCandidates(root, {});
+    const mem = createMemoryManifest();
+    const calls: number[] = [];
+    let adds = 0;
+    const spy: ScanManifest = {
+      add: (p) => { adds++; mem.add(p); },
+      addMany: (ps) => { calls.push(ps.length); mem.addMany(ps); },
+      get size() { return mem.size; },
+      has: (p) => mem.has(p),
+    };
+    await walkCandidates(root, { batchSize: 2, manifest: spy, onBatch: () => {} });
+    assert.deepEqual(calls, [2, 2], "4 条 / 批 2 → 两次 addMany，各 2 条");
+    assert.equal(adds, 0, "批模式下不得逐条 add");
+    assert.equal(mem.size, plain.filesOut.length);
+    // 非流式：同一份清单也能拿到完整集合
+    const m2 = createMemoryManifest();
+    const full = await walkCandidates(root, { manifest: m2 });
+    assert.equal(full.filesOut.length, 4);
+    assert.equal(m2.size, 4);
+  });
+
+  test("T1 finish 钩子：完整可信才调用；截断（limit）不调用", async () => {
+    const root = mkDir("manifest/finish");
+    for (let i = 0; i < 3; i++) mkFile("manifest/finish/f" + i + ".zip", 10 + i);
+    const done: any[] = [];
+    const mem = createMemoryManifest();
+    const withFinish: ScanManifest = {
+      add: (p) => mem.add(p), addMany: (ps) => mem.addMany(ps), get size() { return mem.size; }, has: (p) => mem.has(p),
+      finish: (s) => { done.push(s); },
+    };
+    const ok = await walkCandidates(root, { manifest: withFinish });
+    assert.equal(ok.complete, true);
+    assert.deepEqual(done, [{ files: 3, truncated: false, complete: true }]);
+    const done2: any[] = [];
+    const m2 = createMemoryManifest();
+    const truncatedManifest: ScanManifest = {
+      add: (p) => m2.add(p), addMany: (ps) => m2.addMany(ps), get size() { return m2.size; }, has: (p) => m2.has(p),
+      finish: (s) => { done2.push(s); },
+    };
+    const cut = await walkCandidates(root, { manifest: truncatedManifest, limit: 2 });
+    assert.equal(cut.truncated, true);
+    assert.equal(done2.length, 0, "截断的一轮不得通知清单收尾");
+  });
+});
+
+describe("v0.6.1-A：背压闸门（createBackpressureGate）", () => {
+  test("T4 低于/等于 highWater 直接放行（不 sleep）", async () => {
+    let sleeps = 0;
+    const gate = createBackpressureGate({ depth: () => 2000, highWater: 2000, lowWater: 500, sleep: async () => { sleeps++; } });
+    const r = await gate.wait();
+    assert.deepEqual({ waited: r.waited, throttled: r.throttled, waitedMs: r.waitedMs, depth: r.depth }, { waited: false, throttled: false, waitedMs: 0, depth: 2000 });
+    assert.equal(sleeps, 0);
+  });
+
+  test("T4 高于 highWater：轮询到 <= lowWater 才放行（wait 的度量=轮询次数×pollMs）", async () => {
+    const depths = [5000, 3000, 400];
+    let i = 0;
+    const slept: number[] = [];
+    const gate = createBackpressureGate({
+      depth: () => depths[Math.min(i++, depths.length - 1)],
+      highWater: 2000, lowWater: 500, pollMs: 100,
+      sleep: async (ms) => { slept.push(ms); },
+    });
+    const r = await gate.wait();
+    assert.equal(r.waited, true);
+    assert.equal(r.throttled, false);
+    assert.equal(r.depth, 400);
+    assert.equal(r.waitedMs, 200);
+    assert.deepEqual(slept, [100, 100]);
+  });
+
+  test("T4 超 maxWaitMs：放行但 throttled=true（绝不静默卡死）", async () => {
+    const slept: number[] = [];
+    const gate = createBackpressureGate({
+      depth: () => 999999, highWater: 2000, lowWater: 500, pollMs: 100, maxWaitMs: 300,
+      sleep: async (ms) => { slept.push(ms); },
+    });
+    const r = await gate.wait();
+    assert.equal(r.throttled, true);
+    assert.equal(r.waited, true);
+    assert.equal(r.waitedMs, 300);
+    assert.equal(slept.length, 3);
+    // 反例对照：maxWaitMs=0 表示不限制（由调用方自己保证能解除）；这里仅断言不会立刻 throttled
+    const gate2 = createBackpressureGate({ depth: () => 999999, highWater: 2000, lowWater: 500, pollMs: 100, maxWaitMs: 0, sleep: async () => { throw new Error("should not finish"); } });
+    await assert.rejects(() => gate2.wait(), /should not finish/);
+  });
+
+  test("T4 signal 中止 → CANCELLED（预先中止 / 等待中中止）", async () => {
+    const pre = new AbortController(); pre.abort();
+    await assert.rejects(
+      () => createBackpressureGate({ depth: () => 99999, highWater: 1, lowWater: 0, signal: pre.signal }).wait(),
+      (e: any) => e.code === "CANCELLED",
+    );
+    const mid = new AbortController();
+    await assert.rejects(
+      () => createBackpressureGate({
+        depth: () => 99999, highWater: 1, lowWater: 0, pollMs: 50, signal: mid.signal,
+        sleep: async () => { mid.abort(); },
+      }).wait(),
+      (e: any) => e.code === "CANCELLED",
+    );
+  });
+
+  test("T4 depth 允许 async / NaN 视为 0", async () => {
+    const gate = createBackpressureGate({ depth: async () => 10, highWater: 2000, lowWater: 500 });
+    assert.equal((await gate.wait()).waited, false);
+    const nan = createBackpressureGate({ depth: () => Number.NaN, highWater: 0, lowWater: 0 });
+    const r = await nan.wait();
+    assert.equal(r.depth, 0);
+    assert.equal(r.waited, false);
+  });
+});
+
+describe("v0.6.1-A：取消与清单提交边界", () => {
+  test("T5 批中途取消：只记已提交批次，未提交批次不写", async () => {
+    const root = mkDir("manifest/cancel");
+    for (let i = 0; i < 6; i++) mkFile("manifest/cancel/c" + i + ".zip", 10 + i);
+    const plain = await walkCandidates(root, {});
+    const order = plain.filesOut.map((f) => normalizePath(f.path));
+    assert.equal(order.length, 6);
+    const m = createMemoryManifest();
+    const ac = new AbortController();
+    let batches = 0;
+    await assert.rejects(
+      () => walkCandidates(root, {
+        batchSize: 2, manifest: m, signal: ac.signal,
+        onBatch: () => { batches++; if (batches === 2) ac.abort(); }, // 第 2 批回调里中止
+      }),
+      (e: any) => e.code === "CANCELLED",
+    );
+    assert.equal(batches, 2, "第 2 批已回调（随后中止）");
+    assert.equal(m.size, 4, "已提交 2 批 × 2 条；第 3 批未提交不得记账");
+    for (const p of order.slice(0, 4)) assert.equal(m.has(p), true);
+    for (const p of order.slice(4)) assert.equal(m.has(p), false);
+  });
+
+  test("T5 消费方抛错：该批不算提交，清单不记；重放可拿全量（幂等）", async () => {
+    const root = mkDir("manifest/throw");
+    for (let i = 0; i < 5; i++) mkFile("manifest/throw/t" + i + ".zip", 10 + i);
+    const plain = await walkCandidates(root, {});
+    const m = createMemoryManifest();
+    let batches = 0;
+    await assert.rejects(
+      () => walkCandidates(root, { batchSize: 2, manifest: m, onBatch: () => { if (++batches === 2) throw new Error("consumer failed"); } }),
+      /consumer failed/,
+    );
+    assert.equal(m.size, 2, "只有第 1 批提交成功");
+    // 重放（模拟 job retry）：新的清单能拿到完整集合
+    const m2 = createMemoryManifest();
+    const replay = await walkCandidates(root, { batchSize: 2, manifest: m2, onBatch: () => {} });
+    assert.equal(replay.files, plain.files);
+    assert.equal(m2.size, plain.filesOut.length);
+  });
+});
+
+describe("v0.6.1-A A4：预览 limit 是 opt-in（默认不改变旧行为）", () => {
+  const scanJson = (repo: Repo, id: number): any => JSON.parse(repo.getScanPreview(id).scan_json ?? "{}");
+  test("不传 limit：scan_json 不含 limit 键、state=ready；传 limit 且截断：partial + limitNote", async () => {
+    const db = new Database(":memory:"); db.pragma("foreign_keys = ON"); migrate(db);
+    const repo = new Repo(db);
+    const a = mkDir("preview/optin-a"); mkFile("preview/optin-a/1.zip", 1); mkFile("preview/optin-a/2.zip", 2);
+    const pa = repo.createScanPreview({ rootId: null, path: a, deep: false });
+    const ra = await generateScanPreview(repo, pa.id, () => {});
+    assert.equal(ra.state, "ready");
+    assert.equal("limit" in scanJson(repo, pa.id), false, "默认不写 limit 键（旧行为）");
+
+    const b = mkDir("preview/optin-b");
+    for (let i = 0; i < 3; i++) mkFile("preview/optin-b/p" + i + ".zip", 10 + i);
+    const pb = repo.createScanPreview({ rootId: null, path: b, deep: false });
+    const rb = await generateScanPreview(repo, pb.id, () => {}, { limit: 2 });
+    assert.equal(rb.state, "partial");
+    assert.equal(rb.counts.total, 2);
+    const sj = scanJson(repo, pb.id);
+    assert.equal(sj.limit, 2);
+    assert.equal(typeof sj.limitNote, "string");
+    assert.match(sj.limitNote, /仅扫描了前 2 个候选/);
+    assert.equal(repo.getScanPreview(pb.id).truncated, 1);
     db.close();
   });
 });

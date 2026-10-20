@@ -51,6 +51,14 @@ export interface PreviewGenerateOptions {
   batchSize?: number;
   /** 取消信号；中止会抛 code="CANCELLED"。 */
   signal?: AbortSignal;
+  /**
+   * **opt-in（默认关闭）**：本轮最多保留多少条候选（透传 walkCandidates.limit）。
+   * 不传 = 完全沿用旧行为（walk 的默认上限 20000 仍是硬上限，只是不额外记"被这个 limit 截断"的说明）。
+   * 显式传入且真的被截断时：state 会因 complete=false 变成 partial，scan_json 里带 limit/limitNote，
+   * 供 UI 明确告诉用户"这次只看了前 N 个候选"。不改变 counts/planHash 的口径，也不需要 bump
+   * PREVIEW_GENERATOR_VERSION（rows 与 state 本来就参与 planHash）。
+   */
+  limit?: number;
 }
 
 /** 可流式喂入的预览分类器：先按批 push(文件)，最后 finish(扫描统计) 收尾得到完整 rows/counts/gate。 */
@@ -148,6 +156,10 @@ function pushIssue(rows: PreviewRow[], e: ScanIssue): void {
  * 生成预览（在 scan job 里跑）：遍历 → 对齐 → 落库 → 状态 ready/partial/failed + planHash。
  * v0.6.0 阶段 A：走 walkCandidates 的 onBatch 流式分类（每批一次 push），可选 onProgress 报进度；
  * 落库仍是一次 replaceScanPreviewItems（预览是快照语义，repo 不做增量接口）。
+ *
+ * v0.6.1-A：**limit 是 opt-in**（见 PreviewGenerateOptions.limit）。不传时行为与之前逐字节一致；
+ * 显式传入且被截断时才在 scan_json 记 limit/limitNote（state 由 complete=false 自然变 partial）。
+ * rows 仍需要全量驻留（要一次落库），因此本函数的内存上界由 limit 决定，而不是由调用方"随手不传"决定。
  */
 export async function generateScanPreview(
   repo: Repo,
@@ -164,6 +176,7 @@ export async function generateScanPreview(
     maxDepth: deep ? 10 : 6,
     batchSize: opts.batchSize,
     signal: opts.signal,
+    ...(opts.limit === undefined ? {} : { limit: opts.limit }),
     onBatch: (files, st) => {
       classifier.push(files);
       notify({ phase: "walk", files: st.files, dirs: st.dirs, bytes: st.bytes, rows: classifier.rows.length });
@@ -186,7 +199,14 @@ export async function generateScanPreview(
     truncated: scan.truncated ? 1 : 0, complete: scan.complete ? 1 : 0,
     files: scan.files, dirs: scan.dirs, bytes: scan.bytes, error_count: scan.errorCount,
     counts_json: JSON.stringify(counts),
-    scan_json: JSON.stringify({ readability: scan.readability, missingProposed: gate.allowed, reasons: gate.reasons }),
+    scan_json: JSON.stringify({
+      readability: scan.readability, missingProposed: gate.allowed, reasons: gate.reasons,
+      // opt-in 上限说明：只有调用方显式传 limit 才写这两个字段（不传 = 旧行为，scan_json 不多任何键）
+      ...(opts.limit === undefined ? {} : {
+        limit: opts.limit,
+        limitNote: scan.truncated ? "仅扫描了前 " + opts.limit + " 个候选（truncated），本轮不是完整树" : null,
+      }),
+    }),
     error: rootReadable ? null : "根目录不可读（readdir 失败），本轮结果不可用于判缺",
     finished_at: now(),
   });

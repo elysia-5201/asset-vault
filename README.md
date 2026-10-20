@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-578%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-633%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -44,6 +44,9 @@
 | **资源限制与降级** | 单包大小/条目数/嵌套层数/单条目字节/图片像素/压缩比/超时/重试全部可配；超限标 `limited`（保留基础记录），**不冒充完整索引** |
 | **派生缓存** | 目录清单 / unitypackage 结构按「内容身份 + 解析器版本 + 限制指纹」缓存；同内容跨路径复用解析结果，业务身份各自独立；LRU + 过期 + 原子写 |
 | **流水线诊断** | 「作业」面板内「流水线」页签：各队列深度、阶段耗时、缓存命中率、内存、最近失败（可重试/取消）、单任务详情与事件 |
+| **有界发现** | 扫描改为**流式批次**（`walkCandidates.onBatch` + `scan_seen` 清单表）：不再把整棵树的候选路径留在内存；缺失判定改用 SQL `NOT EXISTS`；10 万文件 runner 实测峰值 RSS **323MB** |
+| **租约与围栏** | `jobs` 带 `holder / lease_until / lease_token`：**60s 租约 + 15s 心跳**，进程挂掉后租约过期可被接管；旧持有者的迟到写入直接 `LEASE_LOST`（409），绝不覆盖新持有者 |
+| **事件保留** | 作业 / 流水线事件按**天数 + 条数**双上限自动裁剪（默认 30 天/10 万行、14 天/20 万行，每 10min 一轮）；只删终态任务事件，**失败与在飞事件受保护**；不自动 `VACUUM` |
 | **扫描变更中心** | 扫描先出**可确认的清单**（新增 / 未变 / 已变化 / 缺失 / 疑似重复 / 不可读 / 错误），逐条勾选后**才**应用；应用前逐条重验 size+mtime，文件变了就标 stale 拒绝写库；只做登记/重新索引/确认缺失，**不移动、不删除源文件，也不自动合并重复项** |
 | **收件箱监听** | 把 IDM / 浏览器下载目录设为收件箱，新落盘的 zip/7z/rar/unitypackage **自动建档入库**（chokidar + awaitWriteFinish，3 秒静默触发） |
 | **真导入 Unity** | 详情页「导入到 Unity 工程」：探测**当前打开的那个编辑器**（mcp-for-unity），列出条目里所有 `.unitypackage`（压缩包内的、zip 套 zip 的也算）→ 按当前工程的 avatar **自动预选** → `AssetDatabase.ImportPackage(path,false)` 真导入；导入前清控制台、导入后回读报错 |
@@ -106,8 +109,8 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（578 用例 / 91 套件；真实素材 fixture 需环境变量，未设则 SKIP）
-node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v5）
+node scripts/test.mjs            # 全仓单测（656 用例：633 pass / 0 fail / 22 skip / 1 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v6）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
 node --import tsx scripts/acceptance-categories.mjs   # 物品分类端到端（21 项：迁移/保护/筛选/统计/批量/阈值）
@@ -213,7 +216,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - 失败可「重试失败项」；已成功的条目不会被重复写。预览 24h 过期（过期只能重新扫描）。
 - 安全性：不移动/删除源文件；疑似重复只提示不合并；预览删除只删清单记录。详见 `docs/scan-preview.md`。
 
-### 9. 后台索引流水线（v0.6.0）
+### 9. 后台索引流水线（v0.6.0 → v0.6.1）
 
 - 扫描 / 应用 / 导入作业只做「发现 → 基础建档 → 入队」，深度解析交给后台流水线；
   作业可配置有界等待（默认 8s），大包没跑完也不会阻塞后续小文件。
@@ -222,10 +225,19 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - 任务状态：`queued / running / done / skipped / waiting_retry / failed / cancelled`。
   指数退避自动重试；退避到期由 worker 定时提升回队列（不需要重启）。
 - 取消：哈希按块、归档按条目、upkg 按 tar 条目检查；取消不回滚已完成的基础建档（部分完成是合法状态）。
-- 崩溃恢复：启动时 `running → queued`、到期重试 → `queued`，并写 `pipeline_events`；
-  同一作业反复崩溃 3 次会被放弃，避免无限重启循环。
-- **单写入者锁**：`data/pipeline.lock`。CLI 与桌面版同时开时，只有一个实例跑流水线，避免互相抢任务。
+- 崩溃恢复：流水线任务启动时 `running → queued`、到期重试 → `queued`，并写 `pipeline_events`；
+  同一作业反复崩溃 3 次会被放弃，避免无限重启循环。**作业（`jobs`）级的恢复改为租约过期接管**（见下「租约与围栏」）。
+- **单写入者锁**：`data/pipeline.lock`。CLI 与桌面版同时开时，只有一个实例跑**流水线与作业执行**
+  （没抢到锁的实例只提供 HTTP），避免互相抢任务。
 - 淘汰：缓存默认 2GB / 30 天；`POST /api/pipeline/gc` 可手动回收（只动 `data/cache`，绝不碰素材）。
+- **有界发现（v0.6.1）**：扫描不再保留全量候选（`walkCandidates.onBatch` 流式 + `scan_seen` 清单表），
+  缺失靠 SQL `NOT EXISTS` 判定；入队按批走背压闸门，10 万文件 runner 实测峰值 RSS 323MB。
+- **租约与围栏（v0.6.1）**：`jobs` 带 `holder / lease_until / lease_token`（60s 租约 + 15s 心跳）。
+  过期作业可被接管；旧持有者的迟到写入返回 `LEASE_LOST`，不会把新持有者的状态覆盖回去。
+  runner 只在拿到 `data/pipeline.lock` 时启动（CLI 与桌面版同时开也只跑一份）。
+- **事件保留（v0.6.1）**：`job_events` / `pipeline_events` 按「天数 + 条数」双上限自动裁剪
+  （默认 30 天/10 万 + 14 天/20 万，每 10min 一轮），只删终态任务的事件；失败与在飞事件受保护。
+  详见 `docs/pipeline-v06.md` §9.1。
 
 完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**。
 
@@ -245,7 +257,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 578 用例（分类 + 扫描变更中心 + 流水线）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs` |
+| 质检 | `node:test` 656 用例（633 pass / 0 fail / 22 skip / 1 todo；分类 + 扫描变更中心 + 流水线）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs` |
 
 ### 打包与迁移踩坑（留档）
 
@@ -274,7 +286,7 @@ asset-vault/
 ├─ apps/server/src/          # Fastify + SQLite + 作业执行器
 │   ├─ db/                   # schema.sql / migrate / repo / seed
 │   ├─ jobs/runner.ts        # 状态机驱动 + worker
-│   ├─ services/pipeline/    # v0.6.0：limits / queue / cache / stages / pipeline / lock
+│   ├─ services/pipeline/    # limits / queue / cache / stages / pipeline / lock（v0.6.0 建，v0.6.1 加固）
 │   ├─ services/             # booth / scan / scanpreview / indexing / match / categories / updates / media / download / unity
 │   └─ http/routes.ts        # HTTP API（契约见 docs/api.md）
 ├─ apps/web/                 # React 19 + Vite（头像轨 / 网格 / 详情 / 包内树 / 作业 / 导入）
@@ -291,6 +303,8 @@ asset-vault/
 `jobs` / `job_events` · `source_snapshots` / `updates` · `scan_previews` / `scan_preview_items` / `scan_preview_errors` / `scan_apply_runs`（扫描变更中心）·
 `index_tasks` / `pipeline_events` / `cache_entries`（v0.6.0 流水线与派生缓存）· `settings` / `audit_log` + `items_fts`（FTS5 trigram）。
 `assets` 另有 `index_state` / `index_error` / `indexed_at` / `content_version` 四个深度索引列。
+`jobs` 另有 `holder` / `lease_until` / `lease_token` / `heartbeat_at`（schema v6 租约围栏）；
+`cache_entries` 另有 `weak`（强键/弱键标记）。
 不物理删除（`status` 软删）。
 
 ---
@@ -337,10 +351,7 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - [ ] 超大包（>500MB）解析进度反馈
 - [ ] 分类规则继续扩词（现在以日/中/英常见说法为主）并用真实库做阈值校准（当前 24 条实测：自动 16 / 建议 6 / 留空 2）
 - [ ] 扫描变更中心：大目录的生成进度（现在是作业 + 轮询，没有细粒度百分比）
-- [ ] 发现阶段接入 `walkCandidates.onBatch` 流式登记（现在仍保留全量 `filesOut`，上限 2 万）
 - [ ] 7z / rar 内嵌图也抽缩略图（当前只抽 zip 与 unitypackage；与 0.5.1 产品口径一致）
-- [ ] 作业事件 / 流水线事件的保留策略（按天归档，避免长跑库无限增长）
-- [ ] jobs 的租约（lease/heartbeat）与跨进程取消（当前流水线用 `data/pipeline.lock` 做单写入者）
 - [ ] 扫描变更中心：撤销已应用（现在只能手工回滚；apply 不动源文件，所以代价低）
 - [ ] 「全库重新生成分类建议」的 UI 入口（后端 `POST /api/categories/reclassify` 支持 `all`/`onlyUncategorized`，现在界面只做了条目级与选中批量）
 - [ ] 自动分类的证据再吃一路「zip 内层 unitypackage 路径」（现在只读已缓存的包清单，避免拖慢热路径）
@@ -361,9 +372,9 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - **分类树里的「其他 › 未分类」≠ 未分类**：前者是人工显式选择的一个分类，后者是 `cat_id` 为空（筛「只看未分类」筛的是后者）。
 - **头像表是白名单**：不在表里的模型不会被匹配（显示为 `?`），需要手动补名字/别名。
 - **`data/unity-staging/` 会累积**：可以随时整个删掉（只是缓存）；`data/cache/` 由流水线按 LRU/过期自动回收。
-- **首轮目录缓存可能是弱身份**：哈希与目录解析并行，archive 先完成时只有 `size:mtime` 身份；第二轮起走 sha256 键。
+- **首轮目录缓存可能是弱身份**：哈希与目录解析并行，archive 先完成时只有 `assetId + path_norm + size:mtime [+ ino/dev]` 身份（v0.6.1 起弱键带资产与路径，不会跨文件串键）；第二轮起才走 sha256 键。
 - **sharp 解码不可硬中断**：取消是"立即返回 + 后台解码自然结束"；要硬停需进程/线程隔离。
-- **超大目录（>2 万候选）仍会截断**：需要多轮扫描 + 增量应用（扫描预览会明确标 truncated）。
+- **超大目录仍受 `maxScanFiles`（默认 2 万）限制**：超出会截断，需要多轮扫描 + 增量应用（扫描预览会明确标 truncated）；v0.6.1 起发现是流式的，内存不再随候选数线性增长（10 万文件 runner 实测 RSS 323MB）。
 
 ---
 

@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/src/categories/taxonomy";
 
-/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心；v5=深度索引流水线/派生缓存 */
-export const SCHEMA_VERSION = 5;
+/** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心；v5=深度索引流水线/派生缓存；
+ *  v6=jobs 租约/心跳列（辅助元数据，不改状态机）+ cache_entries.weak（缓存弱身份标记） */
+export const SCHEMA_VERSION = 6;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 
@@ -33,6 +34,13 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   { table: "assets", column: "index_error", ddl: "TEXT" },
   { table: "assets", column: "indexed_at", ddl: "TEXT" },
   { table: "assets", column: "content_version", ddl: "TEXT" },
+  // v6：jobs 租约/心跳（只加列，不改状态机；旧代码可忽略这些列 → 回滚只需回滚代码）
+  { table: "jobs", column: "holder", ddl: "TEXT" },
+  { table: "jobs", column: "lease_until", ddl: "TEXT" },
+  { table: "jobs", column: "lease_token", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "jobs", column: "heartbeat_at", ddl: "TEXT" },
+  // v6：cache_entries.weak（派生缓存弱身份标记；旧库补列后默认 0=强身份，语义不变）
+  { table: "cache_entries", column: "weak", ddl: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 function tableColumns(db: Database.Database, table: string): Set<string> {

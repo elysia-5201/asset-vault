@@ -25,9 +25,9 @@ import { SAMPLES, buildZip, cleanup, has, PNG_1x1, tmpDir } from "./fixtures";
 // ---------------------------------------------------------------- 解析器版本
 
 test("解析器版本导出：HASH/ARCHIVE/UNITYPACKAGE 都是 2（缓存键依赖它，改动必须 +1）", () => {
-  assert.equal(HASH_VERSION, 2);
-  assert.equal(ARCHIVE_PARSER_VERSION, 2);
-  assert.equal(UNITYPACKAGE_PARSER_VERSION, 2);
+  assert.equal(HASH_VERSION, 3);
+  assert.equal(ARCHIVE_PARSER_VERSION, 3);
+  assert.equal(UNITYPACKAGE_PARSER_VERSION, 3);
 });
 
 // ---------------------------------------------------------------- safeEntryPath

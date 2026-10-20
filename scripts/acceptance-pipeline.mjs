@@ -3,7 +3,7 @@
  * v0.6.0 流水线验收（可重复运行，不需要启动 HTTP 服务）
  *
  * 覆盖：阶段链/依赖、基础建档与深度解析解耦、目录与缩略图、哈希身份、缓存命中、
- *       超限降级（limited）、损坏包失败降级、取消、stale 重建、单写入者锁、schema v5 迁移。
+ *       超限降级（limited）、损坏包失败降级、取消、stale 重建、单写入者锁、schema 版本与三表存在。
  *
  *   node --import tsx scripts/acceptance-pipeline.mjs
  *   node --import tsx scripts/acceptance-pipeline.mjs --keep
@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { openDatabase } from "../apps/server/src/db/migrate.ts";
+import { openDatabase, SCHEMA_VERSION } from "../apps/server/src/db/migrate.ts";
 import { Repo } from "../apps/server/src/db/repo.ts";
 import { MediaStore } from "../apps/server/src/services/media.ts";
 import { DerivedCache, cacheKey } from "../apps/server/src/services/pipeline/cache.ts";
@@ -72,7 +72,8 @@ for (const plan of plans) {
   const item = repo.createItem({ title: plan.title, source_site: "local", status: "inbox" });
   for (const a of plan.assets) {
     const reg = registerAssets(repo, rootId, LIB, item.id, a.file, "scan");
-    assets[a.file.path.split("/").pop()] = { id: reg.id, itemId: item.id };
+    // F1（Windows）：walkCandidates 在 Windows 返回反斜杠路径；split("/") 取不到文件名 → 用跨平台分隔符切分。
+    assets[String(a.file.path).split(/[\\/]/).pop()] = { id: reg.id, itemId: item.id };
   }
 }
 
@@ -172,8 +173,8 @@ const k1 = cacheKey({ kind: "archive-listing", identity: "sha256:aa", versionKey
 const k2 = cacheKey({ kind: "archive-listing", identity: "sha256:aa", versionKey: "v1", limitsHash: limitsHash(resolveLimits({ ...limits, maxArchiveEntries: 2 })) });
 check("限制变化 ⇒ 缓存键变化", k1 !== k2);
 
-console.log("\n[10] schema v5");
-check("schema_meta.version=5", String(db.prepare("SELECT value v FROM schema_meta WHERE key='version'").get()?.v) === "5");
+console.log("\n[10] schema v" + SCHEMA_VERSION);
+check("schema_meta.version=" + SCHEMA_VERSION, String(db.prepare("SELECT value v FROM schema_meta WHERE key='version'").get()?.v) === String(SCHEMA_VERSION));
 for (const t of ["index_tasks", "pipeline_events", "cache_entries"]) {
   check("表存在: " + t, !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(t));
 }

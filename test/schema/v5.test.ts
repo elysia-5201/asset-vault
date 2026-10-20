@@ -1,6 +1,7 @@
 /**
  * schema v5 契约测试（verifier）
- * 覆盖：SCHEMA_VERSION=5、index_tasks / pipeline_events / cache_entries 三表与索引、
+ * 覆盖：SCHEMA_VERSION >= 5（v6 起跟随实际版本，v5 的表/列语义在本文件内仍全部断言）、
+ *       index_tasks / pipeline_events / cache_entries 三表与索引、
  *       assets 四个新列与默认值、唯一活跃任务索引、FK 级联、诊断事件保留、
  *       以及"v4 旧库 → openDatabase → v5"的实迁移（数据不丢、幂等）。
  * 实现：apps/server/src/db/schema.sql + migrate.ts（不改实现）
@@ -20,8 +21,8 @@ const hasTable = (db: any, name: string): boolean => !!db.prepare("SELECT 1 FROM
 const hasIndex = (db: any, name: string): boolean => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(name);
 
 describe("SCHEMA_VERSION 与表结构", () => {
-  test("SCHEMA_VERSION = 5", () => {
-    assert.equal(SCHEMA_VERSION, 5);
+  test("SCHEMA_VERSION >= 5（当前 " + SCHEMA_VERSION + "）", () => {
+    assert.ok(SCHEMA_VERSION >= 5);
   });
 
   test("三张新表 + 关键索引存在", () => {
@@ -147,10 +148,10 @@ describe("迁移：v4 旧库 → v5（真实 openDatabase）", () => {
   const dir = mkdtempSync(join(tmpdir(), "av-v5-mig-"));
   const file = join(dir, "vault.db");
 
-  test("新库首开：version=5 且三表/四列齐备", () => {
+  test("新库首开：version=SCHEMA_VERSION 且三表/四列齐备", () => {
     const db = openDatabase(file);
     try {
-      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), "5");
+      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), String(SCHEMA_VERSION));
       for (const tb of ["index_tasks", "pipeline_events", "cache_entries"]) assert.ok(hasTable(db, tb));
       assert.deepEqual(applyColumnMigrations(db), [], "新库不应再有列需要补");
     } finally { db.close(); }
@@ -172,7 +173,7 @@ describe("迁移：v4 旧库 → v5（真实 openDatabase）", () => {
 
     db = openDatabase(file); // ← 迁移在这里发生
     try {
-      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), "5");
+      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), String(SCHEMA_VERSION));
       for (const tb of ["index_tasks", "pipeline_events", "cache_entries"]) assert.ok(hasTable(db, tb), "迁移后缺表 " + tb);
       for (const col of ["index_state", "index_error", "indexed_at", "content_version"]) assert.ok(cols(db, "assets").includes(col), "迁移后缺列 " + col);
       assert.deepEqual({ items: count(db, "items"), assets: count(db, "assets") }, before, "迁移不得丢数据");
@@ -185,7 +186,7 @@ describe("迁移：v4 旧库 → v5（真实 openDatabase）", () => {
     // 第三次打开：完全幂等
     db = openDatabase(file);
     try {
-      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), "5");
+      assert.equal(String((db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value), String(SCHEMA_VERSION));
       assert.deepEqual(applyColumnMigrations(db), []);
       assert.equal(count(db, "assets"), before.assets);
     } finally { db.close(); rmSync(dir, { recursive: true, force: true }); }

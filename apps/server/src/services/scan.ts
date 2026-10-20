@@ -37,16 +37,65 @@ export interface ScanStats {
   readability: ScanReadability;
   /** 本轮是否"完整可信"：未截断 + 无读取错误 + 根目录可读。false ⇒ 不得据此批量判缺。 */
   complete: boolean;
+  /** 调用方传入的扫描清单（原样回传，便于消费方在同一对象上断言/判缺）；未传则 undefined。 */
+  manifest?: ScanManifest;
 }
 
-/** 单批回调看到的累计计数（不是本批增量）。 */
-export interface WalkBatchStats { files: number; dirs: number; bytes: number; truncated: boolean }
+/**
+ * 扫描清单：把"本轮见过哪些 path_norm"从内存数组/Set 里搬出去（v0.6.1-A）。
+ *
+ * 语义契约（消费方实现/使用时必须遵守）：
+ *  - 记录的是**已提交批次的候选**：onBatch 模式下在批边界写入；中止时未提交批次里的条目**不写**
+ *    （那批没有被消费方接受，重放会重新看到它们）。
+ *  - 判缺 = 库内 present 资产 − 清单（等价于旧实现的 seen Set）；missingWriteGate 仍然照旧把关。
+ *  - path_norm 由 walk 内部归一化后再写入（调用方不必自己 normalize）。
+ *  - 默认实现是内存 Set（createMemoryManifest，2 万条约 4.2MB）；生产建议换 SQLite TEMP 表实现（免迁移）。
+ */
+export interface ScanManifest {
+  /** 记录一条（幂等）。 */
+  add(pathNorm: string): void;
+  /** 批量记录（批边界调用一次；实现可一次 INSERT 多行）。 */
+  addMany(pathNorms: string[]): void;
+  /** 已记录条数（诊断用，必须与实际写入行数一致）。 */
+  readonly size: number;
+  /** 是否已记录（消费方断言/自测用；TEMP 表实现用 SELECT 1）。 */
+  has(pathNorm: string): boolean;
+  /** 本轮收尾（可选）：完整且未截断时调用，供落盘清单刷盘/提交。 */
+  finish?(stats: { files: number; truncated: boolean; complete: boolean }): void;
+}
+
+/** 默认清单实现：内存 Set。只适合调用方明确接受该内存成本时使用。 */
+export function createMemoryManifest(): ScanManifest {
+  const set = new Set<string>();
+  return {
+    add(pathNorm: string): void { if (pathNorm) set.add(pathNorm); },
+    addMany(pathNorms: string[]): void { for (const p of pathNorms) if (p) set.add(p); },
+    get size(): number { return set.size; },
+    has(pathNorm: string): boolean { return set.has(pathNorm); },
+  };
+}
+
+/**
+ * 单批回调看到的累计计数（不是本批增量）与批次标识。
+ * batch 从 1 起；batchFiles 是本批条数（= files[n] - files[n-1]），便于消费方做幂等键与诊断。
+ */
+export interface WalkBatchStats {
+  files: number; dirs: number; bytes: number; truncated: boolean;
+  /** 第几批（1 起）。 */
+  batch: number;
+  /** 本批条数。 */
+  batchFiles: number;
+}
 
 /**
  * v0.6.0 阶段 A：有界批次/流式遍历参数（向后兼容：不传 onBatch 时行为与旧版完全一致）。
  *  - batchSize   每批最多多少条 ScannedFile（默认 500）
  *  - onBatch     逐批回调（可以是 async）；**传入时 filesOut 恒为空数组**以省内存
  *  - signal      每批开始 + 每 256 个目录项检查一次；已中止 → 抛 code="CANCELLED"
+ *
+ * v0.6.1-A 新增：
+ *  - manifest    扫描清单（可选）。传入时逐批写入 path_norm，消费方不必再保留全量 filesOut 去算 seen；
+ *                只在候选入批时写，不改变 filesOut / truncated / errors 任何既有语义。
  */
 export interface WalkOptions {
   maxDepth?: number;
@@ -54,6 +103,64 @@ export interface WalkOptions {
   signal?: AbortSignal;
   batchSize?: number;
   onBatch?: (files: ScannedFile[], stats: WalkBatchStats) => Promise<void> | void;
+  manifest?: ScanManifest;
+}
+
+/**
+ * 背压闸门（v0.6.1-A）：在批次边界检查下游队列深度，超 highWater 时等待，降到 lowWater 以下继续。
+ * 纯函数式（depth/sleep 都可注入），不依赖 DB，便于单测；由消费方在每批开始时 await gate.wait()。
+ *
+ * 语义：
+ *  - depth() <= highWater             → 立即放行 { waited:false, throttled:false }
+ *  - depth() >  highWater             → 每 pollMs 重新探一次，直到 depth() <= lowWater
+ *  - 等待超过 maxWaitMs               → 放行但 throttled=true（调用方决定记事件/继续；绝不静默卡死）
+ *  - signal 中止                      → 抛 code="CANCELLED"（与 walk 的取消语义一致）
+ */
+export interface BackpressureGateOptions {
+  /** 读取下游积压深度（如 index_tasks 的 queued 计数）；可 async。 */
+  depth: () => number | Promise<number>;
+  /** 超过它就开始等。 */
+  highWater: number;
+  /** 降到它（含）以下才继续。 */
+  lowWater: number;
+  signal?: AbortSignal;
+  /** 轮询间隔（默认 200ms）。 */
+  pollMs?: number;
+  /** 最长等待（默认 30000ms）；0 = 不限制。 */
+  maxWaitMs?: number;
+  /** 注入 sleep（测试用虚拟时钟）。 */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface BackpressureGateResult { waited: boolean; waitedMs: number; throttled: boolean; depth: number }
+
+export interface BackpressureGate {
+  wait(): Promise<BackpressureGateResult>;
+}
+
+export function createBackpressureGate(opts: BackpressureGateOptions): BackpressureGate {
+  const pollMs = Math.max(1, Math.floor(opts.pollMs ?? 200));
+  const maxWaitMs = Math.max(0, Math.floor(opts.maxWaitMs ?? 30000));
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  return {
+    async wait(): Promise<BackpressureGateResult> {
+      if (opts.signal?.aborted) throw walkCancelledError();
+      let d = Number(await opts.depth());
+      if (!Number.isFinite(d)) d = 0;
+      if (d <= opts.highWater) return { waited: false, waitedMs: 0, throttled: false, depth: d };
+      let waitedMs = 0;
+      for (;;) {
+        if (opts.signal?.aborted) throw walkCancelledError();
+        if (maxWaitMs > 0 && waitedMs >= maxWaitMs) return { waited: true, waitedMs, throttled: true, depth: d };
+        await sleep(pollMs);
+        waitedMs += pollMs;
+        if (opts.signal?.aborted) throw walkCancelledError();
+        d = Number(await opts.depth());
+        if (!Number.isFinite(d)) d = 0;
+        if (d <= opts.lowWater) return { waited: true, waitedMs, throttled: false, depth: d };
+      }
+    },
+  };
 }
 
 /** errors 明细保留上限（坏盘/大目录不至于撑爆内存与日志）；errorCount 仍记真值。 */
@@ -124,16 +231,28 @@ export async function walkCandidates(rootPath: string, opts: WalkOptions = {}): 
   const errors: ScanIssue[] = [];
   const readability: ScanReadability = { rootReadable: false, dirsRead: 0, dirsFailed: 0, entriesStatFailed: 0 };
   let files = 0, dirs = 0, bytes = 0, truncated = false, sinceYield = 0, errorCount = 0;
+  /** 已提交批次数（1 起递增，供 WalkBatchStats.batch 使用）。 */
+  let batchNo = 0;
   const noteError = (path: string, op: ScanIssue["op"], e: unknown): void => {
     errorCount++;
     if (errors.length < MAX_SCAN_ISSUES) errors.push({ path, op, code: errCode(e), message: String((e as Error | null)?.message ?? e) });
   };
   let batch: ScannedFile[] = [];
+  /** 清单待写缓冲：只在"批已提交"（onBatch 成功返回）后落账，中止/抛错的批次不记。 */
+  let manifestPending: string[] = [];
+  const flushManifest = (): void => {
+    if (!opts.manifest || manifestPending.length === 0) return;
+    const b = manifestPending;
+    manifestPending = [];
+    opts.manifest.addMany(b);
+  };
   const flushBatch = async (): Promise<void> => {
     if (!streaming || batch.length === 0) return;
     const b = batch;
     batch = [];
-    await opts.onBatch!(b, { files, dirs, bytes, truncated });
+    await opts.onBatch!(b, { files, dirs, bytes, truncated, batch: batchNo + 1, batchFiles: b.length });
+    batchNo++;
+    flushManifest(); // 批提交成功后才记清单（中止/失败批次不记）
     await new Promise<void>((r) => setImmediate(r));
   };
   const makeStats = (): ScanStats => ({
@@ -141,6 +260,7 @@ export async function walkCandidates(rootPath: string, opts: WalkOptions = {}): 
     filesOut: streaming ? [] : out,
     truncated, errors, errorCount, readability,
     complete: !truncated && errorCount === 0 && readability.rootReadable,
+    manifest: opts.manifest,
   });
 
   // 根不是目录：等价于旧版 readdirSync 抛 ENOTDIR（记 readdir 错误后返回，绝不静默当成空树）。
@@ -189,11 +309,14 @@ export async function walkCandidates(rootPath: string, opts: WalkOptions = {}): 
       kind: ext === ".unitypackage" ? "unitypackage" : "archive",
     };
     files++; bytes += st.size;
+    if (opts.manifest) manifestPending.push(normalizePath(item.path));
     if (streaming) {
       batch.push(sf);
       if (batch.length >= batchSize) await flushBatch();
     } else {
       out.push(sf);
+      // 非流式模式没有"批提交"概念：每凑够一批就落账，避免清单缓冲本身变成无界数组
+      if (manifestPending.length >= batchSize) flushManifest();
       if (++sinceYield >= 200) { sinceYield = 0; await new Promise<void>((r) => setImmediate(r)); }
     }
     if (++entriesSinceCheck >= ABORT_CHECK_EVERY) {
@@ -204,7 +327,13 @@ export async function walkCandidates(rootPath: string, opts: WalkOptions = {}): 
   // 收尾：把不足一批的尾巴交出去（中止优先，不把"取消前的一瞬"当成功）
   if (signal?.aborted) throw walkCancelledError();
   await flushBatch();
-  return makeStats();
+  flushManifest();
+  const stats = makeStats();
+  // 只有"完整可信"的一轮才通知清单收尾（落盘清单可据此刷盘/提交；不完整的一轮不得当作判缺依据）
+  if (opts.manifest && stats.complete && typeof opts.manifest.finish === "function") {
+    opts.manifest.finish({ files: stats.files, truncated: stats.truncated, complete: stats.complete });
+  }
+  return stats;
 }
 
 export interface ScanPlanItem {

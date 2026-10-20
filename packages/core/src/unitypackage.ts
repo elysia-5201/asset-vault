@@ -29,8 +29,8 @@ import { LimitError, normalizeLimit, type ListingLimit } from "./limits";
 export const DEFAULT_MAX_ASSETS = 10000;
 /** preview.png 读取上限（防止畸形包把 preview 写成 GB 级）。 */
 export const DEFAULT_MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
-/** 解析器语义版本（流水线缓存键用）。 */
-export const UNITYPACKAGE_PARSER_VERSION = 2;
+/** 解析器语义版本（流水线缓存键用）。v0.6.1-B 缓存身份语义变更 → 3 */
+export const UNITYPACKAGE_PARSER_VERSION = 3;
 const READ_CHUNK = 1 << 20;
 const TAR_BLOCK = 512;
 

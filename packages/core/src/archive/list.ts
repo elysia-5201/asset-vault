@@ -43,8 +43,8 @@ import { listFromScan, nameScore, readZipEntryFromCentralDirectory, scanZipCentr
 
 const require_ = createRequire(import.meta.url);
 
-/** 解析器语义版本：限制/输出语义变化时 +1（流水线缓存键用它，避免旧缓存混入新语义）。 */
-export const ARCHIVE_PARSER_VERSION = 2;
+/** 解析器语义版本：限制/输出语义变化时 +1（流水线缓存键用它，避免旧缓存混入新语义）。v0.6.1-B 缓存身份语义变更 → 3 */
+export const ARCHIVE_PARSER_VERSION = 3;
 
 /** 单条目读取的默认字节上限（64 MiB）：超过即抛 LimitError(code="BYTES")，绝不 OOM。 */
 export const DEFAULT_MAX_ENTRY_BYTES = 64 * 1024 * 1024;

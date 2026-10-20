@@ -89,7 +89,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
 
   let app: FastifyInstance | null = null;
   const watcher = new InboxWatcher(repo, log);
-  const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined });
+  const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined, limits });
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
@@ -113,7 +113,9 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     const host = opts.host ?? process.env.HOST ?? "127.0.0.1";
     await fastify.listen({ port, host });
     app = fastify;
-    runner.start(400);
+    // v6 租约：只有取得单写入者锁的实例才跑 jobs。未取得锁的实例只提供 HTTP 接口，
+    // 否则两个进程会同时领取/接管作业（recoverInFlight 本来就在 lock 分支内）。
+    if (lock.acquired) runner.start(400);
     pipeline?.start();
     watcher.sync();
     log("AssetVault up on http://" + host + ":" + port + " (db=" + dbPath + ", seeded=" + seeded + ", recovered=" + recovered + ")");

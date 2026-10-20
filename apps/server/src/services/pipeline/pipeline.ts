@@ -11,7 +11,7 @@
  * 状态语义固定为 queued / running / done / skipped / waiting_retry / failed / cancelled。
  */
 import type { AssetRow } from "../../../../../packages/core/src/contracts";
-import type { Repo } from "../../db/repo";
+import type { EventRetentionState, Repo } from "../../db/repo";
 import type { MediaStore } from "../media";
 import { DerivedCache } from "./cache";
 import type { PipelineLimits } from "./limits";
@@ -63,7 +63,10 @@ export class IndexPipeline {
   private progress = new Map<number, ProgressPatch>();
   private flushTimer: NodeJS.Timeout | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
-  private sleepers = new Set<() => void>();
+  private retentionTimer: NodeJS.Timeout | null = null;
+  private retentionInitial: NodeJS.Timeout | null = null;
+  /** 按阶段分组的空闲唤醒集合（task-17 #1）：notify 只唤醒相关阶段，不再全局广播。 */
+  private sleepers = new Map<Stage, Set<() => void>>();
   private processed = 0;
   private failures = 0;
   private lastError: PipelineStats["lastError"] = null;
@@ -93,6 +96,12 @@ export class IndexPipeline {
       } catch { /* 下一轮再试 */ }
     }, 1000);
     this.retryTimer.unref?.();
+    // 事件保留（task-13）：启动 5s 后首跑，此后默认每 10min 一轮；只删事件表、不阻塞索引 worker。
+    const retentionMs = positiveInt(process.env.ASSETVAULT_EVENT_RETENTION_MS, 10 * 60_000);
+    this.retentionInitial = setTimeout(() => { void this.runRetention(); }, 5_000);
+    this.retentionInitial.unref?.();
+    this.retentionTimer = setInterval(() => { void this.runRetention(); }, retentionMs);
+    this.retentionTimer.unref?.();
   }
 
   async stop(): Promise<void> {
@@ -101,6 +110,8 @@ export class IndexPipeline {
     this.controllers.clear();
     if (this.flushTimer) { clearInterval(this.flushTimer); this.flushTimer = null; }
     if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
+    if (this.retentionTimer) { clearInterval(this.retentionTimer); this.retentionTimer = null; }
+    if (this.retentionInitial) { clearTimeout(this.retentionInitial); this.retentionInitial = null; }
     this.notify();
     await Promise.allSettled(this.workers);
     this.workers = [];
@@ -120,7 +131,8 @@ export class IndexPipeline {
         this.flushProgress();
         return true;
       }
-      this.notify();
+      // 不再广播唤醒（task-17 #1）：worker 由 enqueue/任务完成/退避提升按阶段精确唤醒；
+      // drain 只观察计数，每 25ms 的全局唤醒会让所有 worker 空 claim 一次。
       await new Promise((r) => setTimeout(r, pollMs));
     }
     return false;
@@ -133,17 +145,6 @@ export class IndexPipeline {
     if (!asset || asset.status === "trashed") return [];
     const priority = opts.priority ?? 50;
     const fp = fingerprintOf(asset);
-    const ids: number[] = [];
-    const enqueue = (stage: Stage, dependsOn: number | null): number => {
-      const id = this.deps.repo.enqueueIndexTask({
-        assetId: asset.id, itemId: asset.item_id, stage, priority,
-        maxAttempts: this.deps.limits.taskMaxAttempts,
-        dependsOn, fingerprint: fp,
-        versionKey: "v1",
-      });
-      ids.push(id);
-      return id;
-    };
 
     const chain: Stage[] = [];
     if (asset.container === "unitypackage") chain.push("unitypackage", "thumbs");
@@ -152,18 +153,29 @@ export class IndexPipeline {
     chain.push("meta", "categorize", "fts");
 
     // 哈希独立于解包（大包哈希与目录解析可以并行，但各自有独立并发上限）
-    if (chain[0] !== "hash") enqueue("hash", null);
-    let dep: number | null = null;
-    for (const stage of chain) dep = enqueue(stage, dep);
-    this.deps.repo.setAssetIndexState(asset.id, "queued", null);
-    this.notify();
+    const plan: { stage: Stage; dependsOnStage: Stage | null }[] = [];
+    if (chain[0] !== "hash") plan.push({ stage: "hash", dependsOnStage: null });
+    let prev: Stage | null = null;
+    for (const stage of chain) { plan.push({ stage, dependsOnStage: prev }); prev = stage; }
+
+    // v0.6.1 task-17 #4：整链单事务 + 一次去重 SELECT + 同事务写 assets.index_state
+    const ids = this.deps.repo.enqueueIndexTaskChain({
+      assetId: asset.id, itemId: asset.item_id, priority,
+      maxAttempts: this.deps.limits.taskMaxAttempts, fingerprint: fp, versionKey: "v1",
+      stages: plan, assetState: { state: "queued", error: null },
+    });
+    this.notifyStages(new Set(plan.map((p) => p.stage)));
     return ids;
   }
 
   /** 全库/筛选后重建（诊断面板与 CLI 用）。返回入队资产数。 */
   enqueueMany(assetIds: number[], opts: EnqueueOptions = {}): number {
+    // task-20 R1：整批一个事务（内层 chain 通过 transactionIfNeeded 不再叠加 savepoint），
+    // 10 万资产不再产生 10 万次独立提交；已在事务里（扫描批次）时直接复用外层事务。
     let n = 0;
-    for (const id of assetIds) { if (this.enqueueAsset(id, opts).length) n++; }
+    this.deps.repo.transactionIfNeeded(() => {
+      for (const id of assetIds) { if (this.enqueueAsset(id, opts).length) n++; }
+    });
     return n;
   }
 
@@ -244,6 +256,78 @@ export class IndexPipeline {
     };
   }
 
+  // ---------- 事件保留（task-13） ----------
+  /**
+   * 跑一轮事件保留（可重试；绝不抛给定时器）。
+   * 双上限：时间（jobDays/pipelineDays）→ 条数（jobMaxRows/pipelineMaxRows）。
+   * 硬边界：只删终态作业/无活跃任务的诊断事件；可删集合已空仍超条数上限时记录 blocked 并停止，
+   * 绝不为达标而删 failed/活动/待恢复事件。每轮最多 20 个删除批（每批 ≤batchSize，clamp 500）。
+   */
+  async runRetention(): Promise<EventRetentionState> {
+    const repo = this.deps.repo;
+    const prev = repo.getRetentionState();
+    const at = new Date().toISOString();
+    const cfg = repo.getEventRetentionConfig();
+    const state: EventRetentionState = {
+      at, deletedJobEvents: 0, deletedPipelineEvents: 0, batches: 0,
+      error: null, consecutiveFailures: prev?.consecutiveFailures ?? 0,
+      blocked: { job: false, pipeline: false },
+    };
+    const cutoffJob = cfg.jobDays > 0 ? new Date(Date.parse(at) - cfg.jobDays * 86_400_000).toISOString() : null;
+    const cutoffPipe = cfg.pipelineDays > 0 ? new Date(Date.parse(at) - cfg.pipelineDays * 86_400_000).toISOString() : null;
+    try {
+      while (state.batches < RETENTION_MAX_BATCHES) {
+        let did = 0;
+        // 1) 时间上限：终态作业 / 无活跃任务的诊断事件
+        if (cutoffJob) {
+          const n = repo.pruneJobEventsBatch({ cutoff: cutoffJob, limit: cfg.batchSize });
+          if (n > 0) { state.deletedJobEvents += n; state.batches++; did += n; }
+        }
+        if (cutoffPipe) {
+          const n = repo.prunePipelineEventsBatch({ cutoff: cutoffPipe, limit: cfg.batchSize });
+          if (n > 0) { state.deletedPipelineEvents += n; state.batches++; did += n; }
+        }
+        // 2) 条数上限：只从"可删集合"里删；保护优先于达标
+        if (cfg.jobMaxRows > 0) {
+          const prunable = repo.countPrunableJobEvents();
+          const over = prunable - cfg.jobMaxRows;
+          if (over > 0) {
+            const n = repo.pruneJobEventsBatch({ limit: Math.min(cfg.batchSize, over) });
+            if (n > 0) { state.deletedJobEvents += n; state.batches++; did += n; }
+          } else if (repo.countJobEvents() > cfg.jobMaxRows) {
+            state.blocked.job = true;
+          }
+        }
+        if (cfg.pipelineMaxRows > 0) {
+          const prunable = repo.countPrunablePipelineEvents();
+          const over = prunable - cfg.pipelineMaxRows;
+          if (over > 0) {
+            const n = repo.prunePipelineEventsBatch({ limit: Math.min(cfg.batchSize, over) });
+            if (n > 0) { state.deletedPipelineEvents += n; state.batches++; did += n; }
+          } else if (repo.countPipelineEvents() > cfg.pipelineMaxRows) {
+            state.blocked.pipeline = true;
+          }
+        }
+        if (did === 0) break;
+        await new Promise<void>((r) => setImmediate(r)); // 批间让出，不阻塞索引 worker
+      }
+      state.consecutiveFailures = 0;
+      repo.setRetentionState(state);
+      const total = state.deletedJobEvents + state.deletedPipelineEvents;
+      if (total > 0 || state.blocked.job || state.blocked.pipeline) {
+        this.deps.log("event retention: deleted job=" + state.deletedJobEvents + " pipeline=" + state.deletedPipelineEvents +
+          " batches=" + state.batches + (state.blocked.job || state.blocked.pipeline ? " (blocked: protected events exceed row cap, refusing to delete them)" : ""));
+      }
+      return state;
+    } catch (e) {
+      state.error = String((e as Error)?.message ?? e);
+      state.consecutiveFailures = (prev?.consecutiveFailures ?? 0) + 1;
+      try { repo.setRetentionState(state); } catch { /* 记录失败不掩盖原始错误 */ }
+      this.deps.log("event retention failed (" + state.consecutiveFailures + "): " + state.error);
+      return state;
+    }
+  }
+
   // ---------- 内部 ----------
   private concurrencyOf(stage: Stage): number {
     const l = this.deps.limits;
@@ -268,10 +352,10 @@ export class IndexPipeline {
 
   private async loop(stage: Stage): Promise<void> {
     while (!this.stopped) {
-      if (this.paused) { await this.sleep(250); continue; }
+      if (this.paused) { await this.sleep(stage, 250); continue; }
       let task: any = null;
       try { task = this.deps.repo.claimIndexTask(stage); } catch (e) { this.deps.log("pipeline claim error: " + msgOf(e)); }
-      if (!task) { await this.sleep(250); continue; }
+      if (!task) { await this.sleep(stage, 250); continue; }
       try { await this.execute(stage, task); } catch (e) { this.deps.log("pipeline execute crash: " + msgOf(e)); }
     }
   }
@@ -281,7 +365,8 @@ export class IndexPipeline {
     const asset = repo.getAsset(Number(task.asset_id)) as AssetRow | null;
     if (!asset || asset.status === "trashed") {
       repo.finishIndexTask(task.id, "skipped", { errorCode: "ASSET_GONE", error: "asset missing or trashed" }, { requireRunning: true });
-      this.refreshAssetState(Number(task.asset_id));
+      this.maybeRefresh(Number(task.asset_id));
+      this.notifyStages([stage, ...NEXT_STAGES[stage]]);
       return;
     }
     // 前置校验：文件变了 → 本任务作废，整链重建（绝不把旧快照写进新文件）
@@ -290,7 +375,8 @@ export class IndexPipeline {
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "stale", detail: "fingerprint " + task.fingerprint + " != " + fingerprintOf(asset) });
       this.cancelAsset(asset.id);
       this.enqueueAsset(asset.id, { priority: Number(task.priority) || 50 });
-      this.refreshAssetState(asset.id);
+      this.maybeRefresh(asset.id);
+      this.notifyStages([stage, ...NEXT_STAGES[stage]]);
       return;
     }
 
@@ -323,8 +409,9 @@ export class IndexPipeline {
       this.controllers.delete(Number(task.id));
       this.processed++;
       this.stageMetrics.set(stage, { count: (this.stageMetrics.get(stage)?.count ?? 0) + 1, ms: (this.stageMetrics.get(stage)?.ms ?? 0) + (Date.now() - started) });
-      this.refreshAssetState(asset.id);
-      this.notify();
+      // task-17 #1：只唤醒本阶段（同阶段还有排队任务）与直接下游（依赖刚被满足）；
+      // task-17 #3：不再每任务 refresh（改由 complete/fail 的 maybeRefresh 在链尾刷新）。
+      this.notifyStages([stage, ...NEXT_STAGES[stage]]);
     }
   }
 
@@ -334,13 +421,16 @@ export class IndexPipeline {
       repo.finishIndexTask(task.id, "skipped", { errorCode: result.limited.code, error: result.limited.message }, { requireRunning: true });
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "limited", detail: JSON.stringify(result.limited) });
       this.deps.log("pipeline " + stage + " asset " + asset.id + " limited: " + result.limited.message);
+      this.maybeRefresh(asset.id);
       return;
     }
     if (result.skipped) {
       repo.finishIndexTask(task.id, "skipped", { errorCode: "NOT_APPLICABLE", error: result.skipped }, { requireRunning: true });
+      this.maybeRefresh(asset.id);
       return;
     }
     repo.finishIndexTask(task.id, "done", {}, { requireRunning: true });
+    this.maybeRefresh(asset.id);
     if (result.note) this.deps.log("pipeline " + stage + " asset " + asset.id + " ok: " + result.note + " (" + ms + "ms)");
   }
 
@@ -351,6 +441,7 @@ export class IndexPipeline {
     if (code === "CANCELLED" || code === "ABORT_ERR" || (e instanceof CancelledError)) {
       repo.finishIndexTask(task.id, "cancelled", { errorCode: "CANCELLED", error: message }, { requireRunning: true });
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "cancelled", detail: message });
+      this.maybeRefresh(asset.id);
       return;
     }
     this.failures++;
@@ -367,7 +458,18 @@ export class IndexPipeline {
     repo.finishIndexTask(task.id, "failed", { errorCode: code || "ERROR", error: message }, { requireRunning: true });
     repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "failed", detail: message });
     const skipped = repo.skipDependentTasks(task.id, "UPSTREAM_FAILED", "上游阶段失败: " + stage + " — " + message);
+    this.maybeRefresh(asset.id);
     this.deps.log("pipeline " + stage + " asset " + asset.id + " FAILED after " + attempts + " attempt(s): " + message + (skipped ? " (skipped " + skipped + " dependent)" : "") + " (" + ms + "ms)");
+  }
+
+  /**
+   * task-17 #3：每链只刷一次资产索引状态（链尾/失败时）。展示状态最多滞后一个链时长，
+   * 但省掉"每任务一次 refresh + listIndexTasks"的 6 倍固定成本；refresh 本身复用同一 SQL。
+   */
+  private maybeRefresh(assetId: number): void {
+    try {
+      if (this.deps.repo.countActiveIndexTasks([assetId]) === 0) this.refreshAssetState(assetId);
+    } catch { /* 刷新失败不影响任务结果 */ }
   }
 
   private refreshAssetState(assetId: number): void {
@@ -409,10 +511,26 @@ export class IndexPipeline {
     return out;
   }
 
-  private notify(): void { for (const f of [...this.sleepers]) f(); }
+  /** 低频全量唤醒（stop/resume/退避提升/boost/cancel）：必须能把所有 worker 叫醒。 */
+  private notifyAll(): void {
+    for (const set of this.sleepers.values()) for (const f of [...set]) f();
+  }
+  /** 兼容旧调用点（stop/resume 等）；热路径一律用 notifyStages。 */
+  private notify(): void { this.notifyAll(); }
 
-  /** 空闲等待：所有睡着的 worker 共享一个唤醒集合；stop() 必须能把它们全部叫醒（否则 worker 永不结束）。 */
-  private async sleep(ms: number): Promise<void> {
+  /**
+   * 定向唤醒（task-17 #1）：只叫醒这些阶段的空闲 worker。广播会让每任务完成时 8 个 worker
+   * 全部醒来各空 claim 一次（实测 5 次/任务），是固定成本的最大头。
+   */
+  private notifyStages(stages: Iterable<Stage>): void {
+    for (const stage of stages) {
+      const set = this.sleepers.get(stage);
+      if (set) for (const f of [...set]) f();
+    }
+  }
+
+  /** 空闲等待：按阶段登记唤醒函数；stop()/notifyAll 能全部叫醒（否则 worker 永不结束）。 */
+  private async sleep(stage: Stage, ms: number): Promise<void> {
     await new Promise<void>((resolve) => {
       let done = false;
       let t: NodeJS.Timeout;
@@ -420,14 +538,36 @@ export class IndexPipeline {
         if (done) return;
         done = true;
         clearTimeout(t);
-        this.sleepers.delete(finish);
+        const set = this.sleepers.get(stage);
+        set?.delete(finish);
+        if (set && set.size === 0) this.sleepers.delete(stage);
         resolve();
       };
       t = setTimeout(finish, ms);
       t.unref?.();
-      this.sleepers.add(finish);
+      let set = this.sleepers.get(stage);
+      if (!set) { set = new Set(); this.sleepers.set(stage, set); }
+      set.add(finish);
     });
   }
+}
+
+/** 阶段完成/失败后，下一个可能变为可领取的直接下游阶段（与 enqueueAsset 的链构造一致）。 */
+const NEXT_STAGES: Record<Stage, readonly Stage[]> = {
+  hash: [],
+  archive: ["thumbs"],
+  unitypackage: ["thumbs"],
+  thumbs: ["meta"],
+  meta: ["categorize"],
+  categorize: ["fts"],
+  fts: [],
+};
+
+const RETENTION_MAX_BATCHES = 20;
+
+function positiveInt(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
 function msgOf(e: unknown): string {

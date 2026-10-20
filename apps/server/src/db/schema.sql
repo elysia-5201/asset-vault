@@ -244,11 +244,16 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempts INTEGER NOT NULL DEFAULT 0,
   priority INTEGER NOT NULL DEFAULT 0,
   error TEXT,
-  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+  -- v6 租约/心跳：只是 jobs 状态机的**辅助元数据**，不新增状态、不改变转移表。
+  -- holder=实例身份（host#pid#rand）；lease_until=租约到期（ISO UTC，NULL=旧库未领取）；
+  -- lease_token=fencing token（每次领取/接管+1，旧持有者的迟到写入按它被 CAS 拒绝）；heartbeat_at=最近一次续租。
+  holder TEXT, lease_until TEXT, lease_token INTEGER NOT NULL DEFAULT 0, heartbeat_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_inflight ON jobs(item_id, kind)
   WHERE item_id IS NOT NULL AND state IN ('queued','resolving','fetching','materializing','indexing','matching','releasing','releasing_done','paused');
 CREATE INDEX IF NOT EXISTS ix_jobs_state ON jobs(state, priority DESC, id);
+CREATE INDEX IF NOT EXISTS ix_jobs_lease ON jobs(state, lease_until);
 
 CREATE TABLE IF NOT EXISTS job_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -415,6 +420,8 @@ CREATE TABLE IF NOT EXISTS cache_entries (
   bytes INTEGER NOT NULL DEFAULT 0,
   hits INTEGER NOT NULL DEFAULT 0,
   state TEXT NOT NULL DEFAULT 'ready',
+  -- v6：weak=身份来自 size/mtime 的弱候选（内容未必相同），供缓存诊断/淘汰区分强键与弱键。
+  weak INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   last_used_at TEXT NOT NULL
 );

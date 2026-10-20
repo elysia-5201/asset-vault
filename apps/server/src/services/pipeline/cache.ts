@@ -5,10 +5,12 @@
  * 不是用户数据，也绝不落在素材目录里。
  *
  * 身份键 = kind + 内容身份 + 解析器/规则版本 + 限制指纹：
- *   - 内容身份优先用完整 sha256；没有 sha 时只能用 size:mtime 作为**弱候选**，
- *     调用方必须知道它不等价于"内容相同"（weak=true 会写进 meta，诊断面板可见）。
+ *   - 强身份：完整 sha256，且调用方必须确认"磁盘文件仍是算这个 sha 的那份"（v0.6.1-B：live stat 与行一致）。
+ *   - 弱身份：`weak:<assetId>:<path_norm>:<size>:<mtimeMs>` —— 只用于**同一路径同一文件**的重复解析加速；
+ *     不含路径/资产 id 的旧写法（size:mtime）会让两个不同文件撞同一个键并互相复用错误目录（已修）。
  *   - 解析器版本变了 → 只有该 kind 的键变，缩略图/哈希不受影响。
  *   - 限制参数变了（limitsHash）→ 目录缓存失效，避免用旧上限的结果冒充新上限。
+ *   - 命中校验：调用方可传 expect.contentSha；与条目记录的 content_sha 不符 → 视为脏条目丢弃（防 DB 行被改/撞键）。
  *
  * 写入一律 tmp + rename（原子替换）：写到一半崩溃的临时文件不会被识别为有效缓存。
  */
@@ -39,12 +41,19 @@ export interface CacheMeta {
   kind: string;
   contentSha?: string | null;
   versionKey: string;
+  /** 弱身份（size:mtime 类）标记；写入 cache_entries.weak（列由 v6 迁移加，未迁移时降级为不写）。 */
   weak?: boolean;
 }
 
+/** 命中校验：期望的内容身份（`asset.sha256` 原样）；与条目 content_sha 不符 → drop + miss。 */
+export interface CacheExpect { contentSha?: string }
+
+/** repo.upsertCacheEntry 的入参形状（weak 是 v0.6.1-B 新增的可选字段）。 */
+type CacheUpsertPayload = Parameters<Repo["upsertCacheEntry"]>[0];
+
 /** 流水线只需要这两个能力：读不到就自己算，算完写回。 */
 export interface CacheLike {
-  get<T>(kind: string, key: string): Promise<T | null>;
+  get<T>(kind: string, key: string, expect?: CacheExpect): Promise<T | null>;
   put(kind: string, key: string, value: unknown, meta: CacheMeta): Promise<{ bytes: number }>;
 }
 
@@ -82,13 +91,19 @@ export class DerivedCache implements CacheLike {
     return join(this.dirFor(kind), key.slice(0, 2) + "-" + key + ".json");
   }
 
-  /** 命中返回解析后的值；损坏/缺失一律 null（并清掉坏条目）。 */
-  async get<T>(kind: string, key: string): Promise<T | null> {
+  /** 命中返回解析后的值；损坏/缺失/身份不符一律 null（并清掉坏条目）。 */
+  async get<T>(kind: string, key: string, expect?: CacheExpect): Promise<T | null> {
     this.gets++;
     const entry = this.repo.getCacheEntry(key);
     if (!entry || entry.state !== "ready") return null;
     try {
       if (!existsSync(entry.file_path)) { this.repo.deleteCacheEntry(key); return null; }
+      // 命中校验：条目记录的内容身份与调用方期望不符 → 脏条目（DB 行被改 / 旧实现写入 / 撞键），丢弃重算
+      const stored = entry.content_sha == null ? null : String(entry.content_sha);
+      if (expect?.contentSha !== undefined && stored !== null && stored !== expect.contentSha) {
+        this.drop(key, entry.file_path, "identity-mismatch");
+        return null;
+      }
       const txt = readFileSync(entry.file_path, "utf8");
       const value = JSON.parse(txt) as T;
       this.hits++;
@@ -115,8 +130,15 @@ export class DerivedCache implements CacheLike {
       try { unlinkSync(tmp); } catch { /* ignore */ }
       throw e;
     }
+    const base: CacheUpsertPayload = { key, kind, contentSha: meta.contentSha ?? null, versionKey: meta.versionKey, filePath: file, bytes: Buffer.byteLength(body) };
     try {
-      this.repo.upsertCacheEntry({ key, kind, contentSha: meta.contentSha ?? null, versionKey: meta.versionKey, filePath: file, bytes: Buffer.byteLength(body) });
+      // weak 列由 jobs-dev 的 v6 迁移添加；迁移未落地时降级为不带 weak 写入（诊断字段丢失 ≠ 丢缓存）
+      const withWeak: CacheUpsertPayload & { weak?: boolean } = meta.weak === undefined ? base : { ...base, weak: meta.weak === true };
+      try {
+        this.repo.upsertCacheEntry(withWeak);
+      } catch {
+        this.repo.upsertCacheEntry(base);
+      }
     } catch (e) {
       // DB 失败不能留下无引用孤儿文件（gc 只遍历 DB 条目）
       try { unlinkSync(file); } catch { /* ignore */ }

@@ -54,10 +54,51 @@ export function checkAbort(signal: AbortSignal): void {
   if (signal.aborted) throw new CancelledError(String(signal.reason ?? "cancelled"));
 }
 
-/** 内容身份：有完整 sha256 用强身份；否则 size:mtime 只是**弱候选**（缓存 meta 里标记）。 */
-export function contentIdentity(a: Pick<AssetRow, "sha256" | "sha256_state" | "size" | "mtime">): { identity: string; weak: boolean } {
-  if (a.sha256 && a.sha256_state === "ok") return { identity: "sha256:" + a.sha256, weak: false };
-  return { identity: "weak:" + Number(a.size || 0) + ":" + String(a.mtime ?? ""), weak: true };
+/** 磁盘现状（safeStat 的返回）：身份校验必须看**磁盘**，不能只看 DB 行。 */
+export interface LiveStat { size: number; mtimeMs: number; ino: number; dev: number }
+
+/** mtime 比较容差（ms）：ISO 串是四舍五入、mtimeMs 带亚毫秒小数，实测差 <0.002ms；留 2ms 抗 FS 抖动。 */
+const MTIME_TOLERANCE_MS = 2;
+
+/** DB 行 mtime（ISO 串）→ 毫秒；缺失/非法返回 NaN。绝不用 new Date(mtimeMs).toISOString() 反推（会截断差 1ms）。 */
+function rowMtimeMs(a: Pick<AssetRow, "mtime">): number {
+  return a.mtime ? Date.parse(a.mtime) : NaN;
+}
+
+/** 磁盘文件是否仍是"算这个 sha 的那份"：size 相同且 mtime 在容差内。 */
+function liveMatchesRow(a: Pick<AssetRow, "size" | "mtime">, live: LiveStat): boolean {
+  const rowMs = rowMtimeMs(a);
+  return Number(live.size) === Number(a.size || 0)
+    && Number.isFinite(rowMs)
+    && Math.abs(Math.round(live.mtimeMs) - rowMs) <= MTIME_TOLERANCE_MS;
+}
+
+/**
+ * 内容身份（v0.6.1-B 缓存身份安全）：
+ *  - 强身份 `sha256:<sha>` **仅在** sha256_state==="ok" 且磁盘与行一致时成立；
+ *    否则说明文件已被替换，旧 sha 用来做缓存键会污染强键（审计 F3）。
+ *  - 弱身份 `weak:<assetId>:<path_norm>:<size>:<mtimeMs>[:<ino>:<dev>]`：只对"同一资产同一路径同一份文件"有效，
+ *    跨资产/跨路径绝不共键（审计 F1：旧写法 size:mtime 不含路径，两个不同文件会撞键并发错目录）。
+ *    ino/dev 仅在有效（>0）时追加：换文件会让 inode 变化 → 键变 → miss，挡住"同路径同 size+mtime 的替换"；
+ *    Windows 上 ino 可能为 0/不稳定，此时退化为不含 ino 的旧格式，避免缓存空转。
+ *  - live 缺省（文件读不到）时退化为弱身份，仍带 assetId+path_norm。
+ */
+export function contentIdentity(
+  a: Pick<AssetRow, "id" | "path_norm" | "sha256" | "sha256_state" | "size" | "mtime">,
+  live?: LiveStat | null,
+): { identity: string; weak: boolean } {
+  if (a.sha256 && a.sha256_state === "ok" && live && liveMatchesRow(a, live)) {
+    return { identity: "sha256:" + a.sha256, weak: false };
+  }
+  const size = live ? Number(live.size) : Number(a.size || 0);
+  const mtimeMs: number | string = live
+    ? Math.round(live.mtimeMs)
+    : (Number.isFinite(rowMtimeMs(a)) ? rowMtimeMs(a) : String(a.mtime ?? ""));
+  const base = `weak:${a.id}:${a.path_norm}:${size}:${mtimeMs}`;
+  // ino/dev 只在有效时追加（见函数头说明：Windows 上可能为 0，不追加以免缓存空转）
+  const ino = live ? Number(live.ino) : 0;
+  const dev = live ? Number(live.dev) : 0;
+  return { identity: ino > 0 && dev > 0 ? `${base}:${ino}:${dev}` : base, weak: true };
 }
 
 export function fingerprintOf(a: Pick<AssetRow, "size" | "mtime">): string {
@@ -106,6 +147,18 @@ export async function stageHash(ctx: StageCtx, asset: AssetRow): Promise<StageRe
     },
   });
   checkAbort(ctx.signal);
+  // 哈希期间文件被改写/替换（同尺寸改写、边下边扫）→ digest 是"混合内容"，绝不能写成 ok（否则污染强身份键）
+  const after = safeStat(asset.path);
+  const unchanged = !!after
+    && after.size === st.size
+    && after.ino === st.ino
+    && after.dev === st.dev
+    && Math.round(after.mtimeMs) === Math.round(st.mtimeMs);
+  if (!unchanged) {
+    ctx.repo.setAssetSha(asset.id, null, "error");
+    ctx.log("hash asset " + asset.id + " file changed during hash, sha discarded");
+    return { bytesTotal: r.bytes, itemsTotal: 0, skipped: "file changed during hash" };
+  }
   ctx.repo.setAssetSha(asset.id, r.sha256, "ok");
   ctx.repo.setAssetContentVersion(asset.id, fingerprintOf(asset));
   ctx.progress({ bytesDone: done, bytesTotal: r.bytes, itemsDone: 1, itemsTotal: 1 });
@@ -120,7 +173,8 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
     return { limited: { code: "BYTES", message: "压缩包 " + st.size + " 字节超过解析上限 " + ctx.limits.maxArchiveBytes + "，已跳过目录解析" } };
   }
   const core = await coreArchive();
-  const { identity, weak } = contentIdentity(asset);
+  // 身份取**磁盘现状**（st 是 safeStat 的结果）：文件在排队期间被替换时，DB 行是旧值，不能拿它当身份
+  const { identity, weak } = contentIdentity(asset, st);
   const key = cacheKey({
     kind: "archive-listing",
     identity,
@@ -130,7 +184,8 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
       maxTotalReadBytes: ctx.limits.maxTotalReadBytes, maxCompressionRatio: ctx.limits.maxCompressionRatio,
     } }),
   });
-  const cached = await ctx.cache.get<any>("archive-listing", key);
+  // 强身份命中时校验条目记录的 content_sha（防 DB 行被改/旧实现写入的脏条目）；弱身份没有 sha 可比
+  const cached = await ctx.cache.get<any>("archive-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
   if (cached && Array.isArray(cached.entries)) {
     checkAbort(ctx.signal);
     applyArchiveListing(ctx.repo, asset.id, cached.entries);
@@ -168,12 +223,16 @@ export async function stageUnityPackage(ctx: StageCtx, asset: AssetRow): Promise
     return { limited: { code: "BYTES", message: "unitypackage " + st.size + " 字节超过解析上限 " + ctx.limits.maxArchiveBytes } };
   }
   const core = await coreUnityPackage();
-  const { identity, weak } = contentIdentity(asset);
+  // 同 stageArchive：身份取磁盘现状
+  const { identity, weak } = contentIdentity(asset, st);
   const key = cacheKey({
     kind: "upkg-listing", identity, versionKey: "upkg:v" + core.version,
-    limitsHash: cacheKey({ kind: "limits", identity: "u", versionKey: "", extra: { maxAssets: ctx.limits.maxUnityPackageAssets, maxEntryBytes: ctx.limits.maxEntryBytes } }),
+    // 审计 F6：maxTotalReadBytes 会改变结果（预算命中会提前停止），必须进 limitsHash
+    limitsHash: cacheKey({ kind: "limits", identity: "u", versionKey: "", extra: {
+      maxAssets: ctx.limits.maxUnityPackageAssets, maxEntryBytes: ctx.limits.maxEntryBytes, maxTotalReadBytes: ctx.limits.maxTotalReadBytes,
+    } }),
   });
-  const cached = await ctx.cache.get<any>("upkg-listing", key);
+  const cached = await ctx.cache.get<any>("upkg-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
   if (cached && Array.isArray(cached.assets)) {
     checkAbort(ctx.signal);
     applyUpkgListing(ctx.repo, asset.id, cached.assets);
@@ -368,6 +427,11 @@ async function extractNested(ctx: StageCtx, asset: AssetRow, save: (buf: Buffer,
   return saved;
 }
 
-function safeStat(p: string): { size: number } | null {
-  try { const st = statSync(p); return st.isFile() ? { size: st.size } : null; } catch { return null; }
+/** 磁盘现状：身份校验与"解析期间文件有没有变"都靠它（只 stat，不读内容）。 */
+function safeStat(p: string): LiveStat | null {
+  try {
+    const st = statSync(p);
+    if (!st.isFile()) return null;
+    return { size: st.size, mtimeMs: st.mtimeMs, ino: Number(st.ino), dev: Number(st.dev) };
+  } catch { return null; }
 }

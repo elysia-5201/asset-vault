@@ -15,8 +15,8 @@ import { createReadStream, statSync } from "node:fs";
 import { AppError } from "./contracts";
 import { deadlineOf, type AbortOptions } from "./abort";
 
-/** 解析器语义版本（流水线缓存键用；sha256FileChunked 落地时 +1）。 */
-export const HASH_VERSION = 2;
+/** 解析器语义版本（流水线缓存键用）：v0.6.1-B 缓存身份语义变更（live stat / weak 键）→ 3 */
+export const HASH_VERSION = 3;
 
 /** 读块大小：1 MiB（大文件下吞吐与内存的折中；常量内存与哈希值无关） */
 const CHUNK = 1 << 20;
