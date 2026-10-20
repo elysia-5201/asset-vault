@@ -9,7 +9,7 @@ import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, chmodSync, rmSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, extname } from "node:path";
+import { join, extname, basename } from "node:path";
 import Database from "better-sqlite3";
 import { migrate } from "../../apps/server/src/db/migrate";
 import { Repo } from "../../apps/server/src/db/repo";
@@ -108,7 +108,7 @@ describe("walkCandidates：显式栈与旧递归实现逐字段等价", () => {
     const want = await referenceWalk(root, { maxDepth: 1 });
     assert.deepEqual(shape(got), shape(want));
     // 顺序由 readdir 返回顺序决定（这里只断言"哪些"在，顺序以参考实现为准）
-    assert.deepEqual(got.filesOut.map((f) => f.path.split("/").pop()).sort(), ["one.zip", "top.zip"]);
+    assert.deepEqual(got.filesOut.map((f) => basename(f.path)).sort(), ["one.zip", "top.zip"]);
     // 旧版语义：d1（深度1）与 d2（深度2，被看到但不下沉）计入 dirs；d3 从未被看到 ⇒ dirs=2
     assert.equal(got.dirs, 2, "越界目录被看到则计数、但不展开（与旧递归实现一致）");
     assert.equal(got.dirs, want.dirs);
@@ -155,7 +155,13 @@ describe("walkCandidates：读取失败被记录（不再静默吞）", () => {
     assert.deepEqual(missingWriteGate(got).reasons.sort(), ["empty_tree_no_readdir", "root_unreadable", "read_errors:1"].sort());
   });
 
-  test("真实 EACCES（0000 目录）→ readdir 失败入 errors；以 root 运行时无法构造，跳过", async (t) => {
+  test("真实 EACCES（0000 目录）→ readdir 失败入 errors（POSIX；root/Windows 跳过）", async (t) => {
+    if (process.platform === "win32") {
+      // Windows 权限语义不同：chmod 只改只读位（ACL 模型），0000 目录仍可 readdir，构造不出 EACCES。
+      // 产品断言不放宽：该用例在 POSIX 上保持原样；Windows 只用上面的 ENOTDIR 用例覆盖 readdir 失败分支。
+      t.skip("Windows 权限语义不同：chmod 0000 不产生 readdir EACCES，此断言只在 POSIX 有意义");
+      return;
+    }
     const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
     if (isRoot) {
       t.skip("以 root 运行时 CAP_DAC_OVERRIDE 会绕过 0000 目录权限，无法构造真实的 readdir EACCES（该分支与上面的 ENOTDIR 同一代码路径）");
