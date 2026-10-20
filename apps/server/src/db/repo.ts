@@ -28,6 +28,12 @@ export interface StatsShape {
 
 /** v6 租约：jobs 行上的辅助元数据（不改变作业状态机，job.state 仍是唯一状态机）。 */
 export interface JobLease { holder: string; token: number }
+/**
+ * v0.6.1 FIX-07：派生写入（assets/items/scan_assets）的作业围栏。
+ * 只有 jobs 行仍是该 jobId + holder + lease_token 时才允许写；接管后旧持有者的写入 0 行。
+ * 不传 fence 的调用（HTTP/用户操作、pipeline 派生）保持旧行为。
+ */
+export interface JobFence { jobId: number; holder: string; token: number }
 export interface JobWithLease extends JobRow {
   holder: string | null;
   lease_until: string | null;
@@ -92,6 +98,10 @@ export function normalizeEventRetention(raw: unknown): EventRetentionConfig {
 
 /** 在飞（可被过期回收）的状态集合；paused 是用户显式暂停，绝不自动回收。 */
 const LEASABLE_JOB_STATES = "'resolving','fetching','materializing','indexing','matching','releasing','releasing_done'";
+/** FIX-07：围栏子句（追加在 WHERE 后，参数由调用方按 jobId/holder/token 顺序补）。 */
+const JOB_FENCE_SQL = " AND EXISTS (SELECT 1 FROM jobs j WHERE j.id=? AND j.holder=? AND j.lease_token=?)";
+/** 仍在飞/可恢复的 job 状态（预览清扫时据此保护；paused 由用户持有，不判死）。 */
+const ACTIVE_JOB_STATES_SQL = "'queued','resolving','fetching','materializing','indexing','matching','releasing','releasing_done','paused'";
 /** pipeline_events 的删除保护：本任务不在飞，且该资产名下也没有任何在飞任务。 */
 const PRUNEVENT_PROTECT =
   "NOT EXISTS (SELECT 1 FROM index_tasks t WHERE t.id=e.task_id AND t.state IN ('queued','running','waiting_retry')) " +
@@ -306,7 +316,7 @@ export class Repo {
     return row;
   }
 
-  updateItem(id: number, patch: Record<string, unknown>): ItemRow {
+  updateItem(id: number, patch: Record<string, unknown>, fence?: JobFence): ItemRow {
     const allowed = ["title", "title_ja", "shop_name", "shop_subdomain", "author", "price_text", "price_yen", "purchased", "published_at",
       "category_name", "category_parent", "description", "adult", "status", "rating", "favorite", "notes", "cover_image_id",
       "compat_declared_count", "id_confidence", "id_match_method", "source_url", "canonical_url", "source_item_id", "source_site", "source_gone", "last_checked_at"];
@@ -314,8 +324,10 @@ export class Repo {
     for (const [k, v] of Object.entries(patch)) { if (allowed.includes(k) && v !== undefined) { sets.push(`${k} = ?`); params.push(v as any); } }
     if (sets.length === 0) return this.stmt("SELECT * FROM items WHERE id=?").get(id) as ItemRow;
     sets.push("updated_at = ?"); params.push(now(), id);
-    this.stmt(`UPDATE items SET ${sets.join(", ")} WHERE id = ?`).run(...params as any[]);
-    this.syncFts(id);
+    let where = " WHERE id = ?";
+    if (fence) { where += JOB_FENCE_SQL; params.push(fence.jobId, fence.holder, fence.token); }
+    const changes = this.stmt(`UPDATE items SET ${sets.join(", ")}` + where).run(...params as any[]).changes;
+    if (changes > 0) this.syncFts(id);
     return this.stmt("SELECT * FROM items WHERE id = ?").get(id) as ItemRow;
   }
 
@@ -447,14 +459,21 @@ export class Repo {
     }
   }
   /** 登记本批入队深度索引的资产 id（有界 drain 用；固定 400 占位，末块补最后一个真实 id）。 */
-  insertScanAssetsBatch(assetIds: number[]): void {
+  insertScanAssetsBatch(assetIds: number[], fence?: JobFence): void {
     const ids = assetIds.map(Number).filter((n) => Number.isFinite(n) && n > 0);
     if (ids.length === 0) return;
+    if (fence) {
+      // FIX-07：每行 INSERT…SELECT 都带 EXISTS(jobs) 校验；旧持有者 0 行，不会把 id 写进本轮清单。
+      const st = this.stmt("INSERT OR IGNORE INTO scan_assets(asset_id) SELECT ? WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.id=? AND j.holder=? AND j.lease_token=?)");
+      for (const id of ids) st.run(id, fence.jobId, fence.holder, fence.token);
+      return;
+    }
     const CHUNK = Repo.BATCH_CHUNK;
     for (let i = 0; i < ids.length; i += CHUNK) {
       const part = ids.slice(i, i + CHUNK);
       const padded = part.slice();
       while (padded.length < CHUNK) padded.push(part[part.length - 1]!);
+      if (fence) continue; // 围栏路径在循环外统一处理（逐行 INSERT…SELECT，避免 400×4 绑定参数拼接）
       this.stmt(`INSERT OR IGNORE INTO scan_assets(asset_id) VALUES ${"(?),".repeat(CHUNK - 1)}(?)`).run(...padded);
     }
   }
@@ -627,7 +646,7 @@ export class Repo {
    * 批量标缺失。SQLite 变量上限 32766：必须分块，否则大库（>3.2 万资产）整轮 scan 在写完资产后失败（verifier A4）。
    * 单事务 + 每块 500：原子且不会长时间持有写锁。
    */
-  markAssetsMissing(ids: number[]): void {
+  markAssetsMissing(ids: number[], fence?: JobFence): void {
     if (ids.length === 0) return;
     const unique = [...new Set(ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
     if (unique.length === 0) return;
@@ -636,7 +655,9 @@ export class Repo {
       for (let i = 0; i < unique.length; i += CHUNK) {
         const part = unique.slice(i, i + CHUNK);
         const ph = part.map(() => "?").join(",");
-        this.stmt(`UPDATE assets SET status='missing' WHERE id IN (${ph})`).run(...part);
+        // FIX-07：有 fence 时只有 jobs 行仍属该 holder+token 才允许标缺失（接管后 0 行）
+        if (fence) this.stmt(`UPDATE assets SET status='missing' WHERE id IN (${ph})` + JOB_FENCE_SQL).run(...part as any[], fence.jobId, fence.holder, fence.token);
+        else this.stmt(`UPDATE assets SET status='missing' WHERE id IN (${ph})`).run(...part);
       }
     });
     tx();
@@ -860,6 +881,8 @@ export class Repo {
           if (info.changes === 1) {
             this.stmt("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)")
               .run(j.id, at, j.state, "failed", "abandoned_after_recoveries", "too many recoveries");
+            // v7：作业被放弃也不是"子任务永远 running"的理由——退回 queued 让流水线收尾（内容索引与作业终态独立）
+            this.resetRunningTasksForJob(j.id);
           }
           continue;
         }
@@ -877,6 +900,8 @@ export class Repo {
               "WHERE id=? AND state=? AND lease_token=? AND (lease_until IS NULL OR lease_until < ?)"
             ).run(j.id, j.state, j.lease_token, at);
         if (info.changes !== 1) continue;
+        // v7：同一事务里把该作业名下的 running 子任务退回 queued 并换租约（旧 worker 立即被围栏）
+        this.resetRunningTasksForJob(j.id);
         this.stmt("INSERT INTO job_events(job_id, at, from_state, to_state, event, detail) VALUES (?,?,?,?,?,?)")
           .run(j.id, at, j.state, "queued", "recovered", detail);
         requeued++;
@@ -1602,11 +1627,81 @@ export class Repo {
 
   deleteScanPreview(id: number): boolean { return this.stmt("DELETE FROM scan_previews WHERE id=?").run(id).changes > 0; }
 
-  /** 过期清理：ready/partial 超过 expires_at → expired（applying 不动，交给崩溃恢复）。 */
-  expireScanPreviews(): number {
+  /**
+   * CAS 更新（v0.6.1 FIX-01）：只有当前 state ∈ expectedStates 才写；未命中返回 null。
+   * 预览生成/应用收尾用它写终态 —— 被用户取消/已被清扫成终态后，迟到的结果直接丢弃。
+   */
+  updateScanPreviewIf(id: number, expectedStates: string[], patch: Record<string, unknown>): any | null {
+    const allowed = ["state", "plan_hash", "truncated", "complete", "files", "dirs", "bytes", "error_count",
+      "counts_json", "scan_json", "error", "apply_job_id", "finished_at", "expires_at"];
+    const sets: string[] = []; const params: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) { if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); params.push(v as any); } }
+    if (!sets.length || expectedStates.length === 0) return null;
+    params.push(id, ...expectedStates);
+    const changes = this.stmt(
+      "UPDATE scan_previews SET " + sets.join(", ") + " WHERE id=? AND state IN (" + expectedStates.map(() => "?").join(",") + ")"
+    ).run(...params as any[]).changes;
+    return changes === 1 ? this.getScanPreview(id) : null;
+  }
+  /** CAS 更新 apply run（同上）；被取消/清扫后迟到的收尾结果丢弃。 */
+  updateScanApplyRunIf(id: number, expectedStates: string[], patch: Record<string, unknown>): any | null {
+    const allowed = ["state", "job_id", "applied", "failed", "stale", "skipped", "detail_json", "finished_at"];
+    const sets: string[] = []; const params: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) { if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); params.push(v as any); } }
+    if (!sets.length || expectedStates.length === 0) return null;
+    params.push(id, ...expectedStates);
+    const changes = this.stmt(
+      "UPDATE scan_apply_runs SET " + sets.join(", ") + " WHERE id=? AND state IN (" + expectedStates.map(() => "?").join(",") + ")"
+    ).run(...params as any[]).changes;
+    return changes === 1 ? this.getScanApplyRun(id) : null;
+  }
+  /** 作业是否仍在飞（paused 也算，用户可能恢复）。 */
+  isJobActive(jobId: number | null | undefined): boolean {
+    if (!jobId) return false;
+    const row = this.stmt("SELECT 1 AS x FROM jobs WHERE id=? AND state IN (" + ACTIVE_JOB_STATES_SQL + ")").get(jobId);
+    return !!row;
+  }
+  /** 按 payload.previewId 找生成中的 job（json_extract；无 JSON1 时抛错由调用方兜底）。 */
+  findActiveJobByPreview(previewId: number): any {
     return this.stmt(
-      "UPDATE scan_previews SET state='expired', finished_at=? WHERE state IN ('ready','partial') AND expires_at IS NOT NULL AND expires_at < ?"
-    ).run(now(), now()).changes;
+      "SELECT * FROM jobs WHERE json_extract(payload,'$.previewId')=? AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1"
+    ).get(previewId) ?? null;
+  }
+
+  /**
+   * 清扫预览/应用失联状态（v0.6.1 FIX-01）。启动 + 列表/入口调用。
+   * - scanning 且 expires_at 过期且无在飞生成 job → expired
+   * - applying 且 apply_job_id 缺失/对应 job 非在飞 → failed（应用中断）
+   * - scan_apply_runs running 且 job 缺失/非在飞 → failed
+   * 同时保留旧语义：ready/partial 过期 → expired。返回受影响行数总和。
+   */
+  expireScanPreviews(): number {
+    const at = now();
+    let n = 0;
+    n += this.stmt(
+      "UPDATE scan_previews SET state='expired', finished_at=?, error=COALESCE(error,'扫描超时（无在飞作业）') " +
+      "WHERE state='ready' AND expires_at IS NOT NULL AND expires_at < ?"
+    ).run(at, at).changes;
+    n += this.stmt(
+      "UPDATE scan_previews SET state='expired', finished_at=?, error=COALESCE(error,'扫描超时（无在飞作业）') " +
+      "WHERE state='partial' AND expires_at IS NOT NULL AND expires_at < ?"
+    ).run(at, at).changes;
+    n += this.stmt(
+      "UPDATE scan_previews SET state='expired', finished_at=?, error=COALESCE(error,'扫描超时（无在飞作业）') " +
+      "WHERE state='scanning' AND expires_at IS NOT NULL AND expires_at < ? " +
+      "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE json_extract(j.payload,'$.previewId')=scan_previews.id AND j.state IN (" + ACTIVE_JOB_STATES_SQL + "))"
+    ).run(at, at).changes;
+    n += this.stmt(
+      "UPDATE scan_previews SET state='failed', finished_at=?, error=COALESCE(error,'应用中断（作业已失效）') " +
+      "WHERE state='applying' AND (apply_job_id IS NULL OR NOT EXISTS (" +
+      "SELECT 1 FROM jobs j WHERE j.id=scan_previews.apply_job_id AND j.state IN (" + ACTIVE_JOB_STATES_SQL + ")))"
+    ).run(at).changes;
+    n += this.stmt(
+      "UPDATE scan_apply_runs SET state='failed', finished_at=?, detail_json=COALESCE(detail_json,'apply job dead') " +
+      "WHERE state='running' AND (job_id IS NULL OR NOT EXISTS (" +
+      "SELECT 1 FROM jobs j WHERE j.id=scan_apply_runs.job_id AND j.state IN (" + ACTIVE_JOB_STATES_SQL + ")))"
+    ).run(at).changes;
+    return n;
   }
 
 
@@ -1618,14 +1713,19 @@ export class Repo {
     return this.stmt("SELECT index_state state, COUNT(*) count FROM assets WHERE status<>'trashed' GROUP BY 1").all() as any[];
   }
   setAssetIndexState(assetId: number, state: string, error: string | null = null): void {
-    this.stmt("UPDATE assets SET index_state=?, index_error=?, indexed_at=? WHERE id=?").run(state, error, state === "done" ? now() : null, assetId);
+    // FIX-03：index_error 保留首因——成功（done）才清空；后到的 null/泛化错误不覆盖已记录的具体原因。
+    this.stmt(
+      "UPDATE assets SET index_state=?, " +
+      "index_error=CASE WHEN ?='done' THEN NULL WHEN ? IS NOT NULL AND index_error IS NULL THEN ? ELSE index_error END, " +
+      "indexed_at=? WHERE id=?"
+    ).run(state, state, error, error, state === "done" ? now() : null, assetId);
   }
   setAssetContentVersion(assetId: number, version: string | null): void {
     this.stmt("UPDATE assets SET content_version=? WHERE id=?").run(version, assetId);
   }
 
   /** 入队（幂等）：同一 asset+stage 已有活跃任务时复用，必要时提升优先级/补 depends_on。 */
-  enqueueIndexTask(input: { assetId: number; itemId?: number | null; stage: string; priority?: number; maxAttempts?: number; dependsOn?: number | null; fingerprint?: string | null; versionKey?: string | null }): number {
+  enqueueIndexTask(input: { assetId: number; itemId?: number | null; stage: string; priority?: number; maxAttempts?: number; dependsOn?: number | null; fingerprint?: string | null; versionKey?: string | null; jobId?: number | null }): number {
     // check-then-insert 必须在事务里（多进程下唯一活跃索引仍是最终防线；撞了就当已存在处理）
     const run = (): number => {
       const existing = this.stmt(
@@ -1639,8 +1739,8 @@ export class Repo {
         return Number(existing.id);
       }
       const info = this.stmt(
-        "INSERT INTO index_tasks(asset_id, item_id, stage, state, priority, max_attempts, depends_on, fingerprint, version_key, created_at) VALUES (?,?,?,'queued',?,?,?,?,?,?)"
-      ).run(input.assetId, input.itemId ?? null, input.stage, input.priority ?? 0, input.maxAttempts ?? 3, input.dependsOn ?? null, input.fingerprint ?? null, input.versionKey ?? null, now());
+        "INSERT INTO index_tasks(asset_id, item_id, stage, state, priority, max_attempts, depends_on, fingerprint, version_key, job_id, created_at) VALUES (?,?,?,'queued',?,?,?,?,?,?,?)"
+      ).run(input.assetId, input.itemId ?? null, input.stage, input.priority ?? 0, input.maxAttempts ?? 3, input.dependsOn ?? null, input.fingerprint ?? null, input.versionKey ?? null, input.jobId ?? null, now());
       return Number(info.lastInsertRowid);
     };
     try { return this.transactionIfNeeded(run); }
@@ -1663,6 +1763,8 @@ export class Repo {
     fingerprint?: string | null; versionKey?: string | null;
     stages: { stage: string; dependsOnStage: string | null }[];
     assetState?: { state: string; error?: string | null } | null;
+    /** v7：任务归属的顶层作业 id（reap 时按 job 重置 running 子任务）。 */
+    jobId?: number | null;
   }): number[] {
     const priority = input.priority ?? 0;
     const maxAttempts = input.maxAttempts ?? 3;
@@ -1674,7 +1776,7 @@ export class Repo {
       const idByStage = new Map<string, number>();
       const upd = this.stmt("UPDATE index_tasks SET priority=?, depends_on=COALESCE(depends_on, ?) WHERE id=?");
       const ins = this.stmt(
-        "INSERT INTO index_tasks(asset_id, item_id, stage, state, priority, max_attempts, depends_on, fingerprint, version_key, created_at) VALUES (?,?,?,'queued',?,?,?,?,?,?)"
+        "INSERT INTO index_tasks(asset_id, item_id, stage, state, priority, max_attempts, depends_on, fingerprint, version_key, job_id, created_at) VALUES (?,?,?,'queued',?,?,?,?,?,?,?)"
       );
       for (const s of input.stages) {
         const ex = byStage.get(s.stage);
@@ -1684,10 +1786,11 @@ export class Repo {
         if (ex) {
           const mergedPriority = Math.max(Number(ex.priority) || 0, priority);
           if (mergedPriority !== Number(ex.priority) || (depId && !ex.depends_on)) upd.run(mergedPriority, depId, Number(ex.id));
+          if (input.jobId && !ex.job_id) this.stmt("UPDATE index_tasks SET job_id=? WHERE id=?").run(input.jobId, Number(ex.id));
           idByStage.set(s.stage, Number(ex.id));
           continue;
         }
-        const info = ins.run(input.assetId, input.itemId ?? null, s.stage, priority, maxAttempts, depId, input.fingerprint ?? null, input.versionKey ?? null, now());
+        const info = ins.run(input.assetId, input.itemId ?? null, s.stage, priority, maxAttempts, depId, input.fingerprint ?? null, input.versionKey ?? null, input.jobId ?? null, now());
         idByStage.set(s.stage, Number(info.lastInsertRowid));
       }
       if (input.assetState) this.setAssetIndexState(input.assetId, input.assetState.state, input.assetState.error ?? null);
@@ -1728,12 +1831,16 @@ export class Repo {
    * started_at/next_retry_at/依赖条件都不变），省掉 pick 与 getIndexTask 两次 SELECT；
    * 运行环境不支持时保留 fallback。
    */
-  claimIndexTask(stage: string): any {
+  claimIndexTask(stage: string, owner?: string): any {
     const at = now();
+    // v7：领取即写 owner + lease_token+1；pipeline 后续所有写入都用这一对做围栏。
+    // 未显式传 owner 的调用（测试/诊断）仍可用，但只能走"未围栏"的 finish/retry 兼容路径。
+    const who = owner ?? ("local#" + process.pid);
     if (this.supportsReturning()) {
       try {
         const row = this.db.prepare(
-          `UPDATE index_tasks SET state='running', started_at=?, attempts=attempts+1, next_retry_at=NULL
+          `UPDATE index_tasks SET state='running', started_at=?, attempts=attempts+1, next_retry_at=NULL,
+             owner=?, lease_token=lease_token+1
            WHERE id = (SELECT t.id FROM index_tasks t
               WHERE t.state='queued' AND t.stage=?
                 AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?)
@@ -1742,7 +1849,7 @@ export class Repo {
               ORDER BY t.priority DESC, t.id ASC LIMIT 1)
              AND state='queued'
            RETURNING *`
-        ).get(at, stage, at);
+        ).get(at, who, stage, at);
         return row ?? null;
       } catch {
         // 运行时才暴露不支持（例如换了 SQLite 构建）：本进程永久回落
@@ -1757,17 +1864,21 @@ export class Repo {
             SELECT 1 FROM index_tasks d WHERE d.id=t.depends_on AND d.state IN ('done','skipped')))
         ORDER BY t.priority DESC, t.id ASC LIMIT 1`
     );
-    const upd = this.stmt("UPDATE index_tasks SET state='running', started_at=?, attempts=attempts+1, next_retry_at=NULL WHERE id=? AND state='queued'");
+    const upd = this.stmt("UPDATE index_tasks SET state='running', started_at=?, attempts=attempts+1, next_retry_at=NULL, owner=?, lease_token=lease_token+1 WHERE id=? AND state='queued'");
     for (let i = 0; i < 8; i++) {
       const row = pick.get(stage, at) as any;
       if (!row) return null;
-      const info = upd.run(at, row.id);
+      const info = upd.run(at, who, row.id);
       if (info.changes === 1) return this.getIndexTask(row.id);
     }
     return null;
   }
 
-  updateIndexTask(id: number, patch: { bytesDone?: number; bytesTotal?: number; itemsDone?: number; itemsTotal?: number; error?: string | null; errorCode?: string | null }): void {
+  /**
+   * 进度/诊断写入。v7：传 fence（owner+leaseToken）时带 owner+token+state='running' CAS；
+   * 旧持有者 0 行 → 返回 false（不抛错，由 pipeline 记 lease_lost 诊断并丢弃本次写入）。
+   */
+  updateIndexTask(id: number, patch: { bytesDone?: number; bytesTotal?: number; itemsDone?: number; itemsTotal?: number; error?: string | null; errorCode?: string | null }, fence?: { owner: string; leaseToken: number }): boolean {
     const sets: string[] = []; const params: unknown[] = [];
     if (patch.bytesDone !== undefined) { sets.push("bytes_done = ?"); params.push(Math.max(0, Math.floor(patch.bytesDone))); }
     if (patch.bytesTotal !== undefined) { sets.push("bytes_total = ?"); params.push(Math.max(0, Math.floor(patch.bytesTotal))); }
@@ -1775,9 +1886,11 @@ export class Repo {
     if (patch.itemsTotal !== undefined) { sets.push("items_total = ?"); params.push(Math.max(0, Math.floor(patch.itemsTotal))); }
     if (patch.error !== undefined) { sets.push("error = ?"); params.push(patch.error); }
     if (patch.errorCode !== undefined) { sets.push("error_code = ?"); params.push(patch.errorCode); }
-    if (!sets.length) return;
+    if (!sets.length) return true;
     params.push(id);
-    this.stmt("UPDATE index_tasks SET " + sets.join(", ") + " WHERE id=?").run(...params as any[]);
+    let where = " WHERE id=?";
+    if (fence) { where += " AND owner=? AND lease_token=? AND state='running'"; params.push(fence.owner, fence.leaseToken); }
+    return this.stmt("UPDATE index_tasks SET " + sets.join(", ") + where).run(...params as any[]).changes === 1;
   }
 
   /** 终态：done / skipped（不适用或被限制降级）/ failed（不可重试）/ cancelled。 */
@@ -1785,7 +1898,14 @@ export class Repo {
    * 终态写入。requireRunning=true 时带 CAS（WHERE state='running'）：任务被 recover/重领后，
    * 旧 worker 的迟到结果不会覆盖新终态（lost update）。
    */
-  finishIndexTask(id: number, state: "done" | "skipped" | "failed" | "cancelled", detail: { errorCode?: string | null; error?: string | null } = {}, opts: { requireRunning?: boolean } = {}): any {
+  finishIndexTask(id: number, state: "done" | "skipped" | "failed" | "cancelled", detail: { errorCode?: string | null; error?: string | null } = {}, opts: { requireRunning?: boolean; owner?: string; leaseToken?: number } = {}): any {
+    if (opts.owner !== undefined && opts.leaseToken !== undefined) {
+      // v7 围栏：只允许"当前 owner + 当前 token + 仍在 running"的持有者写终态。
+      // 0 行返回 null（不抛错）—— 旧 failed 不可能覆盖新 done，旧持有者也不可能改写新终态。
+      const changes = this.stmt("UPDATE index_tasks SET state=?, finished_at=?, error_code=?, error=? WHERE id=? AND owner=? AND lease_token=? AND state='running'")
+        .run(state, now(), detail.errorCode ?? null, detail.error ?? null, id, opts.owner, opts.leaseToken).changes;
+      return changes === 1 ? this.getIndexTask(id) : null;
+    }
     if (opts.requireRunning) {
       this.stmt("UPDATE index_tasks SET state=?, finished_at=?, error_code=?, error=? WHERE id=? AND state='running'")
         .run(state, now(), detail.errorCode ?? null, detail.error ?? null, id);
@@ -1801,8 +1921,13 @@ export class Repo {
   }
 
   /** 失败但可重试：进入 waiting_retry（attempts 已在领取时 +1，超过 max_attempts 由调用方判 failed）。 */
-  retryIndexTask(id: number, detail: { errorCode?: string | null; error?: string | null; backoffMs?: number } = {}): any {
+  retryIndexTask(id: number, detail: { errorCode?: string | null; error?: string | null; backoffMs?: number } = {}, fence?: { owner: string; leaseToken: number }): any {
     const at = new Date(Date.now() + (detail.backoffMs ?? 1000)).toISOString();
+    if (fence) {
+      const changes = this.stmt("UPDATE index_tasks SET state='waiting_retry', started_at=NULL, next_retry_at=?, error_code=?, error=? WHERE id=? AND owner=? AND lease_token=? AND state='running'")
+        .run(at, detail.errorCode ?? null, detail.error ?? null, id, fence.owner, fence.leaseToken).changes;
+      return changes === 1 ? this.getIndexTask(id) : null;
+    }
     this.stmt("UPDATE index_tasks SET state='waiting_retry', started_at=NULL, next_retry_at=?, error_code=?, error=? WHERE id=?")
       .run(at, detail.errorCode ?? null, detail.error ?? null, id);
     return this.getIndexTask(id);
@@ -1827,7 +1952,8 @@ export class Repo {
     const due = this.stmt("SELECT id, asset_id, stage FROM index_tasks WHERE state='waiting_retry' AND (next_retry_at IS NULL OR next_retry_at <= ?)").all(now()) as any[];
     const tx = this.db.transaction(() => {
       for (const r of rows) {
-        this.stmt("UPDATE index_tasks SET state='queued', started_at=NULL WHERE id=?").run(r.id);
+        // v7：恢复即换租约（owner=NULL、token+1），旧 worker 若还活着，其后续写入会被围栏拒绝。
+        this.stmt("UPDATE index_tasks SET state='queued', owner=NULL, lease_token=lease_token+1, started_at=NULL WHERE id=?").run(r.id);
         this.logPipelineEvent({ taskId: r.id, assetId: r.asset_id, stage: r.stage, event: "recovered", detail: "service restart (was running)" });
       }
       for (const r of due) {
@@ -1837,6 +1963,17 @@ export class Repo {
     });
     tx();
     return rows.length + due.length;
+  }
+
+  /**
+   * v7：顶层作业被回收（reap）时，把它名下仍在 running 的子任务退回 queued 并换租约。
+   * 必须与 reap 的 jobs UPDATE 同一事务调用（reapExpiredLeases 内）；旧 worker 的写入随后被围栏。
+   */
+  resetRunningTasksForJob(jobId: number): number {
+    return this.stmt(
+      "UPDATE index_tasks SET state='queued', owner=NULL, lease_token=lease_token+1, started_at=NULL, next_retry_at=NULL " +
+      "WHERE job_id=? AND state='running'"
+    ).run(jobId).changes;
   }
 
   countIndexTasks(): { stage: string; state: string; count: number }[] {

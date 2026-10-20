@@ -19,13 +19,14 @@
  */
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openTempDb, addItem, addRoot, type TempDb } from "../schema/_db";
 import { Repo } from "../../apps/server/src/db/repo";
 import { DerivedCache, cacheKey, type CacheLike } from "../../apps/server/src/services/pipeline/cache";
-import { contentIdentity, stageArchive, stageHash, stageUnityPackage, type LiveStat, type StageCtx } from "../../apps/server/src/services/pipeline/stages";
+import { contentIdentity, contentSample, stageArchive, stageHash, stageUnityPackage, type LiveStat, type StageCtx } from "../../apps/server/src/services/pipeline/stages";
 import { DEFAULT_LIMITS, type PipelineLimits } from "../../apps/server/src/services/pipeline/limits";
 import { buildTarGz, buildZip } from "../../packages/core/test/content/fixtures";
 import { ARCHIVE_PARSER_VERSION } from "../../packages/core/src/archive/list";
@@ -91,9 +92,14 @@ const archiveLimitsHash = (l: PipelineLimits) => cacheKey({ kind: "limits", iden
   maxTotalReadBytes: l.maxTotalReadBytes, maxCompressionRatio: l.maxCompressionRatio,
 } });
 
-const archiveKey = (identity: string, container: string, l: PipelineLimits) => cacheKey({
-  kind: "archive-listing", identity, versionKey: "archive:" + container + ":v" + ARCHIVE_PARSER_VERSION, limitsHash: archiveLimitsHash(l),
+/** v0.6.2/FIX-05 起 cacheKey.extra.sample 参与归档缓存键，测试必须用同口径复算。 */
+const archiveKey = (identity: string, container: string, l: PipelineLimits, sample: string | null) => cacheKey({
+  kind: "archive-listing", identity, versionKey: "archive:" + container + ":v" + ARCHIVE_PARSER_VERSION,
+  limitsHash: archiveLimitsHash(l), extra: { sample: sample ?? "unreadable" },
 });
+
+/** 按 stages 的真实口径取采样（测试与实现共用 contentSample，避免两套算法漂移）。 */
+const sampleOf = async (file: string): Promise<string | null> => contentSample(file, statSync(file).size);
 
 /** 两个"内容不同、字节数相同"的 zip（文件名等长 → 总长一致）。 */
 function twinZips(): { a: string; b: string; at: Date } {
@@ -151,7 +157,10 @@ describe("场景2：移动/改名", () => {
   });
 
   test("强身份：同内容不同路径可共享（sha 一致 → 一次解析，两边都正确）", async () => {
-    const { a, b } = twinZips();
+    // 必须是**真正同内容**（FIX-05 起 sample 参与键：同 sha 但字节不同会 miss，这是正确的防御）
+    const { a } = twinZips();
+    const b = join(work, "A-copy.zip");
+    writeFileSync(b, buildZip([{ name: "a1.txt", data: Buffer.alloc(100, 0x61) }]));
     const sha = "a".repeat(64);
     const ra = register(a, { sha });
     const rb = register(b, { sha });
@@ -178,7 +187,7 @@ describe("场景3：DB 行 sha 陈旧（文件已被替换）→ 不得走强身
 
     // 在"旧强键"下埋一条错误目录：若实现仍按旧 sha 走强键，就会命中这条
     const limits = { ...DEFAULT_LIMITS, maxArchiveBytes: 0 };
-    const strongKey = archiveKey("sha256:" + staleSha, "zip", limits);
+    const strongKey = archiveKey("sha256:" + staleSha, "zip", limits, await sampleOf(a));
     await cache.put("archive-listing", strongKey, { entries: [{ path: "WRONG.txt", size: 1, isDir: false }], limited: null, passwordProtected: false, truncated: false }, { kind: "archive-listing", contentSha: staleSha, versionKey: "archive:zip:v" + ARCHIVE_PARSER_VERSION });
 
     const r = await stageArchive(makeCtx(), ra);
@@ -240,8 +249,9 @@ describe("场景5：解析器版本变化", () => {
     const limits = { ...DEFAULT_LIMITS, maxArchiveBytes: 0 };
     const live = liveOf(a);
     const identity = contentIdentity(ra, live).identity;
-    const v3 = archiveKey(identity, "zip", limits);
-    const v2 = cacheKey({ kind: "archive-listing", identity, versionKey: "archive:zip:v" + (ARCHIVE_PARSER_VERSION - 1), limitsHash: archiveLimitsHash(limits) });
+    const sample = await sampleOf(a);
+    const v3 = archiveKey(identity, "zip", limits, sample);
+    const v2 = cacheKey({ kind: "archive-listing", identity, versionKey: "archive:zip:v" + (ARCHIVE_PARSER_VERSION - 1), limitsHash: archiveLimitsHash(limits), extra: { sample: sample ?? "unreadable" } });
     assert.notEqual(v3, v2, "版本必须参与键");
     await cache.put("archive-listing", v2, { entries: [{ path: "OLD-V2.txt", size: 1, isDir: false }], limited: null, passwordProtected: false, truncated: false }, { kind: "archive-listing", contentSha: String(ra.sha256), versionKey: "v2" });
     const r = await stageArchive(makeCtx(), ra);
@@ -253,14 +263,15 @@ describe("场景5：解析器版本变化", () => {
 // ---------------------------------------------------------------- 6) limitsHash（含 upkg 预算，F6）
 
 describe("场景6：limitsHash 变化只失效相关 kind", () => {
-  test("archive：预算/条目上限变化 → 键变", () => {
+  test("archive：预算/条目上限变化 → 键变", async () => {
     const { a } = twinZips();
     const ra = register(a, { sha: "e".repeat(64) });
     const identity = contentIdentity(ra, liveOf(a)).identity;
     const base = { ...DEFAULT_LIMITS, maxArchiveBytes: 0 };
-    const k1 = archiveKey(identity, "zip", base);
-    const k2 = archiveKey(identity, "zip", { ...base, maxTotalReadBytes: 1024 });
-    const k3 = archiveKey(identity, "zip", { ...base, maxArchiveEntries: 10 });
+    const sample = await sampleOf(a);
+    const k1 = archiveKey(identity, "zip", base, sample);
+    const k2 = archiveKey(identity, "zip", { ...base, maxTotalReadBytes: 1024 }, sample);
+    const k3 = archiveKey(identity, "zip", { ...base, maxArchiveEntries: 10 }, sample);
     assert.notEqual(k1, k2);
     assert.notEqual(k1, k3);
   });
@@ -291,7 +302,7 @@ describe("场景7：缓存损坏", () => {
     const ra = register(a);
     await stageArchive(makeCtx(), ra);
     const identity = contentIdentity(ra, liveOf(a)).identity;
-    const key = archiveKey(identity, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 });
+    const key = archiveKey(identity, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 }, await sampleOf(a));
     const file = cache.pathFor(key, "archive-listing");
     writeFileSync(file, "{ this is not json");
     const r = await stageArchive(makeCtx(), ra);
@@ -305,7 +316,9 @@ describe("场景7：缓存损坏", () => {
 
 describe("场景8：两资产同内容（强身份）", () => {
   test("同 sha 的两个资产只解析一次，两边都拿到正确目录", async () => {
-    const { a, b } = twinZips();
+    const { a } = twinZips();
+    const b = join(work, "A-copy2.zip");
+    writeFileSync(b, buildZip([{ name: "a1.txt", data: Buffer.alloc(100, 0x61) }]));
     const sha = "f".repeat(64);
     const ra = register(a, { sha });
     const rb = register(b, { sha });
@@ -337,7 +350,7 @@ describe("F4：命中时 content_sha 不符 → drop + miss", () => {
     const sha = "1".repeat(64);
     const ra = register(a, { sha });
     const identity = contentIdentity(ra, liveOf(a)).identity;
-    const key = archiveKey(identity, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 });
+    const key = archiveKey(identity, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 }, await sampleOf(a));
     await cache.put("archive-listing", key, { entries: [{ path: "POISON.txt", size: 1, isDir: false }], limited: null, passwordProtected: false, truncated: false }, { kind: "archive-listing", contentSha: "9".repeat(64), versionKey: "archive:zip:v" + ARCHIVE_PARSER_VERSION });
     const r = await stageArchive(makeCtx(), ra);
     assert.doesNotMatch(String(r.note), /cache hit/);
@@ -413,5 +426,163 @@ describe("F5：meta.weak 写入", () => {
     if (cols.includes("weak")) {
       assert.equal(Number(repo.getCacheEntry(key)?.weak), 1, "meta.weak=true 必须写进 cache_entries.weak");
     }
+  });
+});
+
+
+// ------------------------------------------------- FIX-05（task-33）：内容采样挡住元数据不可见的替换
+//
+// 采样 = sha256(head 64KiB + tail 64KiB + size) 前 16 hex，写入 cacheKey.extra.sample（强/弱身份都加）。
+// 这些替换在 (size, mtime, ino, dev) 上完全不可见，只有采样能发现。
+
+describe("FIX-05 内容采样：元数据不可见的替换", () => {
+  /** 造一个"victim"文件：内容 A，size 与 mtime 对齐 B（保证 size/mtime 不变）。 */
+  function victimWithA(tag: string, b: string): string {
+    const victim = join(work, tag + "-victim.zip");
+    writeFileSync(victim, buildZip([{ name: "a1.txt", data: Buffer.alloc(100, 0x61) }]));
+    const at = statSync(b).mtime;
+    utimesSync(victim, at, at);
+    return victim;
+  }
+
+  test("① GNU cp -p 就地覆盖（同 inode/size/mtime）→ 采样变 → MISS", async () => {
+    const { a, b } = twinZips();
+    void a;
+    const victim = victimWithA("f5cp", b);
+    const ra = register(victim);
+    const sampleBefore = await sampleOf(victim);
+    const first = await stageArchive(makeCtx(), ra);
+    assert.match(String(first.note), /entries=/);
+
+    const inoBefore = Number(statSync(victim).ino);
+    execFileSync("cp", ["-p", b, victim]);
+    assert.equal(Number(statSync(victim).ino), inoBefore, "前置：cp -p 就地写，inode 不变");
+    assert.notEqual(await sampleOf(victim), sampleBefore, "前置：内容变了采样必须变");
+
+    const second = await stageArchive(makeCtx(), ra);
+    assert.doesNotMatch(String(second.note), /cache hit/, "采样不同 → 不得命中旧目录");
+    assert.deepEqual(repo.getArchiveEntries(ra.id).map((e: any) => e.path), ["b1.txt"]);
+  });
+
+  test("② 原地写 + utimes 回写 mtime（同 inode）→ 采样变 → MISS", async () => {
+    const { b } = twinZips();
+    const victim = victimWithA("f5write", b);
+    const ra = register(victim);
+    await stageArchive(makeCtx(), ra);
+    const inoBefore = Number(statSync(victim).ino);
+    const bytes = readFileSync(b);
+    writeFileSync(victim, bytes);
+    const at = statSync(b).mtime;
+    utimesSync(victim, at, at);
+    assert.equal(Number(statSync(victim).ino), inoBefore, "前置：写文件不改 inode");
+    const second = await stageArchive(makeCtx(), ra);
+    assert.doesNotMatch(String(second.note), /cache hit/);
+    assert.deepEqual(repo.getArchiveEntries(ra.id).map((e: any) => e.path), ["b1.txt"]);
+  });
+
+  test("③ rename 替换（新 inode，同 size+mtime）→ MISS", async () => {
+    const { b } = twinZips();
+    const victim = victimWithA("f5rename", b);
+    const ra = register(victim);
+    await stageArchive(makeCtx(), ra);
+    const inoBefore = Number(statSync(victim).ino);
+    renameSync(b, victim);
+    assert.notEqual(Number(statSync(victim).ino), inoBefore, "前置：rename 换 inode");
+    const second = await stageArchive(makeCtx(), ra);
+    assert.doesNotMatch(String(second.note), /cache hit/);
+    assert.deepEqual(repo.getArchiveEntries(ra.id).map((e: any) => e.path), ["b1.txt"]);
+  });
+
+  test("④ 同 inode 截断重写 + 回写 mtime → MISS", async () => {
+    const { b } = twinZips();
+    const victim = victimWithA("f5trunc", b);
+    const ra = register(victim);
+    await stageArchive(makeCtx(), ra);
+    const inoBefore = Number(statSync(victim).ino);
+    truncateSync(victim, 0);
+    writeFileSync(victim, readFileSync(b));
+    const at = statSync(b).mtime;
+    utimesSync(victim, at, at);
+    assert.equal(Number(statSync(victim).ino), inoBefore, "前置：truncate+write 不改 inode");
+    const second = await stageArchive(makeCtx(), ra);
+    assert.doesNotMatch(String(second.note), /cache hit/);
+    assert.deepEqual(repo.getArchiveEntries(ra.id).map((e: any) => e.path), ["b1.txt"]);
+  });
+
+  test("⑤ 陈旧 sha + 同 size+mtime 替换：强身份仍在，但采样让键变（旧 sha 键不被污染）", async () => {
+    const { b } = twinZips();
+    const victim = victimWithA("f5stale", b);
+    const staleSha = "9".repeat(64);
+    const ra = register(victim, { sha: staleSha });
+    const first = await stageArchive(makeCtx(), ra);
+    assert.match(String(first.note), /entries=/);
+    const sampleBefore = await sampleOf(victim);
+    const keyBefore = archiveKey("sha256:" + staleSha, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 }, sampleBefore);
+    assert.ok(await cache.get("archive-listing", keyBefore), "前置：旧 sha 键下已有条目");
+
+    execFileSync("cp", ["-p", b, victim]); // 同 inode/size/mtime，内容变了
+    const row = repo.getAsset(ra.id)!;
+    const live = liveOf(victim);
+    assert.equal(contentIdentity(row, live).weak, false, "前置：元数据仍匹配 → 仍走强身份");
+    assert.notEqual(await sampleOf(victim), sampleBefore);
+
+    const second = await stageArchive(makeCtx(), row);
+    assert.doesNotMatch(String(second.note), /cache hit/, "采样不同 → 强身份也必须 miss");
+    assert.deepEqual(repo.getArchiveEntries(ra.id).map((e: any) => e.path), ["b1.txt"]);
+    // 旧键（旧采样）仍保留旧内容条目，没有被新内容覆盖 → 不会污染拥有旧 sha 的其他资产
+    const old = await cache.get<any>("archive-listing", keyBefore, { contentSha: staleSha });
+    assert.deepEqual(old?.entries?.map((e: any) => e.path), ["a1.txt"], "旧 sha 键不得被新内容覆盖");
+  });
+
+  test("⑥ 两资产同内容（同 sha + 同采样）→ 仍只解析一次", async () => {
+    const { a } = twinZips();
+    const c1 = join(work, "f5-copy1.zip");
+    const c2 = join(work, "f5-copy2.zip");
+    const bytes = buildZip([{ name: "a1.txt", data: Buffer.alloc(100, 0x61) }]);
+    writeFileSync(c1, bytes);
+    writeFileSync(c2, bytes);
+    assert.equal(await sampleOf(c1), await sampleOf(c2), "同内容 → 采样相同");
+    const sha = "7".repeat(64);
+    const r1 = register(c1, { sha });
+    const r2 = register(c2, { sha });
+    const before = repo.listCacheEntries("archive-listing").length;
+    await stageArchive(makeCtx(), r1);
+    const second = await stageArchive(makeCtx(), r2);
+    assert.match(String(second.note), /cache hit/);
+    assert.equal(repo.listCacheEntries("archive-listing").length - before, 1, "同内容只应新增一条缓存");
+    assert.deepEqual(repo.getArchiveEntries(r2.id).map((e: any) => e.path), ["a1.txt"]);
+    void a;
+  });
+});
+
+// ------------------------------------------------- AUD-03：scan 重置 sha 与身份降级的联动
+// 说明：AUD-03 对抗脚本（scripts/audit-cache-identity-adversarial.ts）覆盖了"同 size+mtime 替换"的残差；
+// 这里只钉住**正确路径**：metadata 变化 → scan 重置 sha → 强身份失效 → 重新解析。
+
+describe("AUD-03：scan 重置 sha 后强身份失效", () => {
+  test("mtime 变化 → upsertAsset 把 sha 重置为 pending → stageArchive 不再走旧 sha 键", async () => {
+    const { a } = twinZips();
+    const sha = "5".repeat(64);
+    const ra = register(a, { sha });
+    const first = await stageArchive(makeCtx(), ra);
+    assert.doesNotMatch(String(first.note), /cache hit/);
+
+    // 模拟"文件被替换后又被扫描到"：mtime 变（size 不变也一样触发重置）
+    const later = new Date(statSync(a).mtimeMs + 5000);
+    utimesSync(a, later, later);
+    const st = statSync(a);
+    const up = repo.upsertAsset({
+      item_id: itemId, kind: "archive", container: "zip",
+      path: a, path_norm: a.toLowerCase(), root_id: rootId,
+      size: st.size, mtime: st.mtime.toISOString(), discovered_by: "scan",
+    });
+    const row = repo.getAsset(up.asset.id)!;
+    assert.equal(row.sha256, null, "metadata 变化后旧 sha 必须作废");
+    assert.equal(row.sha256_state, "pending");
+
+    const id = contentIdentity(row, liveOf(a));
+    assert.equal(id.weak, true, "sha 作废后只能走弱身份");
+    const second = await stageArchive(makeCtx(), row);
+    assert.doesNotMatch(String(second.note), /cache hit/, "弱键含新 mtime，不得命中旧条目");
   });
 });

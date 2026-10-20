@@ -45,9 +45,9 @@ function openV5Db(): { db: Database.Database; close: () => void } {
   return { db, close: () => { try { db.close(); } catch { /* closed */ } rmSync(dir, { recursive: true, force: true }); } };
 }
 
-describe("v6 迁移：jobs 租约列 + cache_entries.weak", () => {
-  test("SCHEMA_VERSION = 6", () => {
-    assert.equal(SCHEMA_VERSION, 6);
+describe("v6/v7 迁移：jobs 租约列 + cache_entries.weak + index_tasks 围栏列", () => {
+  test("SCHEMA_VERSION = 7", () => {
+    assert.equal(SCHEMA_VERSION, 7);
   });
 
   test("v5 老库：补 5 列（4 租约 + weak），幂等；schema.sql 随后可执行（新索引可建）", () => {

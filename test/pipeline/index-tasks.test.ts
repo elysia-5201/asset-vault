@@ -9,6 +9,8 @@ import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { openPipelineDb, oneAsset, bulkAssets, activeTaskCount, taskById, eventTypes, type PipelineDb } from "./_helpers";
 import { addAsset } from "../schema/_db";
+import { IndexPipeline } from "../../apps/server/src/services/pipeline/pipeline";
+import { resolveLimits } from "../../apps/server/src/services/pipeline/limits";
 
 let p: PipelineDb;
 beforeEach(() => { p = openPipelineDb(); });
@@ -324,18 +326,39 @@ describe("依赖跳过 / 优先级提升 / 诊断 / 事件", () => {
   });
 });
 
-describe("已知实现缺口（TODO：不弄红套件，证据已报 lead）", () => {
-  test("[BUG] 到期的 waiting_retry 在服务运行期间无法被重新领取", { todo: "pipeline.ts:78 只在 start() 调 recoverIndexTasks；loop 只 claimIndexTask('queued') → 退避到期后没有任何组件把 waiting_retry 排回 queued" }, () => {
-    const a = oneAsset(p, "bug-retry.zip");
+describe("运行期退避提升（FIX-03：原 TODO 改为真实集成测试）", () => {
+  test("pipeline.start() 后 retryTimer 把到期 waiting_retry 提升回 queued", async () => {
+    const a = oneAsset(p, "retry-promote.zip");
     const id = p.repo.enqueueIndexTask({ assetId: a, stage: "hash" });
     p.repo.claimIndexTask("hash");
     p.repo.retryIndexTask(id, { errorCode: "E_BUSY", error: "locked", backoffMs: 1 });
-    // 等到退避时间已过（不 sleep：直接把 next_retry_at 置为过去）
+    // 直接把 next_retry_at 置为过去，避免 sleep 等退避
     p.t.db.prepare("UPDATE index_tasks SET next_retry_at=? WHERE id=?").run(past(), id);
-    // 期望：到期任务可被重新领取（实现里需要 recoverIndexTasks 或等价的"到期提升"）
-    const claimed = p.repo.claimIndexTask("hash");
-    assert.ok(claimed, "退避已到期，却没有可领取的任务 → 重试永远不会发生（直到进程重启）");
-    assert.equal(claimed.id, id);
+    const pipeline = new IndexPipeline({
+      repo: p.repo, media: {} as any, cache: { pruneTemp: () => 0 } as any,
+      limits: resolveLimits({}), log: () => {},
+    });
+    pipeline.start();
+    try {
+      const deadline = Date.now() + 2000;
+      let row = taskById(p.t.db, id);
+      while (row.state === "waiting_retry" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+        row = taskById(p.t.db, id);
+      }
+      assert.notEqual(row.state, "waiting_retry", "运行期没有提升到期任务 → 重试只能等进程重启");
+    } finally { await pipeline.stop(); }
+  });
+
+  test("setAssetIndexState 保留 index_error 首因（成功才清空）", () => {
+    const a = oneAsset(p, "first-error.zip");
+    p.repo.setAssetIndexState(a, "failed", "首个具体错误");
+    p.repo.setAssetIndexState(a, "failed", null);
+    assert.equal((p.t.db.prepare("SELECT index_error e FROM assets WHERE id=?").get(a) as any).e, "首个具体错误");
+    p.repo.setAssetIndexState(a, "failed", "后到的泛化错误");
+    assert.equal((p.t.db.prepare("SELECT index_error e FROM assets WHERE id=?").get(a) as any).e, "首个具体错误");
+    p.repo.setAssetIndexState(a, "done");
+    assert.equal((p.t.db.prepare("SELECT index_error e FROM assets WHERE id=?").get(a) as any).e, null);
   });
 });
 

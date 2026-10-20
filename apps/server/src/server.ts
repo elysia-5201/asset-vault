@@ -85,6 +85,10 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   if (!lock.acquired) log("pipeline disabled: " + (lock.reason ?? "lock not acquired") + "（本实例不启动后台索引）");
   log("pipeline limits v" + limitsHash(limits) + " hash=" + limits.hashConcurrency + " archive=" + limits.archiveConcurrency + " thumbs=" + limits.thumbConcurrency + " cache=" + limits.cacheMaxBytes + "B");
 
+  // FIX-01：启动清扫失联的预览/应用（scanning 超时无作业、applying 作业已死、apply_runs 跑飞）。
+  // 与 jobs 恢复解耦：scan_previews 不参与 jobs 恢复，否则会永久停在 scanning。
+  const sweptPreviews = repo.expireScanPreviews();
+  if (sweptPreviews) log("scan previews swept: " + sweptPreviews + " row(s) -> expired/failed");
   const recovered = lock.acquired ? repo.recoverInFlight() : 0;
 
   let app: FastifyInstance | null = null;

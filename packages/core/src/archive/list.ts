@@ -35,7 +35,7 @@ import { accessSync, chmodSync, closeSync, constants as fsConstants, copyFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
-import { AppError, type ArchiveEntry, type ArchiveListing, type ContainerKind } from "../contracts";
+import { AppError, type AppErrorCode, type ArchiveEntry, type ArchiveListing, type ContainerKind } from "../contracts";
 import { CancelledError, TimeoutError, deadlineOf, isCancelledError, isTimeoutError, type AbortOptions, type Deadline } from "../abort";
 import { LimitError, normalizeLimit, type ListingLimit } from "../limits";
 import { listRar, readRarEntry } from "./rar";
@@ -121,8 +121,14 @@ function limitFromStop(err: unknown): ListingLimit | null {
 
 // ---------------------------------------------------------------- 容器探测
 
-/** 按魔数探测容器；魔数不认识时退回扩展名；都不认识返回 null。 */
-export function detectContainer(file: string): ContainerKind | null {
+export interface ContainerProbe {
+  kind: ContainerKind | null;
+  /** FIX-03：open/read 魔数失败时保留 errno（EBUSY/EACCES/…），供上层映射 409/403 而不是误报“不是压缩包”。 */
+  error?: NodeJS.ErrnoException;
+}
+
+/** 按魔数探测容器，同时保留读取失败的 errno；魔数不认识时退回扩展名。 */
+export function probeContainer(file: string): ContainerProbe {
   let magic: Buffer;
   try {
     const fd = openSync(file, "r");
@@ -133,25 +139,30 @@ export function detectContainer(file: string): ContainerKind | null {
     } finally {
       closeSync(fd);
     }
-  } catch {
-    return null;
+  } catch (err) {
+    return { kind: null, error: err as NodeJS.ErrnoException };
   }
   if (magic.length >= 4 && magic[0] === 0x50 && magic[1] === 0x4b) {
     // 50 4B 03 04 (local header) / 05 06 (empty) / 07 08 (spanned)
-    if (magic[2] === 0x03 || magic[2] === 0x05 || magic[2] === 0x07) return "zip";
+    if (magic[2] === 0x03 || magic[2] === 0x05 || magic[2] === 0x07) return { kind: "zip" };
   }
-  if (magic.length >= 6 && magic.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]))) return "7z";
-  if (magic.length >= 7 && magic.subarray(0, 7).equals(Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]))) return "rar";
-  if (magic.length >= 8 && magic.subarray(0, 8).equals(Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]))) return "rar";
+  if (magic.length >= 6 && magic.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]))) return { kind: "7z" };
+  if (magic.length >= 7 && magic.subarray(0, 7).equals(Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]))) return { kind: "rar" };
+  if (magic.length >= 8 && magic.subarray(0, 8).equals(Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]))) return { kind: "rar" };
   if (magic.length >= 2 && magic[0] === 0x1f && magic[1] === 0x8b) {
-    return file.toLowerCase().endsWith(".unitypackage") ? "unitypackage" : null;
+    return { kind: file.toLowerCase().endsWith(".unitypackage") ? "unitypackage" : null };
   }
   const lower = file.toLowerCase();
-  if (lower.endsWith(".zip")) return "zip";
-  if (lower.endsWith(".7z")) return "7z";
-  if (lower.endsWith(".rar")) return "rar";
-  if (lower.endsWith(".unitypackage")) return "unitypackage";
-  return null;
+  if (lower.endsWith(".zip")) return { kind: "zip" };
+  if (lower.endsWith(".7z")) return { kind: "7z" };
+  if (lower.endsWith(".rar")) return { kind: "rar" };
+  if (lower.endsWith(".unitypackage")) return { kind: "unitypackage" };
+  return { kind: null };
+}
+
+/** 兼容旧调用：只关心容器类型时用它（错误细节用 probeContainer）。 */
+export function detectContainer(file: string): ContainerKind | null {
+  return probeContainer(file).kind;
 }
 
 function assertReadableFile(file: string): void {
@@ -289,8 +300,22 @@ async function openZipDecoded(file: string, deadline: Deadline | null): Promise<
  * node-stream-zip 对加密条目的原文是 `Error('Entry encrypted')`（node_stream_zip.js:475），
  * 损坏包则是 zlib/中央目录解析错误 → 统一归到 NOT_AN_ARCHIVE 并附原文尾巴。
  */
+/** FIX-03：把文件系统 errno 映射成可判别的 AppError（EBUSY→409 FILE_BUSY，EACCES/EPERM→403 PERMISSION）。 */
+function accessErrorToAppError(err: unknown, file: string): AppError | null {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (code === "EBUSY" || code === "EMFILE" || code === "ETXTBSY") {
+    return new AppError("FILE_BUSY" as AppErrorCode, `file busy (${code}): ${file}`, 409);
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    return new AppError("PERMISSION" as AppErrorCode, `permission denied (${code}): ${file}`, 403);
+  }
+  return null;
+}
+
 function translateArchiveError(err: unknown, file: string, container: string, entryPath?: string): AppError {
   if (err instanceof AppError) return err;
+  const access = accessErrorToAppError(err, file);
+  if (access) return access;
   const e = err as NodeJS.ErrnoException;
   const msg = e?.message ?? String(err);
   if (/encrypted|password/i.test(msg)) {
@@ -707,11 +732,15 @@ export interface ReadEntryOptions extends AbortOptions { /* timeoutMs / signal *
  */
 export async function listArchive(file: string, opts: ListArchiveOptions = {}): Promise<ArchiveListingResult> {
   assertReadableFile(file);
-  const container = detectContainer(file);
+  // FIX-03：先探测（保留 errno），打不开/没权限时给出 FILE_BUSY/PERMISSION，而不是误判为不认识的容器。
+  const probe = probeContainer(file);
+  const container = probe.kind;
   const st = makeState(opts);
   const deadline = deadlineOf(opts, `listArchive ${file}`);
   try {
     if (container === null) {
+      const access = probe.error ? accessErrorToAppError(probe.error, file) : null;
+      if (access) throw access;
       throw new AppError("NOT_AN_ARCHIVE", `unrecognised container (no known magic, no known extension): ${file}`, 400);
     }
     if (container === "unitypackage") {

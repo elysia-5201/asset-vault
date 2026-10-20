@@ -30,6 +30,8 @@ export interface EnqueueOptions {
   priority?: number;
   /** 只入队某个阶段（内部用） */
   stagesOnly?: Stage[];
+  /** v7：任务归属的顶层作业 id（runner 透传；reap 时按 job 重置 running 子任务）。 */
+  jobId?: number | null;
 }
 
 export interface PipelineStats {
@@ -52,6 +54,12 @@ export interface PipelineStats {
 }
 
 interface ProgressPatch { bytesDone?: number; bytesTotal?: number; itemsDone?: number; itemsTotal?: number }
+/** FIX-03：不可重试的永久错误码（与 isRetryableStageError 配套）。 */
+const PERMANENT_STAGE_ERRORS = new Set([
+  "ENOENT", "EACCES", "EPERM", "PERMISSION", "NOT_FOUND", "INVALID_INPUT", "NOT_AN_ARCHIVE", "ARCHIVE_PASSWORD",
+]);
+/** v7 任务围栏：领取时拿到的 owner + lease_token；所有进度/终态写入都必须带上。 */
+interface TaskFence { owner: string; leaseToken: number }
 
 export class IndexPipeline {
   private stopped = false;
@@ -60,7 +68,11 @@ export class IndexPipeline {
   private startedAt = new Date().toISOString();
   private workers: Promise<void>[] = [];
   private controllers = new Map<number, AbortController>();
-  private progress = new Map<number, ProgressPatch>();
+  private progress = new Map<number, { patch: ProgressPatch; fence?: TaskFence; stage: Stage }>();
+  /** 本 pipeline 实例的租约 owner（claim 时写入 index_tasks.owner）。 */
+  private readonly owner = "pipeline#" + process.pid + "#" + Math.random().toString(36).slice(2, 10);
+  /** 已被接管的任务 id（只记一次 lease_lost 诊断，避免刷屏）。 */
+  private lostLogged = new Set<number>();
   private flushTimer: NodeJS.Timeout | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
   private retentionTimer: NodeJS.Timeout | null = null;
@@ -163,6 +175,7 @@ export class IndexPipeline {
       assetId: asset.id, itemId: asset.item_id, priority,
       maxAttempts: this.deps.limits.taskMaxAttempts, fingerprint: fp, versionKey: "v1",
       stages: plan, assetState: { state: "queued", error: null },
+      jobId: opts.jobId ?? null,
     });
     this.notifyStages(new Set(plan.map((p) => p.stage)));
     return ids;
@@ -354,7 +367,7 @@ export class IndexPipeline {
     while (!this.stopped) {
       if (this.paused) { await this.sleep(stage, 250); continue; }
       let task: any = null;
-      try { task = this.deps.repo.claimIndexTask(stage); } catch (e) { this.deps.log("pipeline claim error: " + msgOf(e)); }
+      try { task = this.deps.repo.claimIndexTask(stage, this.owner); } catch (e) { this.deps.log("pipeline claim error: " + msgOf(e)); }
       if (!task) { await this.sleep(stage, 250); continue; }
       try { await this.execute(stage, task); } catch (e) { this.deps.log("pipeline execute crash: " + msgOf(e)); }
     }
@@ -362,19 +375,27 @@ export class IndexPipeline {
 
   private async execute(stage: Stage, task: any): Promise<void> {
     const repo = this.deps.repo;
+    const fence = this.fenceOf(task);
+    const finishOpts = { requireRunning: true, owner: fence?.owner, leaseToken: fence?.leaseToken };
     const asset = repo.getAsset(Number(task.asset_id)) as AssetRow | null;
     if (!asset || asset.status === "trashed") {
-      repo.finishIndexTask(task.id, "skipped", { errorCode: "ASSET_GONE", error: "asset missing or trashed" }, { requireRunning: true });
+      if (repo.finishIndexTask(task.id, "skipped", { errorCode: "ASSET_GONE", error: "asset missing or trashed" }, finishOpts) === null) {
+        this.leaseLost(stage, task, "finish");
+        return;
+      }
       this.maybeRefresh(Number(task.asset_id));
       this.notifyStages([stage, ...NEXT_STAGES[stage]]);
       return;
     }
     // 前置校验：文件变了 → 本任务作废，整链重建（绝不把旧快照写进新文件）
     if (task.fingerprint && String(task.fingerprint) !== fingerprintOf(asset)) {
-      repo.finishIndexTask(task.id, "skipped", { errorCode: "STALE", error: "file changed since enqueue" }, { requireRunning: true });
+      if (repo.finishIndexTask(task.id, "skipped", { errorCode: "STALE", error: "file changed since enqueue" }, finishOpts) === null) {
+        this.leaseLost(stage, task, "finish");
+        return;
+      }
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "stale", detail: "fingerprint " + task.fingerprint + " != " + fingerprintOf(asset) });
       this.cancelAsset(asset.id);
-      this.enqueueAsset(asset.id, { priority: Number(task.priority) || 50 });
+      this.enqueueAsset(asset.id, { priority: Number(task.priority) || 50, jobId: task.job_id ?? null });
       this.maybeRefresh(asset.id);
       this.notifyStages([stage, ...NEXT_STAGES[stage]]);
       return;
@@ -387,7 +408,7 @@ export class IndexPipeline {
     const ctx: StageCtx = {
       repo, media: this.deps.media, cache: this.deps.cache, limits: this.deps.limits,
       log: this.deps.log, signal: ac.signal,
-      progress: (p) => this.noteProgress(Number(task.id), p),
+      progress: (p) => this.noteProgress(Number(task.id), p, fence, stage),
     };
 
     let timer: NodeJS.Timeout | null = null;
@@ -400,13 +421,14 @@ export class IndexPipeline {
         }),
       ]);
       this.flushTaskProgress(Number(task.id));
-      this.complete(stage, task, asset, result, started);
+      this.complete(stage, task, asset, result, started, fence);
     } catch (e) {
       this.flushTaskProgress(Number(task.id));
-      this.fail(stage, task, asset, e, started);
+      this.fail(stage, task, asset, e, started, fence);
     } finally {
       if (timer) clearTimeout(timer);
       this.controllers.delete(Number(task.id));
+      this.lostLogged.delete(Number(task.id));
       this.processed++;
       this.stageMetrics.set(stage, { count: (this.stageMetrics.get(stage)?.count ?? 0) + 1, ms: (this.stageMetrics.get(stage)?.ms ?? 0) + (Date.now() - started) });
       // task-17 #1：只唤醒本阶段（同阶段还有排队任务）与直接下游（依赖刚被满足）；
@@ -415,47 +437,69 @@ export class IndexPipeline {
     }
   }
 
-  private complete(stage: Stage, task: any, asset: AssetRow, result: StageResult, ms: number): void {
+  private complete(stage: Stage, task: any, asset: AssetRow, result: StageResult, ms: number, fence?: TaskFence): void {
     const repo = this.deps.repo;
+    const finishOpts = { requireRunning: true, owner: fence?.owner, leaseToken: fence?.leaseToken };
     if (result.limited) {
-      repo.finishIndexTask(task.id, "skipped", { errorCode: result.limited.code, error: result.limited.message }, { requireRunning: true });
+      if (repo.finishIndexTask(task.id, "skipped", { errorCode: result.limited.code, error: result.limited.message }, finishOpts) === null) {
+        this.leaseLost(stage, task, "finish");
+        return;
+      }
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "limited", detail: JSON.stringify(result.limited) });
       this.deps.log("pipeline " + stage + " asset " + asset.id + " limited: " + result.limited.message);
       this.maybeRefresh(asset.id);
       return;
     }
     if (result.skipped) {
-      repo.finishIndexTask(task.id, "skipped", { errorCode: "NOT_APPLICABLE", error: result.skipped }, { requireRunning: true });
+      if (repo.finishIndexTask(task.id, "skipped", { errorCode: "NOT_APPLICABLE", error: result.skipped }, finishOpts) === null) {
+        this.leaseLost(stage, task, "finish");
+        return;
+      }
       this.maybeRefresh(asset.id);
       return;
     }
-    repo.finishIndexTask(task.id, "done", {}, { requireRunning: true });
+    if (repo.finishIndexTask(task.id, "done", {}, finishOpts) === null) {
+      this.leaseLost(stage, task, "finish");
+      return;
+    }
     this.maybeRefresh(asset.id);
     if (result.note) this.deps.log("pipeline " + stage + " asset " + asset.id + " ok: " + result.note + " (" + ms + "ms)");
   }
 
-  private fail(stage: Stage, task: any, asset: AssetRow, e: unknown, ms: number): void {
+  private fail(stage: Stage, task: any, asset: AssetRow, e: unknown, ms: number, fence?: TaskFence): void {
     const repo = this.deps.repo;
+    const finishOpts = { requireRunning: true, owner: fence?.owner, leaseToken: fence?.leaseToken };
     const code = String((e as any)?.code ?? "");
     const message = msgOf(e);
     if (code === "CANCELLED" || code === "ABORT_ERR" || (e instanceof CancelledError)) {
-      repo.finishIndexTask(task.id, "cancelled", { errorCode: "CANCELLED", error: message }, { requireRunning: true });
+      if (repo.finishIndexTask(task.id, "cancelled", { errorCode: "CANCELLED", error: message }, finishOpts) === null) {
+        this.leaseLost(stage, task, "finish");
+        return;
+      }
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "cancelled", detail: message });
       this.maybeRefresh(asset.id);
       return;
     }
-    this.failures++;
-    this.lastError = { at: new Date().toISOString(), stage, assetId: asset.id, message };
     const attempts = Number(task.attempts) || 0;
     const max = Number(task.max_attempts) || this.deps.limits.taskMaxAttempts;
-    const retryable = code !== "TIMEOUT" && !/ENOENT|EACCES|EPERM/i.test(message) ? attempts < max : attempts < max;
+    const retryable = this.isRetryableStageError(code, message, attempts, max);
     if (retryable) {
       const backoff = Math.min(this.deps.limits.retryMaxMs, this.deps.limits.retryBaseMs * Math.pow(2, Math.max(0, attempts - 1)));
-      repo.retryIndexTask(task.id, { errorCode: code || "ERROR", error: message, backoffMs: backoff });
+      if (repo.retryIndexTask(task.id, { errorCode: code || "ERROR", error: message, backoffMs: backoff }, fence) === null && fence) {
+        this.leaseLost(stage, task, "retry");
+        return;
+      }
+      this.failures++;
+      this.lastError = { at: new Date().toISOString(), stage, assetId: asset.id, message };
       repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "retry", detail: message + " (attempt " + attempts + "/" + max + ", backoff " + backoff + "ms)" });
       return;
     }
-    repo.finishIndexTask(task.id, "failed", { errorCode: code || "ERROR", error: message }, { requireRunning: true });
+    if (repo.finishIndexTask(task.id, "failed", { errorCode: code || "ERROR", error: message }, finishOpts) === null) {
+      this.leaseLost(stage, task, "finish");
+      return;
+    }
+    this.failures++;
+    this.lastError = { at: new Date().toISOString(), stage, assetId: asset.id, message };
     repo.logPipelineEvent({ taskId: task.id, assetId: asset.id, stage, event: "failed", detail: message });
     const skipped = repo.skipDependentTasks(task.id, "UPSTREAM_FAILED", "上游阶段失败: " + stage + " — " + message);
     this.maybeRefresh(asset.id);
@@ -466,6 +510,22 @@ export class IndexPipeline {
    * task-17 #3：每链只刷一次资产索引状态（链尾/失败时）。展示状态最多滞后一个链时长，
    * 但省掉"每任务一次 refresh + listIndexTasks"的 6 倍固定成本；refresh 本身复用同一 SQL。
    */
+  /**
+   * FIX-03：显式重试判定（不再有恒等三元式）。
+   * - 次数用尽 → 不重试；
+   * - 瞬时错误（TIMEOUT / FILE_BUSY / EBUSY / EMFILE）→ 重试；
+   * - 永久错误（ENOENT/EACCES/EPERM/PERMISSION/NOT_FOUND/INVALID_INPUT/NOT_AN_ARCHIVE/ARCHIVE_PASSWORD）→ 不重试；
+   * - 其它未知错误 → 重试（保守，最多 max 次）。
+   */
+  private isRetryableStageError(code: string, message: string, attempts: number, max: number): boolean {
+    if (attempts >= max) return false;
+    const c = code.toUpperCase();
+    if (c === "TIMEOUT" || c === "FILE_BUSY" || c === "EBUSY" || c === "EMFILE") return true;
+    if (PERMANENT_STAGE_ERRORS.has(c)) return false;
+    if (/ENOENT|EACCES|EPERM/i.test(message) && !/busy|locked/i.test(message)) return false;
+    return true;
+  }
+
   private maybeRefresh(assetId: number): void {
     try {
       if (this.deps.repo.countActiveIndexTasks([assetId]) === 0) this.refreshAssetState(assetId);
@@ -488,16 +548,39 @@ export class IndexPipeline {
     } catch { /* 状态刷新失败不影响任务结果 */ }
   }
 
-  private noteProgress(taskId: number, p: ProgressPatch): void {
-    const cur = this.progress.get(taskId) ?? {};
-    this.progress.set(taskId, { ...cur, ...p });
+  private noteProgress(taskId: number, p: ProgressPatch, fence: TaskFence | undefined, stage: Stage): void {
+    const cur = this.progress.get(taskId)?.patch ?? {};
+    this.progress.set(taskId, { patch: { ...cur, ...p }, fence, stage });
   }
 
   private flushTaskProgress(taskId: number): void {
-    const p = this.progress.get(taskId);
-    if (!p) return;
-    try { this.deps.repo.updateIndexTask(taskId, p); } catch { /* ignore */ }
+    const entry = this.progress.get(taskId);
+    if (!entry) return;
+    try {
+      // v7：进度写入同样带 owner+token CAS；被接管后 0 行 → 只记一条 lease_lost，不抛错
+      if (this.deps.repo.updateIndexTask(taskId, entry.patch, entry.fence) === false) {
+        this.leaseLost(entry.stage, { id: taskId }, "progress");
+      }
+    } catch { /* ignore */ }
     this.progress.delete(taskId);
+  }
+
+  /** claim 返回的 owner/lease_token → 围栏；旧任务（owner NULL）返回 undefined（未围栏兼容路径）。 */
+  private fenceOf(task: any): TaskFence | undefined {
+    if (!task || task.owner === null || task.owner === undefined) return undefined;
+    return { owner: String(task.owner), leaseToken: Number(task.lease_token) || 0 };
+  }
+
+  /** 被接管后的迟到写入：只记一条 pipeline_events(lease_lost)，不刷屏、不影响新持有者。 */
+  private leaseLost(stage: Stage, task: any, where: string): void {
+    const id = Number(task?.id);
+    if (!Number.isFinite(id)) return;
+    if (this.lostLogged.has(id)) return;
+    this.lostLogged.add(id);
+    try {
+      this.deps.repo.logPipelineEvent({ taskId: id, assetId: task?.asset_id ?? null, stage, event: "lease_lost", detail: "task taken over; stale " + where + " discarded" });
+    } catch { /* ignore */ }
+    this.deps.log("pipeline " + stage + " task " + id + " lease lost; stale " + where + " discarded");
   }
 
   private flushProgress(): void {

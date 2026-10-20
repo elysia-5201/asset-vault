@@ -722,6 +722,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   app.post("/api/scan/previews", async (req, reply) => {
     try {
+      repo.expireScanPreviews(); // FIX-01：先清扫过期/失联的 scanning，避免复用一个永远 scanning 的旧预览
       const b = (req.body ?? {}) as any;
       const rootRow = b.rootId ? (repo.listRoots() as any[]).find((r) => r.id === toInt(b.rootId, 0)) : null;
       const path = String(b.path ?? rootRow?.path ?? "").trim();
@@ -790,6 +791,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/scan/previews/:id/apply", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
+      repo.expireScanPreviews();
       const p = previewOr404(id);
       if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
       if (p.state === "applying") return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "该预览正在应用中" } });
@@ -827,11 +829,22 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/scan/previews/:id/cancel", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
+      repo.expireScanPreviews();
       const p = previewOr404(id);
       if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
       if (p.state === "applying") return reply.status(409).send({ error: { code: "CONFLICT", message: "应用已开始，无法取消（可对失败项重试）" } });
       if (!["ready", "partial", "scanning"].includes(p.state)) return reply.status(409).send({ error: { code: "CONFLICT", message: "当前状态不可取消: " + p.state } });
-      return { preview: previewView(repo.updateScanPreview(id, { state: "cancelled", finished_at: now() })) };
+      // FIX-01：取消生成中的 job（payload.previewId），再 CAS 预览 → cancelled。
+      // 即使 job 已并发完成/暂停导致转移失败，预览 CAS 也会让生成器迟到的结果整体丢弃。
+      const active = repo.findActiveJobByPreview(id);
+      if (active) {
+        try {
+          const afterStop = repo.transitionJob(active.id, "stop");
+          if (afterStop.state === "releasing") repo.transitionJob(active.id, "cancel_apply");
+        } catch { /* 并发状态变化：忽略，预览 CAS 兜底 */ }
+      }
+      const updated = repo.updateScanPreviewIf(id, ["scanning", "ready", "partial"], { state: "cancelled", finished_at: now() });
+      return { preview: previewView(updated ?? repo.getScanPreview(id)) };
     } catch (e) { return fail(reply, e); }
   });
 
@@ -839,8 +852,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/scan/previews/:id/retry", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
+      repo.expireScanPreviews();
       const p = previewOr404(id);
       if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
+      // FIX-01 门禁：只允许 ready/partial（applying 且 job 已死会被上面的 sweep 变成 failed，不可重试）
+      if (!["ready", "partial"].includes(p.state)) {
+        return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "当前状态不可重试: " + p.state } });
+      }
       const rows = repo.listScanPreviewItems(id, { limit: 500 });
       const keys = rows.items.filter((x: any) => x.applied === 0 && x.error && ["new", "changed", "duplicate_suspected", "missing"].includes(x.change)).map((x: any) => x.item_key);
       if (keys.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "没有可重试的条目" } });
@@ -862,9 +880,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.delete("/api/scan/previews/:id", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
+      repo.expireScanPreviews();
       const p = previewOr404(id);
       if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
-      if (p.state === "applying") return reply.status(409).send({ error: { code: "CONFLICT", message: "应用进行中，不能删除预览" } });
+      // FIX-01：applying 只有在 apply job 仍活着时才禁止删除；job 已死（sweep 之前的状态）允许清理
+      if (p.state === "applying" && repo.isJobActive(p.apply_job_id)) {
+        return reply.status(409).send({ error: { code: "CONFLICT", message: "应用进行中，不能删除预览" } });
+      }
       return { deleted: repo.deleteScanPreview(id) };
     } catch (e) { return fail(reply, e); }
   });

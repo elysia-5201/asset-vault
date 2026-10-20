@@ -184,17 +184,15 @@ export async function generateScanPreview(
   });
   const { rows, counts, gate } = classifier.finish(scan);
   notify({ phase: "classify", files: scan.files, dirs: scan.dirs, bytes: scan.bytes, rows: rows.length });
-  repo.replaceScanPreviewItems(previewId, rows);
-  if (scan.errors.length) {
-    repo.addScanPreviewErrors(previewId, scan.errors.map((e) => ({ stage: "walk:" + e.op, path: e.path, code: e.code, message: e.message })));
-  }
   const rootReadable = scan.readability.rootReadable;
   const state = !rootReadable ? "failed" : scan.complete ? "ready" : "partial";
   const planHash = sha256Text(JSON.stringify({
     v: PREVIEW_GENERATOR_VERSION, path: normalizePath(p.path), deep, state,
     items: rows.map((r) => [r.path_norm, r.change]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
   }));
-  repo.updateScanPreview(previewId, {
+  // v0.6.1 FIX-01：终态 CAS（scanning→ready/partial/failed）。被取消/被清扫后迟到的结果整体丢弃，
+  // 不再写条目/错误，也不把 cancelled 覆盖回 ready。
+  const updated = repo.updateScanPreviewIf(previewId, ["scanning"], {
     state, plan_hash: planHash,
     truncated: scan.truncated ? 1 : 0, complete: scan.complete ? 1 : 0,
     files: scan.files, dirs: scan.dirs, bytes: scan.bytes, error_count: scan.errorCount,
@@ -210,6 +208,15 @@ export async function generateScanPreview(
     error: rootReadable ? null : "根目录不可读（readdir 失败），本轮结果不可用于判缺",
     finished_at: now(),
   });
+  if (!updated) {
+    const cur = repo.getScanPreview(previewId);
+    log("preview " + previewId + ": result discarded (state=" + (cur?.state ?? "gone") + ")");
+    return { state: String(cur?.state ?? "cancelled"), counts, gate };
+  }
+  repo.replaceScanPreviewItems(previewId, rows);
+  if (scan.errors.length) {
+    repo.addScanPreviewErrors(previewId, scan.errors.map((e) => ({ stage: "walk:" + e.op, path: e.path, code: e.code, message: e.message })));
+  }
   notify({ phase: "commit", files: scan.files, dirs: scan.dirs, bytes: scan.bytes, rows: rows.length });
   log("preview " + previewId + ": state=" + state + " files=" + scan.files + " counts=" + JSON.stringify(counts) + (gate.allowed ? "" : " missingSkipped(" + gate.reasons.join(",") + ")"));
   return { state, counts, gate };
@@ -278,11 +285,18 @@ export function finalizeApplyRun(
   }
   const counts = repo.scanPreviewItemCounts(payload.previewId);
   const state = applied > 0 && failed === 0 ? "applied" : applied > 0 ? "partially_applied" : "failed";
-  repo.updateScanPreview(payload.previewId, { state, finished_at: now() });
-  repo.updateScanApplyRun(payload.applyRunId, {
+  // v0.6.1 FIX-01：被取消/被清扫（不再是 applying/running）时丢弃迟到的收尾结果。
+  const preview = repo.updateScanPreviewIf(payload.previewId, ["applying"], { state, finished_at: now() });
+  if (!preview) {
+    const cur = repo.getScanPreview(payload.previewId);
+    log("apply " + payload.applyRunId + ": discarded (preview state=" + (cur?.state ?? "gone") + ")");
+    return { applied, failed, state: String(cur?.state ?? "cancelled") };
+  }
+  const run = repo.updateScanApplyRunIf(payload.applyRunId, ["running"], {
     state: failed === 0 ? "done" : (applied > 0 ? "partial" : "failed"),
     applied, failed, stale: payload.staleCount ?? 0, finished_at: now(), detail_json: JSON.stringify(counts),
   });
+  if (!run) log("apply " + payload.applyRunId + ": run state changed, finalization discarded");
   log("apply " + payload.applyRunId + ": applied=" + applied + " failed=" + failed + " stale=" + (payload.staleCount ?? 0) + " -> " + state);
   return { applied, failed, state };
 }

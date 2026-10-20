@@ -386,7 +386,12 @@ CREATE TABLE IF NOT EXISTS index_tasks (
   created_at TEXT NOT NULL,
   started_at TEXT,
   finished_at TEXT,
-  next_retry_at TEXT
+  next_retry_at TEXT,
+  -- v7 租约围栏：owner=领取者实例；lease_token=每次领取/接管+1（旧持有者按它被 CAS 拒绝）；
+  -- job_id=顶层作业 id（reap 时按 job 重置其 running 子任务；旧行为 NULL）。
+  owner TEXT,
+  lease_token INTEGER NOT NULL DEFAULT 0,
+  job_id INTEGER
 );
 -- 同一资产的同一阶段同时只允许一条活跃任务（排队/运行/等待重试）→ 天然去重
 CREATE UNIQUE INDEX IF NOT EXISTS ux_index_task_active ON index_tasks(asset_id, stage)
@@ -394,6 +399,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_index_task_active ON index_tasks(asset_id, 
 CREATE INDEX IF NOT EXISTS ix_index_task_pick ON index_tasks(state, stage, priority DESC, id);
 CREATE INDEX IF NOT EXISTS ix_index_task_asset ON index_tasks(asset_id, stage);
 CREATE INDEX IF NOT EXISTS ix_index_task_dep ON index_tasks(depends_on);
+CREATE INDEX IF NOT EXISTS ix_index_task_job ON index_tasks(job_id, state);
 
 -- 流水线诊断事件（崩溃恢复、取消、超限降级、缓存命中/失效都留痕；只增不改）
 CREATE TABLE IF NOT EXISTS pipeline_events (

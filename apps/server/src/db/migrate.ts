@@ -4,8 +4,9 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/src/categories/taxonomy";
 
 /** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心；v5=深度索引流水线/派生缓存；
- *  v6=jobs 租约/心跳列（辅助元数据，不改状态机）+ cache_entries.weak（缓存弱身份标记） */
-export const SCHEMA_VERSION = 6;
+ *  v6=jobs 租约/心跳列（辅助元数据，不改状态机）+ cache_entries.weak（缓存弱身份标记）；
+ *  v7=index_tasks 租约围栏列（owner/lease_token/job_id）+ (job_id,state) 索引 */
+export const SCHEMA_VERSION = 7;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 
@@ -41,6 +42,10 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   { table: "jobs", column: "heartbeat_at", ddl: "TEXT" },
   // v6：cache_entries.weak（派生缓存弱身份标记；旧库补列后默认 0=强身份，语义不变）
   { table: "cache_entries", column: "weak", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  // v7：index_tasks 租约围栏（辅助元数据；旧行 owner NULL/lease_token=0，未围栏写入仍兼容）
+  { table: "index_tasks", column: "owner", ddl: "TEXT" },
+  { table: "index_tasks", column: "lease_token", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "index_tasks", column: "job_id", ddl: "INTEGER" },
 ];
 
 function tableColumns(db: Database.Database, table: string): Set<string> {

@@ -10,6 +10,8 @@
  */
 import { basename, join } from "node:path";
 import { statSync, writeFileSync, unlinkSync } from "node:fs";
+import { open } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import type { AssetRow } from "../../../../../packages/core/src/contracts";
 import type { Repo } from "../../db/repo";
@@ -105,6 +107,45 @@ export function fingerprintOf(a: Pick<AssetRow, "size" | "mtime">): string {
   return Number(a.size || 0) + ":" + String(a.mtime ?? "");
 }
 
+/** 内容采样字节数：首尾各 64 KiB（合计最多 128 KiB/资产）。 */
+export const CONTENT_SAMPLE_BYTES = 64 * 1024;
+
+/**
+ * 内容采样指纹（task-33 / AUD-03 修复）：sha256(head 64KiB + tail 64KiB + size) 的前 16 hex。
+ *
+ * 为什么需要：身份 (size, mtime, ino, dev) 全是**元数据**，"同路径同 size+mtime 的内容替换"
+ * （cp -p 就地覆盖 / 写后 utimes 回写 / ext2-3 inode 复用）在元数据上完全不可见，
+ * 会把旧目录当成新文件的（AUD-03 S3b/S4/S9b/S10）；陈旧 sha 时还会把新内容写进旧 sha 强键（S5/S6）。
+ *
+ * 语义：
+ *  - 文件读不了 / 采样期间文件变了（size 与 stat 不一致、读不满）→ 返回 null，
+ *    调用方必须**绕过缓存**（不 get 不 put）：绝不能把"没采到样"当成"内容相同"。
+ *  - 只读首尾各 64 KiB，远端盘/大包也不会变成全量哈希（成本 1-3ms）。
+ */
+export async function contentSample(file: string, sizeHint?: number): Promise<string | null> {
+  let fh;
+  try { fh = await open(file, "r"); } catch { return null; }
+  try {
+    const st = await fh.stat();
+    const size = Number(st.size);
+    if (Number.isFinite(sizeHint) && Number(sizeHint) !== size) return null; // stat 与采样之间被替换
+    const len = Math.min(CONTENT_SAMPLE_BYTES, Math.max(0, size));
+    const head = Buffer.alloc(len);
+    const tail = Buffer.alloc(len);
+    const tailPos = Math.max(0, size - len);
+    const rHead = len ? await fh.read(head, 0, len, 0) : { bytesRead: 0 };
+    const rTail = len ? await fh.read(tail, 0, len, tailPos) : { bytesRead: 0 };
+    if (rHead.bytesRead !== len || rTail.bytesRead !== len) return null; // 读不满 = 采样不可信
+    const h = createHash("sha256");
+    h.update(head); h.update(tail); h.update(String(size));
+    return h.digest("hex").slice(0, 16);
+  } catch {
+    return null;
+  } finally {
+    try { await fh.close(); } catch { /* ignore */ }
+  }
+}
+
 /** 动态取 core 的新版本导出；core-content 落地前用旧实现兜底（签名兼容）。 */
 async function coreHash() {
   const m: any = await import("../../../../../packages/core/src/hash");
@@ -175,6 +216,8 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
   const core = await coreArchive();
   // 身份取**磁盘现状**（st 是 safeStat 的结果）：文件在排队期间被替换时，DB 行是旧值，不能拿它当身份
   const { identity, weak } = contentIdentity(asset, st);
+  // 内容采样（task-33）：把"元数据看不见的内容变化"带进键；采不到样就绕过缓存（不 get 不 put）
+  const sample = await contentSample(asset.path, st.size);
   const key = cacheKey({
     kind: "archive-listing",
     identity,
@@ -183,9 +226,10 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
       maxEntries: ctx.limits.maxArchiveEntries, maxEntryBytes: ctx.limits.maxEntryBytes,
       maxTotalReadBytes: ctx.limits.maxTotalReadBytes, maxCompressionRatio: ctx.limits.maxCompressionRatio,
     } }),
+    extra: { sample: sample ?? "unreadable" },
   });
   // 强身份命中时校验条目记录的 content_sha（防 DB 行被改/旧实现写入的脏条目）；弱身份没有 sha 可比
-  const cached = await ctx.cache.get<any>("archive-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
+  const cached = sample === null ? null : await ctx.cache.get<any>("archive-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
   if (cached && Array.isArray(cached.entries)) {
     checkAbort(ctx.signal);
     applyArchiveListing(ctx.repo, asset.id, cached.entries);
@@ -204,11 +248,15 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
   const entries = (listing.entries ?? []).map((e: any) => ({ path: e.path, size: Number(e.size) || 0, isDir: !!e.isDir }));
   applyArchiveListing(ctx.repo, asset.id, entries);
   const limited = listing.limited ?? (listing.truncated ? { code: "ENTRIES", message: "条目超过上限 " + ctx.limits.maxArchiveEntries + "，目录已截断" } : null);
-  await ctx.cache.put("archive-listing", key, { entries, limited, passwordProtected: !!listing.passwordProtected, truncated: !!listing.truncated }, {
-    kind: "archive-listing", contentSha: weak ? null : String(asset.sha256 ?? ""), versionKey: "archive:v" + core.version, weak,
-  });
+  if (sample !== null) {
+    await ctx.cache.put("archive-listing", key, { entries, limited, passwordProtected: !!listing.passwordProtected, truncated: !!listing.truncated }, {
+      kind: "archive-listing", contentSha: weak ? null : String(asset.sha256 ?? ""), versionKey: "archive:v" + core.version, weak,
+    });
+  } else {
+    ctx.log("archive asset " + asset.id + " content sample unreadable, cache bypassed");
+  }
   ctx.progress({ itemsDone: entries.length, itemsTotal: entries.length });
-  return { itemsTotal: entries.length, note: "entries=" + entries.length + (limited ? " (truncated)" : ""), limited };
+  return { itemsTotal: entries.length, note: "entries=" + entries.length + (limited ? " (truncated)" : "") + (sample === null ? "; sample unreadable (cache bypassed)" : ""), limited };
 }
 
 function applyArchiveListing(repo: Repo, assetId: number, entries: { path: string; size: number; isDir: boolean }[]): void {
@@ -223,16 +271,18 @@ export async function stageUnityPackage(ctx: StageCtx, asset: AssetRow): Promise
     return { limited: { code: "BYTES", message: "unitypackage " + st.size + " 字节超过解析上限 " + ctx.limits.maxArchiveBytes } };
   }
   const core = await coreUnityPackage();
-  // 同 stageArchive：身份取磁盘现状
+  // 同 stageArchive：身份取磁盘现状 + 内容采样
   const { identity, weak } = contentIdentity(asset, st);
+  const sample = await contentSample(asset.path, st.size);
   const key = cacheKey({
     kind: "upkg-listing", identity, versionKey: "upkg:v" + core.version,
     // 审计 F6：maxTotalReadBytes 会改变结果（预算命中会提前停止），必须进 limitsHash
     limitsHash: cacheKey({ kind: "limits", identity: "u", versionKey: "", extra: {
       maxAssets: ctx.limits.maxUnityPackageAssets, maxEntryBytes: ctx.limits.maxEntryBytes, maxTotalReadBytes: ctx.limits.maxTotalReadBytes,
     } }),
+    extra: { sample: sample ?? "unreadable" },
   });
-  const cached = await ctx.cache.get<any>("upkg-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
+  const cached = sample === null ? null : await ctx.cache.get<any>("upkg-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
   if (cached && Array.isArray(cached.assets)) {
     checkAbort(ctx.signal);
     applyUpkgListing(ctx.repo, asset.id, cached.assets);
@@ -249,11 +299,15 @@ export async function stageUnityPackage(ctx: StageCtx, asset: AssetRow): Promise
   const assets = (listing.assets ?? []).map((a: any) => ({ guid: String(a.guid), assetPath: String(a.assetPath), type: a.type ?? null, size: a.size ?? null, hasPreview: !!a.hasPreview }));
   applyUpkgListing(ctx.repo, asset.id, assets);
   const limited = listing.limited ?? (listing.truncated ? { code: "ENTRIES", message: "资产数超过上限 " + ctx.limits.maxUnityPackageAssets } : null);
-  await ctx.cache.put("upkg-listing", key, { assets, limited, truncated: !!listing.truncated }, {
-    kind: "upkg-listing", contentSha: weak ? null : String(asset.sha256 ?? ""), versionKey: "upkg:v" + core.version, weak,
-  });
+  if (sample !== null) {
+    await ctx.cache.put("upkg-listing", key, { assets, limited, truncated: !!listing.truncated }, {
+      kind: "upkg-listing", contentSha: weak ? null : String(asset.sha256 ?? ""), versionKey: "upkg:v" + core.version, weak,
+    });
+  } else {
+    ctx.log("unitypackage asset " + asset.id + " content sample unreadable, cache bypassed");
+  }
   ctx.progress({ itemsDone: assets.length, itemsTotal: assets.length });
-  return { itemsTotal: assets.length, note: "assets=" + assets.length, limited };
+  return { itemsTotal: assets.length, note: "assets=" + assets.length + (sample === null ? "; sample unreadable (cache bypassed)" : ""), limited };
 }
 
 function applyUpkgListing(repo: Repo, assetId: number, assets: any[]): void {

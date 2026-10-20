@@ -4,7 +4,7 @@ import { basename, dirname, extname } from "node:path";
 import type { JobEvent, JobRow } from "../../../../packages/core/src/contracts";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { BoothClient } from "../../../../packages/core/src/source/booth";
-import { DEFAULT_JOB_HEARTBEAT_MS, DEFAULT_JOB_LEASE_MS, LeaseLostError, type JobLease, type Repo } from "../db/repo";
+import { DEFAULT_JOB_HEARTBEAT_MS, DEFAULT_JOB_LEASE_MS, LeaseLostError, type JobFence, type JobLease, type Repo } from "../db/repo";
 import { importBoothUrl } from "../services/booth";
 import { indexAsset } from "../services/indexing";
 import { matchItem } from "../services/match";
@@ -90,6 +90,8 @@ export interface RunJobOptions {
 export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions = {}): Promise<void> {
   const { repo } = deps;
   const lease = opts.lease;
+  // FIX-07：派生写入的作业围栏（有租约才传；嵌入式/直调/HTTP 路径保持无 fence 的旧行为）。
+  const fence: JobFence | undefined = lease ? { jobId, holder: lease.holder, token: lease.token } : undefined;
   const signal = opts.signal;
   const scratch: Scratch = { errors: [], visibleFailures: [], directIndexIds: [], directItemIds: [], scanQueued: 0 };
   // task-20 R3：TEMP 条目清单对**所有**作业类型可用（匹配阶段统一从这里读；非扫描类只写 directItemIds）。
@@ -166,13 +168,24 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
       if (payload.mode === "preview" && payload.previewId) {
         // task-20 R4：预览也接 limits（limit=本轮候选上限，batchSize=流式批大小，signal=可取消）
         const limits = deps.limits ?? DEFAULT_LIMITS;
-        const r = await generateScanPreview(repo, Number(payload.previewId), deps.log, {
-          batchSize: Math.max(1, Math.floor(Number(limits.registerBatchSize) || 200)),
-          limit: Math.max(1, Math.floor(Number(limits.maxScanFiles) || 20000)),
-          signal,
-        });
-        ensureLease();
-        scratch.note = "preview " + payload.previewId + ": " + r.state + " files=" + r.counts.total + " new=" + r.counts.new + " changed=" + r.counts.changed + " missing=" + r.counts.missing;
+        const previewId = Number(payload.previewId);
+        try {
+          const r = await generateScanPreview(repo, previewId, deps.log, {
+            batchSize: Math.max(1, Math.floor(Number(limits.registerBatchSize) || 200)),
+            limit: Math.max(1, Math.floor(Number(limits.maxScanFiles) || 20000)),
+            signal,
+          });
+          ensureLease();
+          scratch.note = "preview " + payload.previewId + ": " + r.state + " files=" + r.counts.total + " new=" + r.counts.new + " changed=" + r.counts.changed + " missing=" + r.counts.missing;
+        } catch (e) {
+          // FIX-01：生成抛错必须落终态（CAS 只从 scanning 出发；已被取消/接管则丢弃）
+          try {
+            repo.updateScanPreviewIf(previewId, ["scanning"], {
+              state: "failed", error: String(asError(e).message).slice(0, 300), finished_at: new Date().toISOString(),
+            });
+          } catch { /* 预览收尾失败不掩盖原始错误 */ }
+          throw e;
+        }
       } else {
         const limits = deps.limits ?? DEFAULT_LIMITS;
         const maxDepth = payload.deep ? 10 : 6;
@@ -254,7 +267,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
               if (plan.sourceItemId && !repo.getItem(itemId)!.sourceUrl) {
                 // D7 修复：自动匹配的条目必须带回溯链接，否则无法做更新检查基线
                 const url = `https://booth.pm/ja/items/${plan.sourceItemId}`;
-                repo.updateItem(itemId, { source_url: url, canonical_url: url });
+                repo.updateItem(itemId, { source_url: url, canonical_url: url }, fence);
               }
               batchItemIds.push(itemId);
               for (const a of plan.assets) {
@@ -268,9 +281,9 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
             // "资产已提交但没入队"，而重放时 created=0 永远不再入队（静默漏索引）。
             if (changedIds.length > 0 && deps.pipeline) {
               const p = deps.pipeline as any;
-              if (typeof p.enqueueAssets === "function") p.enqueueAssets(changedIds, { priority: 50 });
-              else p.enqueueMany(changedIds, { priority: 50 });
-              repo.insertScanAssetsBatch(changedIds);
+              if (typeof p.enqueueAssets === "function") p.enqueueAssets(changedIds, { priority: 50, jobId });
+              else p.enqueueMany(changedIds, { priority: 50, jobId });
+              repo.insertScanAssetsBatch(changedIds, fence);
               enqueuedNow = changedIds.length;
             }
             // task-20 R3：条目 id 写入 TEMP 清单（同事务；回滚不留脏行），替代无界 Set；
@@ -299,10 +312,14 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
             }
           }
         };
-        if (Array.isArray(payload.files) && payload.files.length > 0) {
+        // AUD-08：apply 的判定是 mode/applyRunId，不是 files.length>0 ——
+        // missing-only（files=[]）也必须走这条路，绝不能回退到整目录遍历。
+        const isApply = payload.mode === "apply" || !!payload.applyRunId;
+        const explicitFiles = Array.isArray(payload.files) ? (payload.files as string[]) : [];
+        if (isApply || explicitFiles.length > 0) {
           // M1 apply：只处理用户勾选的显式文件，不遍历目录 ⇒ 后续 missing 门控自然跳过（scan=null）
-          const files = (payload.files as string[]).map((p) => scannedFileOf(String(p))).filter((x): x is ScannedFile => !!x);
-          deps.log(`apply job ${jobId}: explicit files=${files.length}/${(payload.files as string[]).length}`);
+          const files = explicitFiles.map((p) => scannedFileOf(String(p))).filter((x): x is ScannedFile => !!x);
+          deps.log(`apply job ${jobId}: explicit files=${files.length}/${explicitFiles.length} (missingOnly=${isApply && explicitFiles.length === 0})`);
           for (let i = 0; i < files.length; i += batchSize) {
             const part = files.slice(i, i + batchSize);
             await registerBatch(part, { files: Math.min(i + part.length, files.length), dirs: 0, bytes: 0, truncated: false, batch: Math.floor(i / batchSize) + 1, batchFiles: part.length });
@@ -325,7 +342,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           scanGate = missingWriteGate(scan);
           if (scanGate.allowed) {
             const missing = repo.listMissingUnderPath(pathNorm).filter((a) => depthOf(a.path) <= maxDepth).map((a) => a.id);
-            repo.markAssetsMissing(missing);
+            repo.markAssetsMissing(missing, fence);
           } else {
             // 不完整的一轮：不写 missing，但必须留下可查询的证据（作业状态机不变，只追加诊断事件）。
             const skipped = repo.countMissingUnderPath(pathNorm);
@@ -342,7 +359,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
         // 用户确认过的"缺失"项：逐条写 missing（已有决策，不再经过整轮扫描的门控）
         if (Array.isArray(payload.markMissing) && payload.markMissing.length > 0) {
           const ids = (payload.markMissing as number[]).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0);
-          if (ids.length) { repo.markAssetsMissing(ids); deps.log(`apply job ${jobId}: marked ${ids.length} asset(s) missing (user-confirmed)`); }
+          if (ids.length) { repo.markAssetsMissing(ids, fence); deps.log(`apply job ${jobId}: marked ${ids.length} asset(s) missing (user-confirmed)`); }
         }
         scratch.scanQueued = assetQueued;
         scratch.note = `scan: files=${scan?.files ?? filesSeen} new=${assetNew} changed=${assetChanged} queued=${assetQueued} batches=${batches}${throttled ? " throttled=" + throttled : ""} ${isFile ? "(single file)" : ""}` +
@@ -392,8 +409,8 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
       const ids = scratch.directIndexIds;
       if (deps.pipeline) {
         const p = deps.pipeline as any;
-        if (typeof p.enqueueAssets === "function") p.enqueueAssets(ids, { priority: 50 });
-        else p.enqueueMany(ids, { priority: 50 });
+        if (typeof p.enqueueAssets === "function") p.enqueueAssets(ids, { priority: 50, jobId });
+        else p.enqueueMany(ids, { priority: 50, jobId });
         const waited = await waitDirectIndexed(repo, ids, Number(payload.indexWaitMs ?? 8000), ensureLease);
         ensureLease();
         deps.log(`job ${jobId}: ${ids.length} asset(s) queued to pipeline` + (waited ? " (settled)" : " (still running in background)"));
@@ -470,6 +487,24 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
     // 租约丢失导致的 walk/gate CANCELLED 一律按"丢租约"收尾（不做任何状态转移）
     if (lease && signal?.aborted) stopFail(new LeaseLostError(`job ${jobId} 租约已失效（心跳中断/被接管）`));
     else stopFail(e);
+    // FIX-01：按作业终态收尾对应预览/应用（被用户取消 → cancelled；失败 → failed；paused 留给恢复）
+    try {
+      const jd: any = job()?.payload ? JSON.parse(job()!.payload!) : {};
+      const previewId = Number(jd?.previewId ?? 0);
+      const st = job()?.state;
+      const target = st === "cancelled" ? "cancelled" : st === "failed" ? "failed" : null;
+      if (previewId && target) {
+        repo.updateScanPreviewIf(previewId, ["scanning", "applying"], {
+          state: target, error: "作业" + (target === "cancelled" ? "已取消" : "失败") + ": " + asError(e).message.slice(0, 200),
+          finished_at: new Date().toISOString(),
+        });
+      }
+      if (jd?.applyRunId && target) {
+        repo.updateScanApplyRunIf(Number(jd.applyRunId), ["running"], {
+          state: target === "cancelled" ? "cancelled" : "failed", finished_at: new Date().toISOString(),
+        });
+      }
+    } catch { /* 预览收尾失败不影响作业状态 */ }
   }
 }
 
