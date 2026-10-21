@@ -56,9 +56,10 @@ describe("createImportPlan", () => {
   });
 
   test("压缩包内条目：plan 指纹按条目 size 校验，未变化时 ready（不是恒 blocked）", async () => {
-    const p = mk("bundle.zip", 64);
-    const a = addAsset(t.db, itemId, rootId, p, { kind: "archive", container: "zip", path: p, path_norm: p, size: 64, mtime: "2026-10-02T00:00:00.000Z" });
-    t.db.prepare("INSERT INTO archive_entries(asset_id,entry_path,entry_size,is_dir,ext) VALUES (?,?,?,0,'.unitypackage')").run(a, "Manuka/only.unitypackage", 33);
+    // task-44：压缩包条目也必须能解析出包内路径（用真实夹具，不再用假 zip）
+    const p = join(process.cwd(), "test/fixtures/structure/out/D_companion.zip");
+    const a = addAsset(t.db, itemId, rootId, p, { kind: "archive", container: "zip", path: p, path_norm: p, size: 100, mtime: "2026-10-02T00:00:00.000Z" });
+    t.db.prepare("INSERT INTO archive_entries(asset_id,entry_path,entry_size,is_dir,ext) VALUES (?,?,?,0,'.unitypackage')").run(a, "MANUKA_model/MANUKA_model.unitypackage", 33);
     t.db.prepare("UPDATE assets SET index_state='done' WHERE id=?").run(a);
     await analyzeItemStructure(repo, itemId);
     const unit = repo.listUnits({ itemId }).find((u) => Number(u.asset_id) === a && u.importable)!;

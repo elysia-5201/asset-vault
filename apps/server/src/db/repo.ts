@@ -2146,9 +2146,13 @@ export class Repo {
   }
 
   // ---------- 工作台辅助查询 ----------
-  /** item 上人工/自动确认的 avatar id（FIX: detectUnitAvatars 的 item_avatar 证据）。 */
+  /**
+   * item 上**已确认**的 avatar id（task-44：只有 source='manual' 或 match='confirmed' 才算 confirmed 证据；
+   * source='auto' 的自动匹配不参与单元证据，避免把推测当人工确认）。
+   */
   itemAvatarIds(itemId: number): number[] {
-    return (this.stmt("SELECT avatar_id FROM item_avatars WHERE item_id=?").all(itemId) as any[]).map((r) => Number(r.avatar_id));
+    return (this.stmt("SELECT avatar_id FROM item_avatars WHERE item_id=? AND (source='manual' OR match='confirmed') ORDER BY avatar_id")
+      .all(itemId) as any[]).map((r) => Number(r.avatar_id));
   }
   /** 压缩包内可作为独立资源单元的 .unitypackage 条目（只取文件、大小写不敏感）。 */
   listUnitypackageEntries(assetId: number): { entryPath: string; size: number }[] {
