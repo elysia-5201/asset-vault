@@ -17,6 +17,13 @@ import type { Repo } from "../db/repo";
 
 /** 本机两个已知的 Unity 桥（都只监听 127.0.0.1）。 */
 export const UNITY_MCP_URLS = ["http://127.0.0.1:8080/mcp", "http://127.0.0.1:14523/mcp"];
+
+/** 按 settings.unity_mcp_url 优先构造客户端（routes 与 Job runner 共用，避免两套 URL 逻辑）。 */
+export function unityClientFor(repo: Pick<Repo, "getSetting">): UnityMcp {
+  const saved = String(repo.getSetting("unity_mcp_url") ?? "").trim();
+  const urls = saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
+  return new UnityMcp(urls);
+}
 const MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024;
 /** 内层 zip 下钻上限：VRChat 素材常见"一个 7z 里 9 个 per-avatar zip"，所以放得比较宽。 */
 const MAX_NESTED_ZIPS = 16;

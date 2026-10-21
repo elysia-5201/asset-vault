@@ -16,6 +16,7 @@ import type {
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   PipelineEvent, PipelineOverview, PipelineStage, PipelineTask,
+  ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, WorkbenchAvatar, WorkbenchAvatarCounts, WorkbenchItem, WorkbenchItemQuery, WorkbenchItemsResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
@@ -1048,3 +1049,266 @@ export async function recomputeSignatures(): Promise<RecomputeResponse> {
 }
 
 export type { ArchiveEntry, AssetRow, BoothItemMeta, ContainerKind, ItemStatus, JobRow, LibraryRootRow, RootMode, SourceSite, TagRow };
+
+// ---------------- Avatar 素材工作台（task-39） ----------------
+/**
+ * 契约由任务板固定（后端并行实现）。前端只做**宽容归一化**：
+ * 字段同时吃 camelCase / snake_case，裸数组与 {key:[]} 都吃，缺字段补默认值。
+ * ⚠️ 这里不定义任何新状态：单元执行状态（planned/importing/.../unknown）全部原样透传。
+ */
+function errOf(x: unknown): { code: string; message: string } | null {
+  if (!x || typeof x !== "object") return null;
+  const o = rec(x);
+  const code = typeof o.code === "string" ? o.code : "";
+  const message = typeof o.message === "string" ? o.message : "";
+  return code || message ? { code: code || "UNKNOWN", message } : null;
+}
+function strField(o: Record<string, unknown>, a: string, b: string): string | null {
+  const v = o[a] ?? o[b];
+  return typeof v === "string" && v ? v : null;
+}
+function numField(o: Record<string, unknown>, a: string, b: string): number | null {
+  const v = o[a] ?? o[b];
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function workbenchAvatarOf(raw: unknown): WorkbenchAvatar {
+  const o = rec(raw);
+  // 后端形状：{ avatar: { id, name }, counts: { confirmed, probable, unknown, mixed } }
+  const av = o.avatar && typeof o.avatar === "object" ? rec(o.avatar) : o;
+  const c = rec(o.counts);
+  const counts: WorkbenchAvatarCounts = {
+    total: numOr(c.total, 0),
+    confirmed: numOr(c.confirmed, 0),
+    probable: numOr(c.probable, 0),
+    unknown: numOr(c.unknown, 0),
+    mixed: numOr(c.mixed, 0),
+  };
+  if (c.suggested !== undefined) counts.suggested = numOr(c.suggested, 0);
+  for (const [k, v] of Object.entries(c)) if (counts[k] === undefined && Number.isFinite(Number(v))) counts[k] = Number(v);
+  if (!counts.total) counts.total = counts.confirmed + counts.probable + counts.unknown + counts.mixed;
+  return {
+    id: numOr(av.id, 0),
+    name: String(av.name ?? ("avatar #" + String(av.id ?? "?"))),
+    kind: typeof av.kind === "string" ? av.kind : null,
+    owned: numOr(av.owned, 0),
+    coverPath: typeof av.coverPath === "string" ? av.coverPath : null,
+    counts,
+  };
+}
+
+/**
+ * GET /api/workbench/units 的单元行 → WorkbenchItem。
+ * 后端行形状：{ id, assetId, itemId, relPath, format, kind, name, size, fingerprint, policy, importable,
+ *   mixed, parseState, parseError, avatars:[{avatarId,via,level,hits}], evidence, item:{id,title,status},
+ *   asset:{id,path,kind,container,size}, updatedAt }（旧的扁平形状也继续兼容）。
+ * unitId 一律用后端的数字 id —— 导入计划的 unitIds 要把它原样发回去。
+ */
+function workbenchItemOf(raw: unknown, idx: number): WorkbenchItem {
+  const o = rec(raw);
+  const itemRec = o.item && typeof o.item === "object" ? rec(o.item) : null;
+  const assetRec = o.asset && typeof o.asset === "object" ? rec(o.asset) : null;
+  const itemId = numOr(o.itemId ?? o.item_id ?? itemRec?.id, 0);
+  const assetId = numField(o, "assetId", "asset_id") ?? (assetRec ? (numOr(assetRec.id, 0) || null) : null);
+  const relPath = strField(o, "relPath", "rel_path");
+  const avatars = arr<unknown>(o.avatars).map((x) => rec(x));
+  const avatar0 = avatars.length ? avatars[0] : null;
+  const level = (typeof avatar0?.level === "string" && avatar0.level)
+    || (typeof o.level === "string" && o.level)
+    || "unknown";
+  const ev = o.evidence && typeof o.evidence === "object" ? rec(o.evidence) : null;
+  const hits = avatars.flatMap((a) => arr<unknown>(a.hits).map(String)).slice(0, 6);
+  const sources = avatars.map((a) => String(a.via ?? "")).filter(Boolean);
+  const unitId = String(o.unitId ?? o.unit_id ?? o.id ?? o.key ?? "") ||
+    [itemId, assetId === null ? "-" : assetId, relPath ?? "", idx].join(":");
+  const parseState = typeof o.parseState === "string" ? o.parseState : strField(o, "parse_state", "parse_state");
+  const parseError = strField(o, "parseError", "parse_error");
+  return {
+    unitId,
+    itemId,
+    assetId,
+    title: String(o.title ?? itemRec?.title ?? o.name ?? ("item #" + itemId)),
+    sourceSite: strField(o, "sourceSite", "source_site"),
+    sourceItemId: strField(o, "sourceItemId", "source_item_id"),
+    shopName: strField(o, "shopName", "shop_name"),
+    coverImageId: numField(o, "coverImageId", "cover_image_id"),
+    packageName: strField(o, "packageName", "package_name") ?? (typeof o.name === "string" ? o.name : null),
+    relPath,
+    // 互斥键：优先容器路径（压缩包/unitypackage 的原始资产路径），同一容器只能选一个单元
+    containerPath: strField(o, "containerPath", "container_path") ?? (assetRec ? strField(assetRec, "path", "path") : null),
+    avatarId: avatar0 ? numField(avatar0, "avatarId", "avatar_id") : numField(o, "avatarId", "avatar_id"),
+    avatarName: avatar0 ? (typeof avatar0.name === "string" ? avatar0.name : null) : strField(o, "avatarName", "avatar_name"),
+    kind: strField(o, "kind", "kind"),
+    level,
+    evidence: ev
+      ? { level: typeof ev.level === "string" ? ev.level : level, summary: String(ev.summary ?? ev.reason ?? ""), sources: arr<string>(ev.sources) }
+      : (hits.length || sources.length ? { level, summary: hits.join(" / "), sources } : null),
+    // 后端 policy：single_unitypackage / mixed_unitypackage / multi_package_container / unknown_structure
+    policy: typeof o.policy === "string" && o.policy ? o.policy : "unknown_structure",
+    mixed: o.mixed === true || o.policy === "mixed_unitypackage",
+    importable: o.importable === true,
+    parseState: parseState ?? null,
+    suggested: o.suggested === true || level === "probable" || level === "weak",
+    confirmed: o.confirmed === true || level === "confirmed",
+    error: errOf(o.error) ?? (parseError ? { code: "PARSE_" + String(parseState ?? "failed").toUpperCase(), message: parseError } : null),
+  };
+}
+
+function planUnitOf(raw: unknown, idx: number): ImportPlanUnit {
+  const o = rec(raw);
+  const itemId = numOr(o.itemId ?? o.item_id, 0);
+  const unitId = String(o.unitId ?? o.unit_id ?? o.key ?? "") || [itemId, idx].join(":");
+  const path = strField(o, "packagePath", "package_path") ?? strField(o, "path", "path");
+  const baseName = path ? (path.split(/[\\/]/).pop() ?? path) : null;
+  return {
+    unitId,
+    itemId,
+    assetId: numField(o, "assetId", "asset_id"),
+    title: String(o.title ?? o.name ?? baseName ?? ("unit #" + unitId)),
+    packagePath: path,
+    policy: typeof o.policy === "string" && o.policy ? o.policy : "unknown_structure",
+    mixed: o.mixed === true || o.policy === "mixed_unitypackage",
+    suggested: o.suggested === true || o.status === "suggested",
+    state: String(o.state ?? o.status ?? "pending"),
+    error: errOf(o.error),
+  };
+}
+function precheckOf(raw: unknown): ImportPrecheck {
+  const o = rec(raw);
+  const warnings = arr<unknown>(o.warnings).map((x) => String(x));
+  const errors = arr<unknown>(o.errors).map((x) => errOf(x)).filter((x): x is { code: string; message: string } => !!x);
+  return { ok: o.ok !== false, status: typeof o.status === "string" ? o.status : "", warnings, errors };
+}
+/** precheck 可能以 precheck_json 字符串落库（repo 里就是 TEXT）。 */
+function jsonOf(x: unknown): unknown {
+  if (typeof x !== "string") return x;
+  try { return JSON.parse(x) as unknown; } catch { return null; }
+}
+/**
+ * 计划视图归一化。后端返回 PlanView = { plan, items, precheck }（items 是 import_plan_items）。
+ * 所以 units 要从**外层** items 取，precheck 从外层 precheck 取（plan 行里只有 precheck_json）。
+ */
+function planOf(raw: unknown): ImportPlan {
+  const outer = rec(raw);
+  const p = outer.plan && typeof outer.plan === "object" ? rec(outer.plan) : outer;
+  const unitsSrc = outer.items ?? outer.units ?? p.units ?? p.items ?? p.plan_items;
+  const precheckSrc = outer.precheck ?? p.precheck ?? p.precheck_json;
+  return {
+    id: numOr(p.id ?? p.planId, 0),
+    state: String(p.state ?? p.status ?? ""),
+    avatarId: numField(p, "avatarId", "avatar_id"),
+    avatarName: strField(p, "avatarName", "avatar_name"),
+    projectPath: strField(p, "projectPath", "project_path"),
+    projectName: strField(p, "projectName", "project_name"),
+    precheck: precheckOf(jsonOf(precheckSrc)),
+    units: arr<unknown>(unitsSrc).map(planUnitOf),
+    mixedWarning: strField(p, "mixedWarning", "mixed_warning"),
+    // run 是在 import job 里建出来的：后端若在 plan 视图里暴露 run_id / latestRun.id 就能自动接上轮询
+    runId: numField(p, "runId", "run_id")
+      ?? (outer.latestRun && typeof outer.latestRun === "object" ? numField(rec(outer.latestRun), "id", "id") : null)
+      ?? (outer.run && typeof outer.run === "object" ? numField(rec(outer.run), "id", "id") : null),
+    jobId: numField(p, "jobId", "job_id"),
+    createdAt: strField(p, "createdAt", "created_at"),
+    error: errOf(p.error),
+  };
+}
+function runUnitOf(raw: unknown, idx: number): ImportRunUnit {
+  const o = rec(raw);
+  const itemId = numOr(o.itemId ?? o.item_id, 0);
+  return {
+    unitId: String(o.unitId ?? o.unit_id ?? o.key ?? "") || [itemId, idx].join(":"),
+    itemId,
+    title: String(o.title ?? o.name ?? o.rel_path ?? ("item #" + itemId)),
+    // 后端 import_run_items.status：importing / import_command_completed / verifying / verified / partial_success / failed
+    state: String(o.state ?? o.status ?? "unknown"),
+    error: errOf(o.error),
+    startedAt: strField(o, "startedAt", "started_at"),
+    finishedAt: strField(o, "finishedAt", "finished_at"),
+  };
+}
+function runOf(raw: unknown): ImportRun {
+  const outer = rec(raw);
+  const o = outer.run && typeof outer.run === "object" ? rec(outer.run) : outer;
+  return {
+    id: numOr(o.id ?? o.runId, 0),
+    planId: numOr(o.planId ?? o.plan_id, 0),
+    state: String(o.state ?? o.status ?? ""),
+    units: arr<unknown>(o.units ?? o.items ?? o.run_items).map(runUnitOf),
+    error: errOf(o.error),
+    startedAt: strField(o, "startedAt", "started_at"),
+    finishedAt: strField(o, "finishedAt", "finished_at"),
+  };
+}
+
+/**
+ * GET /api/workbench/avatars?itemId= —— 按 Avatar 聚合的单元证据计数。
+ * 后端返回**裸数组** [{ avatar:{id,name}, counts:{confirmed,probable,unknown,mixed} }]。
+ */
+export async function workbenchAvatars(itemId?: number): Promise<WorkbenchAvatar[]> {
+  const raw = await request<unknown>("GET", "/workbench/avatars" + queryString({ itemId }));
+  return pickArray<unknown>(raw, "avatars").map(workbenchAvatarOf);
+}
+/**
+ * GET /api/workbench/units —— 资源单元视图（后端只认 itemId/avatarId/policy/level/itemStatus/limit）。
+ * 关键词与分类由调用方本地过滤（后端不提供这两个参数，别假装发过去就生效）。
+ */
+export async function workbenchItems(q: WorkbenchItemQuery = {}): Promise<WorkbenchItemsResponse> {
+  const raw = await request<unknown>("GET", "/workbench/units" + queryString({
+    itemId: q.itemId, avatarId: q.avatarId, policy: q.policy || undefined, level: q.level || undefined,
+    itemStatus: q.itemStatus || undefined, limit: q.limit ?? 500,
+  }));
+  const items = pickArray<unknown>(raw, "items").map(workbenchItemOf);
+  return { items, total: items.length };
+}
+/**
+ * POST /api/import-plans —— 生成导入计划（只读预检，不动 Unity）。
+ * 后端**只认** `{ unitIds, projectPath, includeSuggested }`，且一次计划只能属于同一个 item（跨 item 报 400）。
+ * 返回 **201 PlanView** `{plan, items, precheck}`；这里归一化成 ImportPlan[]（通常 1 个）。
+ */
+export async function createImportPlans(body: {
+  projectPath: string;
+  unitIds: string[];
+  /** 是否把伴生单元作为 suggested 一起放进计划（会以未勾选状态出现） */
+  includeSuggested?: boolean;
+}): Promise<ImportPlan[]> {
+  const raw = await request<unknown>("POST", "/import-plans", {
+    unitIds: body.unitIds.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0),
+    projectPath: body.projectPath,
+    includeSuggested: body.includeSuggested === true,
+  }, { timeoutMs: 30000 });
+  const r = rec(raw);
+  // 三种返回都吃：{plan,items,precheck} / {plans:[...]} / 裸数组
+  const list = Array.isArray(r.plans) ? arr<unknown>(r.plans) : Array.isArray(raw) ? arr<unknown>(raw) : [raw];
+  return list.map(planOf).filter((p) => p.id > 0 || p.units.length > 0);
+}
+/** GET /api/import-plans/:id —— 计划状态 + precheck + 每单元。 */
+export async function getImportPlan(id: number): Promise<ImportPlan> {
+  return planOf(await request<unknown>("GET", "/import-plans/" + id));
+}
+/**
+ * POST /api/import-plans/:id/confirm —— **只做人工确认**（suggested → pending、user_confirmed=1、状态回 ready）。
+ * 它不执行导入；执行是下一个 execute。返回 PlanView。
+ */
+export async function confirmImportPlan(id: number): Promise<{ plan: ImportPlan }> {
+  const raw = await request<unknown>("POST", "/import-plans/" + id + "/confirm", {});
+  return { plan: planOf(raw) };
+}
+/**
+ * POST /api/import-plans/:id/execute —— Job 化执行：**202 {jobId, planId}**，不返回 run。
+ * 拿到 jobId 后轮询 GET /import-plans/:id 与（plan 暴露 run_id 后）GET /import-runs/:id。
+ */
+export async function executeImportPlan(id: number): Promise<ImportExecuteAck> {
+  const raw = await request<unknown>("POST", "/import-plans/" + id + "/execute", {});
+  const r = rec(raw);
+  return {
+    jobId: numField(r, "jobId", "job_id"),
+    planId: numField(r, "planId", "plan_id") ?? id,
+    runId: numField(r, "runId", "run_id"),
+  };
+}
+/** GET /api/import-runs/:id —— 执行进度（每单元 state 原样透传）。 */
+export async function getImportRun(id: number): Promise<ImportRun> {
+  return runOf(await request<unknown>("GET", "/import-runs/" + id));
+}

@@ -2145,6 +2145,201 @@ export class Repo {
     return this.stmt("SELECT * FROM cache_entries WHERE state='ready' ORDER BY last_used_at ASC, key ASC LIMIT ?").all(Math.max(1, limit)) as any[];
   }
 
+  // ---------- 工作台辅助查询 ----------
+  /** item 上人工/自动确认的 avatar id（FIX: detectUnitAvatars 的 item_avatar 证据）。 */
+  itemAvatarIds(itemId: number): number[] {
+    return (this.stmt("SELECT avatar_id FROM item_avatars WHERE item_id=?").all(itemId) as any[]).map((r) => Number(r.avatar_id));
+  }
+  /** 压缩包内可作为独立资源单元的 .unitypackage 条目（只取文件、大小写不敏感）。 */
+  listUnitypackageEntries(assetId: number): { entryPath: string; size: number }[] {
+    return (this.stmt("SELECT entry_path AS entryPath, entry_size AS size FROM archive_entries WHERE asset_id=? AND is_dir=0 AND lower(entry_path) LIKE '%.unitypackage' ORDER BY entry_path")
+      .all(assetId) as any[]).map((r) => ({ entryPath: String(r.entryPath), size: Number(r.size) || 0 }));
+  }
+  /** 单包资产里的 GUID 抽样（执行后验证工程里是否真的落盘）。 */
+  listUnitypackageGuids(assetId: number): string[] {
+    return (this.stmt("SELECT guid FROM unitypackage_assets WHERE asset_id=? ORDER BY guid").all(assetId) as any[]).map((r) => String(r.guid));
+  }
+  /** 工程里是否出现某 GUID（扫描 Assets 下 .meta 文本的方式在 services/structure 做，这里只提供期望集合）。 */
+
+  // ---------- 工作台：资源单元 / 关系 / 导入计划（v8）----------
+  /** 按 asset 替换（upsert + 删除消失项）单元集。返回 rel_path → unit id。 */
+  replaceAssetUnits(assetId: number, itemId: number | null, units: {
+    relPath: string; format: string; kind: string; name: string; size: number; fingerprint: string | null;
+    policy: string; importable: boolean; parseState: string; parseError?: string | null;
+    avatars?: unknown; evidence?: unknown;
+  }[]): Map<string, number> {
+    const t = now();
+    const up = this.stmt(
+      "INSERT INTO asset_units(asset_id,item_id,rel_path,format,kind,name,size,fingerprint,policy,importable,parse_state,parse_error,avatar_json,evidence_json,created_at,updated_at) " +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
+      "ON CONFLICT(asset_id,rel_path) DO UPDATE SET item_id=excluded.item_id, format=excluded.format, kind=excluded.kind, name=excluded.name, " +
+      "size=excluded.size, fingerprint=excluded.fingerprint, policy=excluded.policy, importable=excluded.importable, " +
+      "parse_state=excluded.parse_state, parse_error=excluded.parse_error, avatar_json=excluded.avatar_json, evidence_json=excluded.evidence_json, updated_at=excluded.updated_at"
+    );
+    const out = new Map<string, number>();
+    const tx = this.db.transaction(() => {
+      for (const u of units) {
+        up.run(assetId, itemId, u.relPath, u.format, u.kind, u.name, Math.max(0, Math.floor(u.size)), u.fingerprint,
+          u.policy, u.importable ? 1 : 0, u.parseState, u.parseError ?? null,
+          JSON.stringify(u.avatars ?? []), JSON.stringify(u.evidence ?? null), t, t);
+      }
+      const keep = units.map((u) => u.relPath);
+      if (keep.length === 0) this.stmt("DELETE FROM asset_units WHERE asset_id=?").run(assetId);
+      else {
+        const ph = keep.map(() => "?").join(",");
+        this.stmt("DELETE FROM asset_units WHERE asset_id=? AND rel_path NOT IN (" + ph + ")").run(assetId, ...keep);
+      }
+      const rows = this.stmt("SELECT id, rel_path FROM asset_units WHERE asset_id=?").all(assetId) as any[];
+      for (const r of rows) out.set(String(r.rel_path), Number(r.id));
+    });
+    tx();
+    return out;
+  }
+
+  replaceUnitRelations(fromUnitIds: number[], rels: { fromUnitId: number; toUnitId: number; type: string; evidence: string; confidence: string }[]): void {
+    const tx = this.db.transaction(() => {
+      for (const id of fromUnitIds) this.stmt("DELETE FROM unit_relations WHERE from_unit_id=?").run(id);
+      const ins = this.stmt("INSERT OR IGNORE INTO unit_relations(from_unit_id,to_unit_id,type,evidence,confidence,confirmed,created_at) VALUES (?,?,?,?,?,0,?)");
+      for (const r of rels) ins.run(r.fromUnitId, r.toUnitId, r.type, r.evidence, r.confidence, now());
+    });
+    tx();
+  }
+
+  listUnits(f: { itemId?: number; assetId?: number; avatarId?: number; policy?: string; level?: string; itemStatus?: string; limit?: number } = {}): any[] {
+    const w: string[] = ["1=1"]; const p: unknown[] = [];
+    if (f.itemId) { w.push("au.item_id=?"); p.push(f.itemId); }
+    if (f.assetId) { w.push("au.asset_id=?"); p.push(f.assetId); }
+    if (f.policy) { w.push("au.policy=?"); p.push(f.policy); }
+    if (f.itemStatus) { w.push("i.status=?"); p.push(f.itemStatus); }
+    if (f.avatarId) {
+      w.push("EXISTS (SELECT 1 FROM json_each(au.avatar_json) je WHERE CAST(json_extract(je.value,'$.avatarId') AS INTEGER)=?)"); p.push(f.avatarId);
+    }
+    if (f.level) {
+      w.push("EXISTS (SELECT 1 FROM json_each(au.avatar_json) je WHERE json_extract(je.value,'$.level')=?)"); p.push(f.level);
+    }
+    const limit = Math.min(2000, Math.max(1, Math.floor(f.limit ?? 1000)));
+    return this.stmt(
+      "SELECT au.*, a.path AS asset_path, a.kind AS asset_kind, a.container AS asset_container, a.size AS asset_size, " +
+      "i.title AS item_title, i.status AS item_status FROM asset_units au " +
+      "LEFT JOIN assets a ON a.id=au.asset_id LEFT JOIN items i ON i.id=au.item_id " +
+      "WHERE " + w.join(" AND ") + " ORDER BY i.title, au.asset_id, au.rel_path LIMIT ?"
+    ).all(...p as any[], limit) as any[];
+  }
+  getUnitsByIds(ids: number[]): any[] {
+    const unique = [...new Set(ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    if (unique.length === 0) return [];
+    const out: any[] = [];
+    const CHUNK = 400;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const part = unique.slice(i, i + CHUNK);
+      out.push(...this.stmt("SELECT * FROM asset_units WHERE id IN (" + part.map(() => "?").join(",") + ")").all(...part) as any[]);
+    }
+    return out;
+  }
+
+  workbenchAvatarCounts(itemId?: number): { avatar: { id: number; name: string }; counts: { confirmed: number; probable: number; unknown: number; mixed: number } }[] {
+    const units = this.listUnits({ itemId, limit: 2000 });
+    const map = new Map<number, { name: string; confirmed: Set<number>; probable: Set<number>; unknown: Set<number>; mixed: Set<number> }>();
+    for (const u of units) {
+      let avatars: any[] = [];
+      try { avatars = JSON.parse(u.avatar_json ?? "[]"); } catch { avatars = []; }
+      for (const a of Array.isArray(avatars) ? avatars : []) {
+        const id = Number(a?.avatarId); if (!Number.isFinite(id) || id <= 0) continue;
+        const rec = map.get(id) ?? { name: "", confirmed: new Set(), probable: new Set(), unknown: new Set(), mixed: new Set() };
+        if (!rec.name) { const row = this.stmt("SELECT name FROM avatars WHERE id=?").get(id) as any; rec.name = String(row?.name ?? "#" + id); }
+        const level = String(a?.level ?? "unknown");
+        if (level === "confirmed") rec.confirmed.add(Number(u.id));
+        else if (level === "probable") rec.probable.add(Number(u.id));
+        else rec.unknown.add(Number(u.id));
+        if (u.policy === "mixed_unitypackage") rec.mixed.add(Number(u.id));
+        map.set(id, rec);
+      }
+    }
+    return [...map.entries()].map(([id, r]) => ({ avatar: { id, name: r.name }, counts: { confirmed: r.confirmed.size, probable: r.probable.size, unknown: r.unknown.size, mixed: r.mixed.size } }))
+      .sort((a, b) => (b.counts.confirmed + b.counts.probable) - (a.counts.confirmed + a.counts.probable) || a.avatar.name.localeCompare(b.avatar.name));
+  }
+
+  listUnitRelations(fromUnitIds: number[], type?: string): any[] {
+    const unique = [...new Set(fromUnitIds.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    if (unique.length === 0) return [];
+    const w = "r.from_unit_id IN (" + unique.map(() => "?").join(",") + ")" + (type ? " AND r.type=?" : "");
+    const p: unknown[] = [...unique]; if (type) p.push(type);
+    return this.stmt(
+      "SELECT r.*, fu.name AS from_name, tu.name AS to_name, tu.asset_id AS to_asset_id, tu.policy AS to_policy, tu.importable AS to_importable " +
+      "FROM unit_relations r JOIN asset_units fu ON fu.id=r.from_unit_id JOIN asset_units tu ON tu.id=r.to_unit_id WHERE " + w
+    ).all(...p as any[]) as any[];
+  }
+
+  createImportPlan(input: { itemId: number; projectPath: string; policy?: string | null; status: string; precheck: unknown }): any {
+    const info = this.stmt("INSERT INTO import_plans(item_id,project_path,policy,status,user_confirmed,precheck_json,created_at,version) VALUES (?,?,?,?,0,?,?,1)")
+      .run(input.itemId, input.projectPath, input.policy ?? null, input.status, JSON.stringify(input.precheck ?? null), now());
+    return this.getImportPlan(Number(info.lastInsertRowid));
+  }
+  getImportPlan(id: number): any { return this.stmt("SELECT * FROM import_plans WHERE id=?").get(id) ?? null; }
+  listImportPlanItems(planId: number): any[] {
+    return this.stmt(
+      "SELECT pi.*, au.rel_path, au.kind AS unit_kind, au.name AS unit_name, au.parse_state, au.avatar_json, au.evidence_json, " +
+      "a.path AS asset_path, a.kind AS asset_kind, a.container AS asset_container " +
+      "FROM import_plan_items pi JOIN asset_units au ON au.id=pi.unit_id JOIN assets a ON a.id=pi.asset_id WHERE pi.plan_id=? ORDER BY pi.id"
+    ).all(planId) as any[];
+  }
+  addImportPlanItem(input: { planId: number; unitId: number; assetId: number; path: string; policy?: string | null; fingerprint?: string | null; status?: string; error?: string | null }): any {
+    const info = this.stmt("INSERT INTO import_plan_items(plan_id,unit_id,asset_id,path,policy,fingerprint,status,error) VALUES (?,?,?,?,?,?,?,?)")
+      .run(input.planId, input.unitId, input.assetId, input.path, input.policy ?? null, input.fingerprint ?? null, input.status ?? "pending", input.error ?? null);
+    return this.stmt("SELECT * FROM import_plan_items WHERE id=?").get(Number(info.lastInsertRowid));
+  }
+  updateImportPlan(id: number, patch: { status?: string; policy?: string | null; user_confirmed?: number; precheck_json?: string | null; version?: number }): any {
+    const allowed = ["status", "policy", "user_confirmed", "precheck_json", "version"];
+    const sets: string[] = []; const p: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
+    if (sets.length) { p.push(id); this.stmt("UPDATE import_plans SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
+    return this.getImportPlan(id);
+  }
+  updateImportPlanItem(id: number, patch: { status?: string; error?: string | null; fingerprint?: string | null; policy?: string | null }): any {
+    const allowed = ["status", "error", "fingerprint", "policy"];
+    const sets: string[] = []; const p: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
+    if (sets.length) { p.push(id); this.stmt("UPDATE import_plan_items SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
+    return this.stmt("SELECT * FROM import_plan_items WHERE id=?").get(id) ?? null;
+  }
+
+  createImportRun(input: { planId: number; projectId?: number | null; projectPath?: string | null }): any {
+    const info = this.stmt("INSERT INTO import_runs(plan_id,project_id,project_path,status,started_at) VALUES (?,?,?,'running',?)")
+      .run(input.planId, input.projectId ?? null, input.projectPath ?? null, now());
+    return this.getImportRun(Number(info.lastInsertRowid));
+  }
+  getImportRun(id: number): any { return this.stmt("SELECT * FROM import_runs WHERE id=?").get(id) ?? null; }
+  latestImportRun(planId: number): any { return this.stmt("SELECT * FROM import_runs WHERE plan_id=? ORDER BY id DESC LIMIT 1").get(planId) ?? null; }
+  /** 同一计划是否已有在跑的 import job（plan+kind 防重复；ux_jobs_inflight 只按 item+kind）。 */
+  findInflightImportJob(planId: number): any {
+    return this.stmt("SELECT * FROM jobs WHERE kind='import' AND json_extract(payload,'$.planId')=? AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1").get(planId) ?? null;
+  }
+  updateImportRun(id: number, patch: { status?: string; finished_at?: string | null; console_errors?: string | null; summary_json?: string | null; project_id?: number | null }): any {
+    const allowed = ["status", "finished_at", "console_errors", "summary_json", "project_id"];
+    const sets: string[] = []; const p: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
+    if (sets.length) { p.push(id); this.stmt("UPDATE import_runs SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
+    return this.getImportRun(id);
+  }
+  addImportRunItem(input: { runId: number; planItemId: number; unitId: number }): any {
+    const info = this.stmt("INSERT INTO import_run_items(run_id,plan_item_id,unit_id,status) VALUES (?,?,?,'pending')")
+      .run(input.runId, input.planItemId, input.unitId);
+    return this.stmt("SELECT * FROM import_run_items WHERE id=?").get(Number(info.lastInsertRowid));
+  }
+  listImportRunItems(runId: number): any[] {
+    return this.stmt(
+      "SELECT ri.*, pi.path, pi.policy, pi.unit_id AS plan_unit_id, au.name AS unit_name, au.rel_path " +
+      "FROM import_run_items ri JOIN import_plan_items pi ON pi.id=ri.plan_item_id JOIN asset_units au ON au.id=ri.unit_id WHERE ri.run_id=? ORDER BY ri.id"
+    ).all(runId) as any[];
+  }
+  updateImportRunItem(id: number, patch: { status?: string; started_at?: string | null; finished_at?: string | null; error?: string | null; detail_json?: string | null }): any {
+    const allowed = ["status", "started_at", "finished_at", "error", "detail_json"];
+    const sets: string[] = []; const p: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
+    if (sets.length) { p.push(id); this.stmt("UPDATE import_run_items SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
+    return this.stmt("SELECT * FROM import_run_items WHERE id=?").get(id) ?? null;
+  }
+
   // ---------- stats / export ----------
   stats(): StatsShape {
     const one = (sql: string) => (this.stmt(sql).get() as any).v as number;

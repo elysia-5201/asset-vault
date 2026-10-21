@@ -564,3 +564,180 @@ export interface ScanUsageResponse {
   ms: number;
 }
 
+// ---------------- Avatar 素材工作台（task-39） ----------------
+/**
+ * 证据级别（后端 asset_units.avatar_json[].level，前端只做展示映射，未知值原样显示不吞）：
+ *   confirmed 人工确认 > probable 结构/路径推断 > unknown 未定
+ *   （旧后端可能给 strong / weak / none，同样按原样兼容显示）
+ */
+export type WorkbenchLevel = "confirmed" | "probable" | "unknown" | "strong" | "weak" | "none" | string;
+/**
+ * 打包策略（后端 asset_units.policy）：
+ *   single_unitypackage 独立包 / mixed_unitypackage 混合整包（导入必带其它资源）/
+ *   unknown_structure 结构未知（不可导入）/（旧值 standalone / multi_package / unknown 兼容）
+ */
+export type WorkbenchPolicy =
+  | "single_unitypackage" | "mixed_unitypackage" | "unknown_structure"
+  | "standalone" | "multi_package" | "mixed" | "unknown" | string;
+
+export interface WorkbenchAvatarCounts {
+  total: number;
+  /** 已确认 */
+  confirmed: number;
+  /** 结构/路径推断（后端 counts.probable） */
+  probable: number;
+  /** 未定 */
+  unknown: number;
+  /** 混合整包单元数 */
+  mixed: number;
+  /** 兼容旧后端的 suggested 计数 */
+  suggested?: number;
+  /** 其它后端计数（如 byPolicy）；展示时按 key 兜底 */
+  [k: string]: number | undefined;
+}
+export interface WorkbenchAvatar {
+  id: number;
+  name: string;
+  kind: string | null;
+  owned: number;
+  coverPath: string | null;
+  counts: WorkbenchAvatarCounts;
+}
+
+export interface WorkbenchEvidence {
+  level: WorkbenchLevel;
+  /** 一句话摘要（后端给的原文，前端不重新拼） */
+  summary: string;
+  /** 证据来源（title / archive_path / unitypackage_path / ...） */
+  sources: string[];
+}
+
+/**
+ * 工作台里的一条「素材单元」= 一个可导入的包/文件（挂在某个 item 下）。
+ * unitId 缺失时由前端用 assetId/itemId/relPath 兜底生成，保证列表 key 与勾选稳定。
+ */
+export interface WorkbenchItem {
+  unitId: string;
+  itemId: number;
+  assetId: number | null;
+  title: string;
+  sourceSite: string | null;
+  sourceItemId: string | null;
+  shopName: string | null;
+  coverImageId: number | null;
+  /** 包名（zip / .unitypackage 文件名） */
+  packageName: string | null;
+  /** 包内相对路径 */
+  relPath: string | null;
+  /** 容器路径（同一个压缩包里的多个单元共享它）——导入清单按它做互斥 */
+  containerPath: string | null;
+  avatarId: number | null;
+  avatarName: string | null;
+  kind: string | null;
+  level: WorkbenchLevel;
+  evidence: WorkbenchEvidence | null;
+  policy: WorkbenchPolicy;
+  /** 整包风险：true = 导入这个单元会把整包里其它 Avatar 的资源也带进来 */
+  mixed: boolean;
+  /** 后端 importable：只有 single_unitypackage / mixed_unitypackage 为 true */
+  importable: boolean;
+  /** 单元解析状态：ok / partial / failed（非 ok 时 policy 会落 unknown_structure） */
+  parseState: string | null;
+  suggested: boolean;
+  confirmed: boolean;
+  error: { code: string; message: string } | null;
+}
+
+/** GET /api/workbench/units 的查询参数（后端只认这几个；q/category 由前端本地筛）。 */
+export interface WorkbenchItemQuery {
+  itemId?: number;
+  avatarId?: number;
+  q?: string;
+  category?: string;
+  level?: string;
+  policy?: string;
+  itemStatus?: string;
+  confirmedOnly?: boolean;
+  limit?: number;
+}
+export interface WorkbenchItemsResponse {
+  items: WorkbenchItem[];
+  total: number;
+}
+
+/** 计划单元：来自 WorkbenchItem，但只保留计划需要的字段。 */
+export interface ImportPlanUnit {
+  unitId: string;
+  itemId: number;
+  assetId: number | null;
+  title: string;
+  packagePath: string | null;
+  policy: WorkbenchPolicy;
+  mixed: boolean;
+  suggested: boolean;
+  /** 后端计划项状态：suggested（建议，需用户勾选）/ pending（待执行）/ … 原样透传 */
+  state: string;
+  error: { code: string; message: string } | null;
+}
+export interface ImportPrecheck {
+  ok: boolean;
+  status: string;
+  warnings: string[];
+  errors: { code: string; message: string }[];
+}
+export interface ImportPlan {
+  id: number;
+  state: string;
+  avatarId: number | null;
+  avatarName: string | null;
+  projectPath: string | null;
+  projectName: string | null;
+  precheck: ImportPrecheck;
+  units: ImportPlanUnit[];
+  /** 后端若给整包风险文案就用它；没给时前端用 MIXED_WARNING 常量 */
+  mixedWarning: string | null;
+  runId: number | null;
+  /** 提交执行后后端返回的顶层作业 id（task-42：execute 变成 Job 化，202 {jobId, planId}） */
+  jobId: number | null;
+  createdAt: string | null;
+  error: { code: string; message: string } | null;
+}
+
+/**
+ * POST /api/import-plans/:id/confirm —— 202 { jobId, planId }（task-42 Job 化）。
+ * **不要假设同步返回 run**：runId 可能为 null，稍后由 GET /api/import-plans/:id 给出 run_id。
+ */
+export interface ImportExecuteAck {
+  jobId: number | null;
+  planId: number;
+  runId: number | null;
+}
+
+/**
+ * 执行单元状态（后端契约，原样展示，**前端不新增状态、不推断转移**）：
+ * planned → importing → import_command_completed → verifying → verified
+ * 失败分支：partial_success / failed；无法判定：unknown
+ */
+export type ImportUnitState =
+  | "planned" | "importing" | "import_command_completed" | "verifying"
+  | "verified" | "partial_success" | "failed" | "unknown" | string;
+
+export interface ImportRunUnit {
+  unitId: string;
+  itemId: number;
+  title: string;
+  state: ImportUnitState;
+  error: { code: string; message: string } | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+export interface ImportRun {
+  id: number;
+  planId: number;
+  state: string;
+  units: ImportRunUnit[];
+  error: { code: string; message: string } | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+

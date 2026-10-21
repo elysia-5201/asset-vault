@@ -12,6 +12,7 @@ import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
+import { createImportPlan, confirmImportPlan, getPlanView, precheckImportPlan, getRunView } from "../services/structure";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
@@ -1771,6 +1772,108 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     const r = repo.fixMissingCovers();
     deps.log("fix-covers: " + r.fixed + " items");
     return r;
+  });
+
+  // ---------- 工作台：结构单元 / 关系 / 导入计划（v8） ----------
+  /** POST /api/workbench/scan：异步分析一个条目的容器/资源单元（重复请求由 jobs 的 item+kind 唯一索引兜底）。 */
+  app.post("/api/workbench/scan", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const itemId = toInt(b.itemId, 0);
+      if (!itemId || !repo.getItem(itemId)) {
+        return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 无效或条目不存在" } });
+      }
+      let job: any;
+      try {
+        job = repo.createJob("structure", itemId, { itemId, refresh: b.refresh === true }, 20);
+      } catch (e) {
+        if (String((e as any)?.code ?? "").includes("SQLITE_CONSTRAINT")) {
+          return reply.status(409).send({ error: { code: "CONFLICT", message: "该条目已有结构分析作业在跑" } });
+        }
+        throw e;
+      }
+      return reply.status(202).send({ jobId: job.id, itemId, state: job.state });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** GET /api/workbench/avatars?itemId=：按头像聚合单元证据计数。 */
+  app.get("/api/workbench/avatars", async (req) => {
+    const q = req.query as any;
+    const itemId = q.itemId ? toInt(q.itemId, 0) || undefined : undefined;
+    return repo.workbenchAvatarCounts(itemId);
+  });
+
+  /** GET /api/workbench/units：单元视图（证据/policy/来源条目与资产）。 */
+  app.get("/api/workbench/units", async (req) => {
+    const q = req.query as any;
+    const rows = repo.listUnits({
+      itemId: q.itemId ? toInt(q.itemId, 0) || undefined : undefined,
+      avatarId: q.avatarId ? toInt(q.avatarId, 0) || undefined : undefined,
+      policy: q.policy ? String(q.policy) : undefined,
+      level: q.level ? String(q.level) : undefined,
+      itemStatus: q.itemStatus ? String(q.itemStatus) : undefined,
+      limit: q.limit ? toInt(q.limit, 1000) : 1000,
+    });
+    const safe = (t: any) => { try { return JSON.parse(String(t ?? "null")); } catch { return null; } };
+    return rows.map((u) => ({
+      id: Number(u.id), assetId: Number(u.asset_id), itemId: u.item_id ?? null,
+      relPath: String(u.rel_path), format: String(u.format), kind: String(u.kind), name: String(u.name),
+      size: Number(u.size) || 0, fingerprint: u.fingerprint ?? null,
+      policy: String(u.policy), importable: !!u.importable, mixed: u.policy === "mixed_unitypackage",
+      parseState: String(u.parse_state), parseError: u.parse_error ?? null,
+      avatars: safe(u.avatar_json) ?? [], evidence: safe(u.evidence_json),
+      item: u.item_id ? { id: Number(u.item_id), title: u.item_title ?? "", status: u.item_status ?? null } : null,
+      asset: { id: Number(u.asset_id), path: u.asset_path ?? "", kind: u.asset_kind ?? null, container: u.asset_container ?? null, size: Number(u.asset_size) || 0 },
+      updatedAt: u.updated_at,
+    }));
+  });
+
+  /** POST /api/import-plans：按单元建计划（mixed 仍引用原始整包；precheck 指纹/文件/策略）。 */
+  app.post("/api/import-plans", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const unitIds = Array.isArray(b.unitIds) ? b.unitIds.map((n: any) => toInt(n, 0)).filter((n: number) => n > 0) : [];
+      const view = createImportPlan(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
+      return reply.status(201).send(view);
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/import-plans/:id", async (req, reply) => {
+    try {
+      const view = getPlanView(repo, toInt((req.params as any).id, 0));
+      if (!view) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "计划不存在" } });
+      return view;
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.post("/api/import-plans/:id/confirm", async (req, reply) => {
+    try { return confirmImportPlan(repo, toInt((req.params as any).id, 0)); }
+    catch (e) { return fail(reply, e); }
+  });
+
+  /**
+   * POST /api/import-plans/:id/execute：只做前置校验并创建 import job（202 {jobId,planId}）。
+   * 实际 Unity 导入在 runner 内执行；外部副作用禁止自动重试（失败 → run interrupted / plan failed）。
+   */
+  app.post("/api/import-plans/:id/execute", async (req, reply) => {
+    try {
+      const planId = toInt((req.params as any).id, 0);
+      const pre = precheckImportPlan(repo, planId);
+      const inflight = repo.findInflightImportJob(planId);
+      if (inflight) {
+        return reply.status(409).send({ error: { code: "CONFLICT", message: "该计划已有执行作业在跑", jobId: inflight.id } });
+      }
+      const job = repo.createJob("import", Number(pre.plan.item_id), { planId }, 40);
+      return reply.status(202).send({ jobId: job.id, planId });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/import-runs/:id", async (req, reply) => {
+    try {
+      const view = getRunView(repo, toInt((req.params as any).id, 0));
+      if (!view) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "执行记录不存在" } });
+      return view;
+    } catch (e) { return fail(reply, e); }
   });
 
   // ---------- media / stats / export ----------

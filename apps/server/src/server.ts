@@ -93,7 +93,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
 
   let app: FastifyInstance | null = null;
   const watcher = new InboxWatcher(repo, log);
-  const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined, limits });
+  const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined, limits, dataDir });
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });

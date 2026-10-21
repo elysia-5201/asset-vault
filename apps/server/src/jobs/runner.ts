@@ -1,6 +1,6 @@
 import { readdirSync, statSync } from "node:fs";
-import { hostname } from "node:os";
-import { basename, dirname, extname } from "node:path";
+import { hostname, tmpdir } from "node:os";
+import { basename, dirname, extname, join } from "node:path";
 import type { JobEvent, JobRow } from "../../../../packages/core/src/contracts";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { BoothClient } from "../../../../packages/core/src/source/booth";
@@ -11,6 +11,8 @@ import { matchItem } from "../services/match";
 import { checkItemUpdate } from "../services/updates";
 import { walkCandidates, planFromFiles, registerAssets, missingWriteGate, scannedFileOf, createBackpressureGate, type ScanManifest, type WalkBatchStats, type ScannedFile, type ScanStats } from "../services/scan";
 import { generateScanPreview, finalizeApplyRun } from "../services/scanpreview";
+import { analyzeItemStructure, executeImportPlan, markImportInterrupted } from "../services/structure";
+import { unityClientFor } from "../services/unity";
 import { applyCategoryEvidence } from "../services/categories";
 import type { MediaStore } from "../services/media";
 import type { IndexPipeline } from "../services/pipeline/pipeline";
@@ -19,6 +21,10 @@ import { DEFAULT_LIMITS, type PipelineLimits } from "../services/pipeline/limits
 export interface JobDeps {
   repo: Repo; media: MediaStore; booth: BoothClient; log: (msg: string) => void;
   pipeline?: IndexPipeline;
+  /** 工作台导入执行用：默认按 settings/UNITY_MCP_URLS 构造；测试可注入假客户端。 */
+  unity?: import("../services/unity").UnityMcp;
+  /** 暂存目录根（默认系统 tmp）；server 传 dataDir。 */
+  dataDir?: string;
   /** v0.6.1-G2：发现批大小/扫描上限/背压水位；缺省 DEFAULT_LIMITS（runJob 直调/嵌入式兼容）。 */
   limits?: PipelineLimits;
 }
@@ -364,6 +370,33 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
         scratch.scanQueued = assetQueued;
         scratch.note = `scan: files=${scan?.files ?? filesSeen} new=${assetNew} changed=${assetChanged} queued=${assetQueued} batches=${batches}${throttled ? " throttled=" + throttled : ""} ${isFile ? "(single file)" : ""}` +
           (scanGate && !scanGate.allowed ? ` INCOMPLETE(${scanGate.reasons.join(",")})` : "");
+      }
+    } else if (job().kind === "structure") {
+      // task-38：容器/资源单元识别。失败只影响本次作业与诊断事件，不改 assets 索引状态。
+      const itemId = Number(payload.itemId ?? job().item_id ?? 0);
+      if (!itemId) throw new Error("structure 需要 itemId");
+      const analyzed = await analyzeItemStructure(repo, itemId, deps.log);
+      ensureLease();
+      repo.logJobEvent(jobId, null, job().state, "structure_analyzed", JSON.stringify({
+        itemId, assets: analyzed.assets, units: analyzed.units, relations: analyzed.relations,
+        errors: analyzed.errors.slice(0, 10), errorCount: analyzed.errors.length,
+      }), lease);
+      scratch.note = `structure: item=${itemId} assets=${analyzed.assets} units=${analyzed.units} relations=${analyzed.relations} errors=${analyzed.errors.length}`;
+    } else if (job().kind === "import") {
+      // task-42：导入执行走 Job。外部副作用绝不自动重试：失败/中断把 run 标 interrupted、计划标 failed。
+      const planId = Number(payload.planId ?? 0);
+      if (!planId) throw new Error("import 需要 planId");
+      try {
+        const result = await executeImportPlan({
+          repo, log: deps.log,
+          unity: deps.unity ?? unityClientFor(repo),
+          stagingDir: join(deps.dataDir ?? tmpdir(), "unity-staging"),
+        }, planId);
+        ensureLease();
+        scratch.note = `import: plan=${planId} run=${result.run.id} status=${result.run.status} items=${result.items.length}`;
+      } catch (e) {
+        markImportInterrupted(repo, planId, (e as Error)?.message ?? String(e));
+        throw e;
       }
     } else if (job().kind === "reindex") {
       const id = payload.assetId ? Number(payload.assetId) : 0;

@@ -11,6 +11,8 @@ import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
 import { CategoryManager } from "../src/components/CategoryManager";
 import { PipelinePanel } from "../src/components/PipelinePanel";
+import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, UNIT_STATE_LABEL, isRunBusy, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
+import { confirmImportPlan, executeImportPlan } from "../src/api";
 
 type Fail = string;
 const fails: Fail[] = [];
@@ -32,6 +34,8 @@ function has(obj: unknown, keys: string[], label: string): void {
 function expect(cond: boolean, label: string): void {
   if (cond) oks.push(label); else fails.push(label);
 }
+/** React SSR 会在相邻动态文本之间插 <!-- -->，断言前先去掉（否则 "code：message" 永远匹配不上）。 */
+function stripSsr(s: string): string { return s.replace(/<!-- -->/g, ""); }
 
 // ---- ① 形状检查（严格同 docs/api.md） ----
 const health = req("GET", "/health");
@@ -383,6 +387,80 @@ for (const needle of ["阶段", "缓存 / 内存", "最近失败", "执行中", 
   expect(pipeHtml.includes(needle), "PipelinePanel SSR 含「" + needle + "」");
 }
 
+// ---- ④ Avatar 素材工作台（task-39） ----
+const wbBase = {
+  unitId: "u", itemId: 7, assetId: 3, title: "MANUKA 裙装", sourceSite: "booth", sourceItemId: "1234567",
+  shopName: "citrus shop", coverImageId: null, packageName: "dress.zip", relPath: "Assets/dress.unitypackage",
+  containerPath: "/lib/dress.zip", avatarId: 1, avatarName: "MANUKA", kind: "unitypackage",
+  level: "strong", evidence: { level: "strong", summary: "包内路径命中 2 次", sources: ["archive_path"] },
+  // v0.7.0 后端契约：policy 字面量 + importable 决定能不能进计划
+  policy: "mixed_unitypackage", mixed: true, importable: true, parseState: "ok",
+  suggested: false, confirmed: false, error: null,
+};
+const wbA = { ...wbBase, unitId: "a" } as any;
+const wbB = { ...wbBase, unitId: "b", itemId: 8, assetId: 4 } as any;   // 同一压缩包 → 互斥
+const wbC = { ...wbBase, unitId: "c", itemId: 9, assetId: 5, containerPath: "/lib/other.zip", packageName: "other.zip", policy: "single_unitypackage", mixed: false } as any;
+const wbBlocked = { ...wbBase, unitId: "d", itemId: 10, assetId: 6, policy: "unknown_structure", importable: false, mixed: false } as any;
+
+expect(sameSlot(wbA, wbB) === true, "工作台：同一压缩包里的单元判定为互斥");
+expect(sameSlot(wbA, wbC) === false, "工作台：不同压缩包的单元不互斥");
+let wbPlan = togglePick([], wbA);
+expect(wbPlan.length === 1 && wbPlan[0].unitId === "a", "工作台：点卡片加入清单");
+const afterBlocked = togglePick(wbPlan, wbBlocked);
+expect(afterBlocked.length === 1 && afterBlocked[0].unitId === "a", "工作台：importable=false 的单元点不进清单（后端 policy=unknown_structure）");
+wbPlan = togglePick(wbPlan, wbB);
+expect(wbPlan.length === 1 && wbPlan[0].unitId === "b", "工作台清单互斥：选同包另一个会替换前一个");
+wbPlan = togglePick(wbPlan, wbC);
+expect(wbPlan.length === 2, "工作台清单：不同包可同时入清单");
+wbPlan = togglePick(wbPlan, wbB);
+expect(wbPlan.length === 1 && wbPlan[0].unitId === "c", "工作台清单：再次点击取消勾选");
+
+const REQUIRED_UNIT_STATES = ["planned", "importing", "import_command_completed", "verifying", "verified", "partial_success", "failed", "unknown"];
+expect(REQUIRED_UNIT_STATES.every((s) => !!UNIT_STATE_LABEL[s]) && UNIT_STATE_LABEL.import_command_completed === "导入命令已完成",
+  "工作台：后端 8 个执行状态全部有中文标签（不新增状态）");
+const mkRun = (states: string[]) => ({
+  id: 1, planId: 1, state: "executing",
+  units: states.map((s, i) => ({ unitId: "u" + i, itemId: i, title: "t" + i, state: s, error: null, startedAt: null, finishedAt: null })),
+  error: null, startedAt: null, finishedAt: null,
+}) as any;
+expect(isRunBusy(mkRun(["planned", "verified"])) === true, "工作台：还有 planned 单元 → 继续轮询");
+expect(isRunBusy(mkRun(["verified", "failed"])) === false, "工作台：全部终态 → 停止轮询");
+
+const wbHtml = render("AvatarWorkbench", createElement(AvatarWorkbench, { onClose: () => {}, onToast: () => {} } as any));
+for (const needle of ["Avatar 素材工作台", "选择 Avatar", "生成导入计划", "导入清单", "Unity 工程"]) {
+  expect(wbHtml.includes(needle), "工作台面板 SSR 含「" + needle + "」");
+}
+
+const planFixture = {
+  id: 12, state: "planned", avatarId: 1, avatarName: "MANUKA", projectPath: "E:/unity/P", projectName: "P",
+  precheck: { ok: false, status: "has_warnings", warnings: ["工程里已有同名目录"], errors: [{ code: "PATH_MISSING", message: "路径不存在" }] },
+  units: [
+    { unitId: "a", itemId: 7, assetId: 3, title: "MANUKA 裙装", packagePath: "/lib/dress.zip", policy: "mixed", mixed: true, suggested: false, state: "planned", error: null },
+    { unitId: "b", itemId: 8, assetId: 4, title: "建议项", packagePath: null, policy: "standalone", mixed: false, suggested: true, state: "planned", error: null },
+  ],
+  mixedWarning: null, runId: null, createdAt: null, error: null,
+} as any;
+const planHtml = render("PlanPanel", createElement(PlanPanel, { plan: planFixture, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false } as any));
+expect(planHtml.includes(MIXED_WARNING), "工作台计划：mixed 整包风险文案出现");
+expect(planHtml.includes("建议") && planHtml.includes("需你确认后才加入"), "工作台计划：suggested 需用户勾选才入计划");
+expect(stripSsr(planHtml).includes("PATH_MISSING：路径不存在"), "工作台计划：precheck 错误显示 code + message");
+expect(planHtml.includes("工程里已有同名目录"), "工作台计划：precheck 警告可见");
+const planBoxes = (planHtml.match(/type="checkbox"/g) ?? []).length;
+expect(planBoxes === 2, "工作台计划：每个单元一个复选框（实际 " + planBoxes + "）");
+expect(stripSsr(planHtml).includes("确认并导入 1 个单元"), "工作台计划：确认按钮按勾选数计数（suggested 未勾选不计数）");
+
+// task-42：execute → 202 {jobId, planId}，UI 显示 job 号并轮询 plan/run（不假设同步返回 run）
+const planRunning = { ...planFixture, state: "running", jobId: 77 } as any;
+const planRunningHtml = render("PlanPanel(running)", createElement(PlanPanel, {
+  plan: planRunning, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false, jobId: 77,
+} as any));
+expect(planRunningHtml.includes("执行中"), "工作台计划：计划状态 running → 执行中（标签来自后端值）");
+expect(stripSsr(planRunningHtml).includes("job #77"), "工作台计划：显示执行 job 号（202 {jobId, planId}）");
+expect(typeof executeImportPlan === "function" && confirmImportPlan.length <= 1,
+  "工作台：执行走独立 execute 端点（confirm 只做确认，不返回 run）");
+expect(!!PLAN_STATE_LABEL.executed && !!PLAN_STATE_LABEL.blocked && !!PLAN_STATE_LABEL.failed,
+  "工作台：计划终态标签齐全（executed / blocked / failed）");
+
 // ---- ② SSR 冒烟 ----
 let html = "";
 try {
@@ -391,6 +469,7 @@ try {
 } catch (e) {
   fails.push("renderToString 抛异常：" + (e instanceof Error ? e.stack ?? e.message : String(e)));
 }
+expect(html.includes("素材工作台"), "工具栏有「素材工作台」入口（与扫描预览/批量分类同级）");
 for (const needle of ["头像轨", "AssetVault", "搜索", "导入", "作业", "已拥有", "分类", "未分类"]) {
   if (html.includes(needle)) oks.push("渲染包含「" + needle + "」");
   else fails.push("渲染缺少「" + needle + "」");

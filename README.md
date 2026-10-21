@@ -2,10 +2,10 @@
 # AssetVault · 资源库
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.3-blue.svg)](#-快速开始)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](#-快速开始)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-673%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-709%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -53,7 +53,10 @@
 | **诊断口径** | `GET /api/health` 的 `version` 取自 `package.json`（不再写死 0.1.0）；`EBUSY / EMFILE` → 409 `FILE_BUSY`、`EACCES / EPERM` → 403 `PERMISSION`（不再误报“不是压缩包”）；`/api/stats` 的物品/资产/体积**不含回收站** |
 | **扫描变更中心** | 扫描先出**可确认的清单**（新增 / 未变 / 已变化 / 缺失 / 疑似重复 / 不可读 / 错误），逐条勾选后**才**应用；应用前逐条重验 size+mtime，文件变了就标 stale 拒绝写库；只做登记/重新索引/确认缺失，**不移动、不删除源文件，也不自动合并重复项** |
 | **收件箱监听** | 把 IDM / 浏览器下载目录设为收件箱，新落盘的 zip/7z/rar/unitypackage **自动建档入库**（chokidar + awaitWriteFinish，3 秒静默触发） |
-| **真导入 Unity** | 详情页「导入到 Unity 工程」：探测**当前打开的那个编辑器**（mcp-for-unity），列出条目里所有 `.unitypackage`（压缩包内的、zip 套 zip 的也算）→ 按当前工程的 avatar **自动预选** → `AssetDatabase.ImportPackage(path,false)` 真导入；导入前清控制台、导入后回读报错 |
+| **Avatar 素材工作台** | 工具栏「素材工作台」：按 Avatar 聚合每个资源单元的**证据级别**（已确认 / 可能 / 未知）与**打包策略**，勾选进导入清单 → 选 Unity 工程 → 生成**导入计划**（只读预检：指纹、文件、工程路径）→ 确认 → 提交执行并轮询**每单元状态** |
+| **资源单元** | 一个资产拆成可独立识别的 **unit**（`.unitypackage` 本体，或压缩包里的某个 `.unitypackage`，含 zip 套 zip 的一层）：`asset_units` 记 rel_path / 大小 / 指纹 / policy / 可导入性 / avatar 证据；**分层判定不猜**——解析不完整就 `unknown_structure` |
+| **导入计划与执行状态** | 计划是**快照**：建计划时逐单元记下路径 + 指纹 + precheck；执行前再校验指纹，变了就 `blocked`（`PLAN_BLOCKED`）拒绝按旧快照导入。Job 化执行（`202 {jobId, planId}`），每单元独立状态：`importing → import_command_completed → verifying → verified / partial_success / failed`，互不覆盖 |
+| **混合包整包策略** | 混合 `.unitypackage`（≥2 个模型证据）**永远导入原始整包**，绝不生成筛选包/临时拆包；计划与清单里显式标注「整包风险」并提示「其他 Avatar 的资源也可能被一并导入」，需人工勾选确认后才执行 |
 | **套装 / 合并** | 同一商品拆成「模型包 + 材质包/DLC」时，用**套装**归组（各自保留条目），确认后再**合并**成一条（压缩包/图片/标签全并过去，来源进回收站可恢复）；套装里有一键「⤵并入」 |
 | **来源可点 + 一键补全** | 「来源」行里 `BOOTH 7562436` 是直达商品页的超链接，旁边的「补全 BOOTH」直接重抓标题/店铺/价格/标签 + 图集 |
 
@@ -113,8 +116,8 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（695 用例：673 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
-node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v7）
+node scripts/test.mjs            # 全仓单测（731 用例：709 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v8）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
 node --import tsx scripts/acceptance-categories.mjs   # 物品分类端到端（21 项：迁移/保护/筛选/统计/批量/阈值）
@@ -221,7 +224,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - 生成中的预览可随时**取消**（`POST /api/scan/previews/:id/cancel`，连生成作业一起停）；应用一旦开始就不能取消，只能对失败项重试。
 - 安全性：不移动/删除源文件；疑似重复只提示不合并；预览删除只删清单记录。详见 `docs/scan-preview.md`。
 
-### 9. 后台索引流水线（v0.6.0 → v0.6.3）
+### 9. 后台索引流水线（v0.6.0 → v0.7.0）
 
 - 扫描 / 应用 / 导入作业只做「发现 → 基础建档 → 入队」，深度解析交给后台流水线；
   作业可配置有界等待（默认 8s），大包没跑完也不会阻塞后续小文件。
@@ -255,12 +258,16 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
   `FILE_BUSY`(409) / `PERMISSION`(403)；`/api/stats` 不再把回收站算进物品/资产/体积。
 - **合并/删图的封面一致性（v0.6.3）**：合并条目时**先清空来源条目的 `cover_image_id`**，删缩略图时**清掉所有指向它的引用**；
   不再出现"删缩略图触发外键错误（`FOREIGN KEY constraint failed`）"的 500。
+- **资源单元（v0.7.0）**：`POST /api/workbench/scan` 异步分析条目容器 → `asset_units`（一个 `.unitypackage` 本体或压缩包内的一层 `.unitypackage`，含 rel_path/大小/指纹/policy/可导入性/avatar 证据）+ `unit_relations`（伴生/变体建议，只到 probable）；嵌套发现深度 ≤2、最多 8 个内层归档、条目/字节/时间有界，超限只标 `limited`。
+- **Avatar 素材工作台（v0.7.0）**：`GET /api/workbench/avatars`（按 Avatar 聚合证据计数：confirmed / probable / unknown / mixed）与 `GET /api/workbench/units`（单元视图：证据、policy、来源条目与资产）；工具栏「素材工作台」面板串起 选择 → 筛选 → 清单 → 计划 → 执行。
+- **导入计划与执行（v0.7.0）**：`POST /api/import-plans`（按 unitIds 建计划，快照路径 + 指纹 + precheck）→ `confirm`（suggested → pending，人工确认）→ `execute`（**202 {jobId, planId}**，Job 化）→ 轮询 `GET /api/import-plans/:id` 与 `GET /api/import-runs/:id`。每单元独立状态，互不覆盖；指纹变化 → plan `blocked` / execute 拒绝，绝不按旧快照导入；Unity 返回只算 `import_command_completed`，`verified` / `partial_success` 是另外的 GUID + 控制台校验结论。
+- **混合包整包策略（v0.7.0）**：`mixed_unitypackage`（≥2 个不同模型证据，或显式 `mixedConfirmed`）**永远导入原始整包**，不生成筛选包、不拆包；ZIP 里多个 `.unitypackage` 算「多独立包容器」（逐包导入），不算混合包；解析不完整且判不了 → `unknown_structure`（不猜、不可导入）。
 
-完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**。
+完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**；工作台用户手册与整包策略见 **`docs/avatar-workbench.md`**。
 
 ## 10. HTTP API
 
-完整契约见 `docs/api.md`（含 Unity 桥、套装、合并、导入等端点）；健康检查 `GET /api/health`（`version` 取自 `package.json`）。
+完整契约见 `docs/api.md`（含 Unity 桥、套装、合并、导入等端点）；**素材工作台/导入计划**端点与错误码见 `docs/avatar-workbench.md` §6；健康检查 `GET /api/health`（`version` 取自 `package.json`）。
 
 ---
 
@@ -274,7 +281,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 695 用例（673 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs` |
+| 质检 | `node:test` 731 用例（709 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线 + 工作台/导入计划）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs`、`scripts/acceptance-structure.mjs` |
 
 ### 打包与迁移踩坑（留档）
 
@@ -305,24 +312,29 @@ asset-vault/
 │   ├─ jobs/runner.ts        # 状态机驱动 + worker
 │   ├─ services/pipeline/    # limits / queue / cache / stages / pipeline / lock（v0.6.0 建，v0.6.1 加固，v0.6.2 围栏与采样）
 │   ├─ services/             # booth / scan / scanpreview / indexing / match / categories / updates / media / download / unity
+│   ├─ services/structure.ts # v0.7.0 工作台：单元识别 / policy / 关系建议 / 导入计划 / 执行
 │   └─ http/routes.ts        # HTTP API（契约见 docs/api.md）
-├─ apps/web/                 # React 19 + Vite（头像轨 / 网格 / 详情 / 包内树 / 作业 / 导入）
+├─ apps/web/                 # React 19 + Vite（头像轨 / 网格 / 详情 / 包内树 / 作业 / 导入 / 素材工作台）
 ├─ apps/desktop/             # Electron 主进程 + esbuild 打包脚本
 ├─ config/avatars.seed.json  # 头像与别名种子（可编辑，首次启动播种）
 ├─ data/                     # vault.db + media/ 缩略图缓存（可重建）
-├─ docs/                     # api.md / categories.md / CONTRACT.md / verification/
+├─ docs/                     # api.md / avatar-workbench.md / categories.md / pipeline-v06.md / CONTRACT.md / verification/
 └─ scripts/                  # test / start / acceptance / win-* / sanitize 等
 ```
 
-**数据模型**（SQLite，32 张表；另有 `items_fts` 全文索引）：`items`（来源站+商品号唯一；含 13 个 `cat_*` 物品分类列）· `categories`（分类树，两层）· `item_images` · `assets`（物理路径唯一）·
+**数据模型**（SQLite，38 张表，schema v8；另有 `items_fts` 全文索引）：`items`（来源站+商品号唯一；含 13 个 `cat_*` 物品分类列）· `categories`（分类树，两层）· `item_images` · `assets`（物理路径唯一）·
 `archive_entries` · `unitypackage_assets` · `avatars` + `avatar_aliases` + `item_avatars`（多对多，含 manual/confirmed 保护）·
 `asset_avatars`（文件级 + 包内前缀）· `tags` / `item_tags` · `collections` · `library_roots` · `projects` / `project_imports` ·
 `jobs` / `job_events` · `source_snapshots` / `updates` · `scan_previews` / `scan_preview_items` / `scan_preview_errors` / `scan_apply_runs`（扫描变更中心）·
-`index_tasks` / `pipeline_events` / `cache_entries`（v0.6.0 流水线与派生缓存）· `settings` / `audit_log` + `items_fts`（FTS5 trigram）。
+`index_tasks` / `pipeline_events` / `cache_entries`（v0.6.0 流水线与派生缓存）·
+`asset_units` / `unit_relations`（v0.7.0 资源单元与关系建议）·
+`import_plans` / `import_plan_items` / `import_runs` / `import_run_items`（v0.7.0 导入计划与逐单元执行状态）·
+`settings` / `audit_log` + `items_fts`（FTS5 trigram）。
 `assets` 另有 `index_state` / `index_error` / `indexed_at` / `content_version` 四个深度索引列。
 `jobs` 另有 `holder` / `lease_until` / `lease_token` / `heartbeat_at`（schema v6 租约围栏）；
 `index_tasks` 另有 `owner` / `lease_token` / `job_id`（schema v7 任务围栏 + 按顶层作业归组）；
 `cache_entries` 另有 `weak`（强键/弱键标记）。
+`asset_units` 的 `policy` 取值 `single_unitypackage` / `mixed_unitypackage` / `multi_package_container` / `unknown_structure`，`importable` 只对前两者为 1；`import_plan_items.path` 永远指向**原始资产**（整包/原容器），不指向任何筛选产物。
 不物理删除（`status` 软删）。
 
 ---
@@ -394,6 +406,8 @@ curl -X PUT http://127.0.0.1:7317/api/settings -H 'content-type: application/jso
 - **sharp 解码不可硬中断**：取消是"立即返回 + 后台解码自然结束"；要硬停需进程/线程隔离。
 - **缓存内容采样有额外读开销**：每个资产多读最多 128 KiB（首尾各 64 KiB）；换来的是"size/mtime 没变但内容被换掉"也能 miss。采不到样（读不了 / 采样期间被替换 / 读不满）时直接绕过缓存，不拿可疑结果复用。
 - **超大目录仍受 `maxScanFiles`（默认 2 万）限制**：超出会截断，需要多轮扫描 + 增量应用（扫描预览会明确标 truncated）；v0.6.1 起发现是流式的，内存不再随候选数线性增长（10 万文件 runner 实测 RSS 323MB）。
+- **Unity 实导未做端到端验证（v0.7.0）**：工作台「计划 → 执行」链路（staging → `AssetDatabase.ImportPackage` → 控制台回读 → GUID 抽样校验）已实现并有单测，但本轮**没有连接真实 Unity 编辑器跑过实导**；`verified` / `partial_success` 是"抽样 GUID 命中 + 控制台无 error"的判定，不等于肉眼验收。
+- **7z / rar 内层缩略图仍不抽**：内层归档与 7z/rar 里的图片不生成缩略图（只抽 zip 与 `.unitypackage` 内嵌预览图）；工作台的单元识别与这条无关。
 
 ---
 

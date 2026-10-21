@@ -16,6 +16,7 @@ import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
+import { AvatarWorkbench } from "./components/AvatarWorkbench";
 import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { CategoryBatchBar } from "./components/CategoryBatchBar";
@@ -71,6 +72,8 @@ export default function App() {
   const [dupPanel, setDupPanel] = useState(false);
   /** 扫描变更中心（M1）：先预览、确认后再写库。 */
   const [previewPanel, setPreviewPanel] = useState(false);
+  /** Avatar 素材工作台：选 Avatar → 素材清单 → 导入计划 → 执行状态（task-39）。 */
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
   /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
   const [settingsPanel, setSettingsPanel] = useState(false);
   /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
@@ -331,6 +334,11 @@ export default function App() {
           >分类管理</button>
           <button
             className="btn tiny"
+            title="Avatar 素材工作台：按 Avatar 看素材证据与打包策略，勾选进导入清单，生成导入计划并跟踪每单元状态"
+            onClick={() => setWorkbenchOpen(true)}
+          >素材工作台</button>
+          <button
+            className="btn tiny"
             title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）"
             onClick={() => setPreviewPanel(true)}
           >扫描预览</button>
@@ -479,6 +487,9 @@ export default function App() {
       )}
       {dupPanel && (
         <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
+      )}
+      {workbenchOpen && (
+        <AvatarWorkbench onClose={() => setWorkbenchOpen(false)} onToast={toast} />
       )}
 
       {selectedItemId !== null && (

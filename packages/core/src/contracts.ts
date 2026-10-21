@@ -21,7 +21,7 @@ export type AvatarEvidenceSource =
 export type JobState =
   | "queued" | "resolving" | "fetching" | "materializing" | "indexing" | "matching"
   | "releasing" | "releasing_done" | "paused" | "done" | "failed" | "cancelled" | "abandoned";
-export type JobKind = "import_url" | "import_file" | "scan" | "reindex" | "check_update" | "download" | "match_avatars";
+export type JobKind = "import_url" | "import_file" | "scan" | "reindex" | "check_update" | "download" | "match_avatars" | "structure" | "import";
 export type JobEvent =
   | "start" | "resolve_ok" | "fetch_ok" | "commit" | "index_ok" | "match_ok" | "stop"
   | "fail" | "hold" | "cancel_apply" | "give_up" | "succeed" | "resume" | "retry" | "abandon";

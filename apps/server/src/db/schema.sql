@@ -433,6 +433,103 @@ CREATE TABLE IF NOT EXISTS cache_entries (
 );
 CREATE INDEX IF NOT EXISTS ix_cache_kind ON cache_entries(kind, last_used_at);
 
+-- ===== 容器/资源单元 + 导入计划/执行（v8，工作台）=====
+-- asset_units：一个资产内可独立识别的资源单元（unitypackage 本体，或压缩包里的一个 .unitypackage）。
+-- mixed 单元仍指向**原始整包**（importable=1，policy=mixed_unitypackage），绝不产生筛选包。
+CREATE TABLE IF NOT EXISTS asset_units (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  item_id INTEGER,
+  rel_path TEXT NOT NULL,
+  format TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  fingerprint TEXT,
+  policy TEXT NOT NULL DEFAULT 'unknown_structure',
+  importable INTEGER NOT NULL DEFAULT 0,
+  parse_state TEXT NOT NULL DEFAULT 'ok',
+  parse_error TEXT,
+  avatar_json TEXT,
+  evidence_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(asset_id, rel_path)
+);
+CREATE INDEX IF NOT EXISTS ix_asset_units_item ON asset_units(item_id);
+CREATE INDEX IF NOT EXISTS ix_asset_units_policy ON asset_units(policy, importable);
+
+-- 单元之间的关系建议（伴生/变体）；confirmed 只在有显式证据时由上层置位
+CREATE TABLE IF NOT EXISTS unit_relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_unit_id INTEGER NOT NULL REFERENCES asset_units(id) ON DELETE CASCADE,
+  to_unit_id INTEGER NOT NULL REFERENCES asset_units(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  evidence TEXT,
+  confidence TEXT NOT NULL DEFAULT 'probable',
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(from_unit_id, to_unit_id, type)
+);
+CREATE INDEX IF NOT EXISTS ix_unit_relations_to ON unit_relations(to_unit_id);
+
+-- 导入计划：一次"用户确认后要导入 Unity 工程"的快照（含指纹与 precheck）
+CREATE TABLE IF NOT EXISTS import_plans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  project_path TEXT NOT NULL,
+  policy TEXT,
+  status TEXT NOT NULL DEFAULT 'ready',
+  user_confirmed INTEGER NOT NULL DEFAULT 0,
+  precheck_json TEXT,
+  created_at TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS ix_import_plans_item ON import_plans(item_id);
+
+-- 计划条目：每单元独立状态；path 永远指向原始资产（整包/原容器），不指向任何筛选产物
+CREATE TABLE IF NOT EXISTS import_plan_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL REFERENCES import_plans(id) ON DELETE CASCADE,
+  unit_id INTEGER NOT NULL REFERENCES asset_units(id) ON DELETE CASCADE,
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  policy TEXT,
+  fingerprint TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT,
+  UNIQUE(plan_id, unit_id)
+);
+CREATE INDEX IF NOT EXISTS ix_import_plan_items_plan ON import_plan_items(plan_id, status);
+
+-- 执行批次与逐单元状态（import_command_completed 只代表 Unity 接受了命令，验证另算）
+CREATE TABLE IF NOT EXISTS import_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_id INTEGER NOT NULL REFERENCES import_plans(id) ON DELETE CASCADE,
+  project_id INTEGER,
+  project_path TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  console_errors TEXT,
+  summary_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_import_runs_plan ON import_runs(plan_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS import_run_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES import_runs(id) ON DELETE CASCADE,
+  plan_item_id INTEGER NOT NULL REFERENCES import_plan_items(id) ON DELETE CASCADE,
+  unit_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  started_at TEXT,
+  finished_at TEXT,
+  error TEXT,
+  detail_json TEXT,
+  UNIQUE(run_id, plan_item_id)
+);
+CREATE INDEX IF NOT EXISTS ix_import_run_items_run ON import_run_items(run_id, status);
+
 -- 全文检索：trigram 支持中日文子串（>=3 字符走 FTS，<3 字符回退 LIKE）
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   title, shop_name, author, description, notes, tags_text,
