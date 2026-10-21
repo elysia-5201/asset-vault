@@ -2,10 +2,10 @@
 # AssetVault · 资源库
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.6.2-blue.svg)](#-快速开始)
+[![Version](https://img.shields.io/badge/version-0.6.3-blue.svg)](#-快速开始)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-669%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-673%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -113,7 +113,7 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（691 用例：669 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+node scripts/test.mjs            # 全仓单测（695 用例：673 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
 node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v7）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
@@ -221,7 +221,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - 生成中的预览可随时**取消**（`POST /api/scan/previews/:id/cancel`，连生成作业一起停）；应用一旦开始就不能取消，只能对失败项重试。
 - 安全性：不移动/删除源文件；疑似重复只提示不合并；预览删除只删清单记录。详见 `docs/scan-preview.md`。
 
-### 9. 后台索引流水线（v0.6.0 → v0.6.2）
+### 9. 后台索引流水线（v0.6.0 → v0.6.3）
 
 - 扫描 / 应用 / 导入作业只做「发现 → 基础建档 → 入队」，深度解析交给后台流水线；
   作业可配置有界等待（默认 8s），大包没跑完也不会阻塞后续小文件。
@@ -253,6 +253,8 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
   `scanning` 过期且无在飞作业 → `expired`，`applying` 的作业已死 → `failed`（`scan_apply_runs` 同步转 failed）。
 - **诊断口径（v0.6.2）**：health 的 `version` 读 `package.json`；文件系统 errno 映射成可判别的
   `FILE_BUSY`(409) / `PERMISSION`(403)；`/api/stats` 不再把回收站算进物品/资产/体积。
+- **合并/删图的封面一致性（v0.6.3）**：合并条目时**先清空来源条目的 `cover_image_id`**，删缩略图时**清掉所有指向它的引用**；
+  不再出现"删缩略图触发外键错误（`FOREIGN KEY constraint failed`）"的 500。
 
 完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**。
 
@@ -272,7 +274,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 691 用例（669 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs` |
+| 质检 | `node:test` 695 用例（673 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs` |
 
 ### 打包与迁移踩坑（留档）
 
