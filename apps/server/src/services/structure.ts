@@ -374,6 +374,8 @@ export interface PlanView {
   /** 最新一次执行批次 id（无执行过则为 null），前端据此轮询 /api/import-runs/:id。 */
   run_id: number | null;
   latestRun: { id: number; status: string; started_at: string | null; finished_at: string | null; summary: any; console_errors: any } | null;
+  /** 最近一次执行失败的 {code,message,phase}（来自 latestRun.summary.error）；成功/未执行为 null。 */
+  lastError: { code: string; message: string; phase?: string } | null;
 }
 
 function nowIso(): string { return new Date().toISOString(); }
@@ -460,14 +462,17 @@ export function getPlanView(repo: Repo, planId: number): PlanView | null {
   const plan = repo.getImportPlan(planId);
   if (!plan) return null;
   const latest = repo.latestImportRun(planId);
+  const summary = latest ? safeJson(latest.summary_json) : null;
+  const err = summary && typeof summary === "object" ? (summary as any).error : null;
   return {
     plan, items: repo.listImportPlanItems(planId), precheck: safeJson(plan.precheck_json),
     run_id: latest ? Number(latest.id) : null,
     latestRun: latest ? {
       id: Number(latest.id), status: String(latest.status),
       started_at: latest.started_at ?? null, finished_at: latest.finished_at ?? null,
-      summary: safeJson(latest.summary_json), console_errors: safeJson(latest.console_errors),
+      summary, console_errors: safeJson(latest.console_errors),
     } : null,
+    lastError: err && typeof err === "object" ? { code: String(err.code ?? "ERROR"), message: String(err.message ?? ""), ...(err.phase ? { phase: String(err.phase) } : {}) } : null,
   };
 }
 
@@ -554,6 +559,34 @@ export function markImportInterrupted(repo: Repo, planId: number, reason: string
   repo.updateImportPlan(planId, { status: "failed" });
 }
 
+/**
+ * task-46：前置失败（Unity 离线/工程不匹配/指纹变化等）也要留下可审计的 failed run + 逐项 run_items，
+ * 否则 plan=failed 但 run_id=null、用户看不到原因。
+ */
+function recordPreflightFailure(repo: Repo, planId: number, err: unknown): void {
+  try {
+    const plan = repo.getImportPlan(planId);
+    if (!plan) return;
+    const code = String((err as any)?.code ?? "ERROR");
+    const message = String((err as Error)?.message ?? err);
+    const items = repo.listImportPlanItems(planId);
+    const run = repo.createImportRun({ planId, projectPath: plan.project_path });
+    for (const it of items) {
+      const ri = repo.addImportRunItem({ runId: run.id, planItemId: it.id, unitId: it.unit_id });
+      repo.updateImportRunItem(ri.id, {
+        status: "failed", started_at: nowIso(), finished_at: nowIso(),
+        error: code + ": " + message, detail_json: JSON.stringify({ phase: "preflight" }),
+      });
+    }
+    repo.updateImportRun(run.id, {
+      status: "failed", finished_at: nowIso(),
+      console_errors: JSON.stringify([code + ": " + message]),
+      summary_json: JSON.stringify({ phase: "preflight", error: { code, message }, total: items.length, failed: items.length }),
+    });
+    repo.updateImportPlan(planId, { status: "failed" });
+  } catch { /* 审计记录失败不掩盖原始错误 */ }
+}
+
 /** 执行计划：逐单元独立状态；命令返回 ≠ 验证成功。 */
 export async function executeImportPlan(deps: ExecuteDeps, planId: number): Promise<{ run: any; items: any[] }> {
   const { repo, unity } = deps;
@@ -569,12 +602,25 @@ export async function executeImportPlan(deps: ExecuteDeps, planId: number): Prom
       throw appErr("PLAN_INTERRUPTED", "该计划已有未完成的执行（已标记 interrupted），不会自动重试外部导入", 409);
     }
   }
-  const { plan, items } = precheckImportPlan(repo, planId);
+  let checked: { plan: any; items: any[] };
+  try {
+    checked = precheckImportPlan(repo, planId);
+  } catch (e) {
+    recordPreflightFailure(repo, planId, e);
+    throw e;
+  }
+  const { plan, items } = checked;
 
-  const editor = await unityEditorInfo(unity);
-  if (!editor?.projectPath) throw appErr("UNITY_UNAVAILABLE", "Unity 编辑器不可用或未返回工程路径", 409);
-  if (normalizePath(String(editor.projectPath)) !== normalizePath(String(plan.project_path))) {
-    throw appErr("PROJECT_MISMATCH", "Unity 当前工程与计划不一致：编辑器=" + editor.projectPath + "，计划=" + plan.project_path, 409);
+  let editor: any;
+  try {
+    editor = await unityEditorInfo(unity);
+    if (!editor?.projectPath) throw appErr("UNITY_UNAVAILABLE", "Unity 编辑器不可用或未返回工程路径", 409);
+    if (normalizePath(String(editor.projectPath)) !== normalizePath(String(plan.project_path))) {
+      throw appErr("PROJECT_MISMATCH", "Unity 当前工程与计划不一致：编辑器=" + editor.projectPath + "，计划=" + plan.project_path, 409);
+    }
+  } catch (e) {
+    recordPreflightFailure(repo, planId, e);
+    throw e;
   }
 
   const run = repo.createImportRun({ planId, projectPath: plan.project_path });

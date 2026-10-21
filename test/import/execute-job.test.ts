@@ -142,5 +142,32 @@ describe("execute → job", () => {
     assert.equal(repo.getImportPlan(plan.id).status, "failed");
     const retries = (t.db.prepare("SELECT COUNT(*) c FROM jobs WHERE kind='import'").get() as any).c;
     assert.equal(retries, 1, "失败后不得自动生成新的 import 作业（外部副作用禁止自动重试）");
+    // task-46：前置失败也必须留下 failed run + 逐项 run_item + 可读错误
+    const run = repo.latestImportRun(plan.id);
+    assert.ok(run, "Unity 离线也必须创建 failed run");
+    assert.equal(run.status, "failed");
+    const runItems = repo.listImportRunItems(run.id);
+    assert.equal(runItems.length, 1, "每个 plan_item 都要有 failed run_item");
+    assert.equal(runItems[0].status, "failed");
+    assert.match(String(runItems[0].error), /^[A-Z_]+: .*connect refused|^UPSTREAM_ERROR:/);
+    const view = getPlanView(repo, plan.id)!;
+    assert.equal(view.run_id, run.id);
+    assert.equal(view.lastError?.code, "UPSTREAM_ERROR");
+    assert.match(String(view.lastError?.message), /connect refused/);
+  });
+
+  test("task-46：执行时指纹变化 → 仍记录 failed run/run_items 与 lastError", async () => {
+    const { plan } = await readyPlan();
+    t.db.prepare("UPDATE assets SET mtime='2026-10-09T00:00:00.000Z' WHERE id=?").run(Number(plan.item_id) ? (t.db.prepare("SELECT asset_id FROM import_plan_items WHERE plan_id=?").get(plan.id) as any).asset_id : 0);
+    await assert.rejects(() => executeImportPlan({ repo, unity: fakeUnity() as any, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id), /指纹/);
+    const run = repo.latestImportRun(plan.id);
+    assert.ok(run, "指纹变化也要创建 failed run");
+    assert.equal(run.status, "failed");
+    const items = repo.listImportRunItems(run.id);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].status, "failed");
+    assert.match(String(items[0].error), /^FINGERPRINT_CHANGED: /);
+    const view = getPlanView(repo, plan.id)!;
+    assert.equal(view.lastError?.code, "FINGERPRINT_CHANGED");
   });
 });
