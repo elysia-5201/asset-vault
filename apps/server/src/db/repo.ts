@@ -357,7 +357,9 @@ export class Repo {
     return img;
   }
   deleteImage(itemId: number, imageId: number): void {
-    this.stmt("UPDATE items SET cover_image_id = NULL WHERE id = ? AND cover_image_id = ?").run(itemId, imageId);
+    // FIX-08：删除前清掉**所有**指向该图的封面引用（不只当前 item）。
+    // 合并条目会把图片迁到 target，而历史脏数据可能让别的条目仍引用它；ON DELETE RESTRICT 会拒绝删除。
+    this.stmt("UPDATE items SET cover_image_id = NULL WHERE cover_image_id = ?").run(imageId);
     this.stmt("DELETE FROM item_images WHERE id = ? AND item_id = ?").run(imageId, itemId);
   }
   setCover(itemId: number, imageId: number): void { this.stmt("UPDATE items SET cover_image_id=?, updated_at=? WHERE id=?").run(imageId, now(), itemId); }
@@ -571,6 +573,9 @@ export class Repo {
       }
       this.stmt("UPDATE item_images SET position = position + 1000 WHERE item_id=?").run(targetId);
       this.stmt("UPDATE item_images SET position = position - 1000 WHERE item_id=? AND position >= 1000").run(targetId);
+      // FIX-08：图片已迁到 target；source 的 cover_image_id 必须清空，否则 source 仍引用已迁走的图，
+      // 之后删除该图会被 ON DELETE RESTRICT 拒绝（merge → 删除第一张缩略图即报错）。
+      this.stmt("UPDATE items SET cover_image_id=NULL WHERE id=?").run(sourceId);
       // 模型关联：并集，人工/已确认优先
       const srcAv = this.stmt("SELECT * FROM item_avatars WHERE item_id=?").all(sourceId) as any[];
       for (const a of srcAv) {
