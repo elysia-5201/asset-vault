@@ -28,7 +28,7 @@ function walk(dir) {
   let entries = [];
   try { entries = readdirSync(dir); } catch { return; }
   for (const name of entries) {
-    if (SKIP.has(name)) continue;
+    if (SKIP.has(name) || name.startsWith("rollback-") || name === ".tmp-av") continue;
     const p = join(dir, name);
     let st;
     try { st = statSync(p); } catch { continue; }

@@ -1,4 +1,4 @@
-# v0.6.1 · 后台索引流水线、超大压缩包解析与缓存
+# v0.6.2 · 后台索引流水线、超大压缩包解析与缓存
 
 > 目标：把「发现 → 建档 → 深度解析」解耦，让一个 2GB 的压缩包不再堵住整个扫描队列；
 > 所有资源消耗有明确上限，任务可取消、可重试、崩溃后可恢复、失败可诊断。
@@ -7,7 +7,9 @@
 > （`apps/server/src/services/pipeline/*`、`apps/server/src/jobs/runner.ts`、`apps/server/src/db/schema.sql`）。
 >
 > v0.6.0 建起流水线本体；**v0.6.1 做的是加固**：发现层有界化（§4.1）、jobs 租约与围栏（§3.1）、
-> 缓存身份收紧（§5.1）、事件保留（§9.1），外加一轮去掉固定开销的性能优化（§10）。schema 5 → 6。
+> 缓存身份收紧（§5.1）、事件保留（§9.1），外加一轮去掉固定开销的性能优化（§10）。
+> **v0.6.2 继续收紧正确性**：index_tasks 任务围栏（§3.2）、缓存内容采样（§5.1）、预览/应用终态恢复（§6）、
+> 文件系统错误码口径（§7）。schema 6 → 7。
 
 ---
 
@@ -112,6 +114,28 @@ lease_token=lease_token+1`（`WHERE id=? AND state=?`）；续租是
 - **启动条件**：runner 只在**取得 `data/pipeline.lock`** 时才启动（`server.ts`：`if (lock.acquired) runner.start(400)`）；
   没抢到锁的实例只提供 HTTP，作业留在库里排队。文件锁管"两个实例别同时跑"，租约管"跑着跑着进程没了 / 卡死了"。
 
+### 3.2 index_tasks 任务围栏（v0.6.2）
+
+`jobs` 靠**时间租约**（§3.1）判定"谁还活着"；`index_tasks` 是高频短任务，不引入时间租约，
+只做**纯围栏（fencing）**——三列就够：
+
+| 列 | 值 | 含义 |
+|---|---|---|
+| `owner` | `pipeline#<pid>#<rand>` | 领取者实例身份（每个 IndexPipeline 实例一个） |
+| `lease_token` | 整数，**每次领取/重领 +1** | 旧持有者按它被 CAS 拒绝 |
+| `job_id` | 顶层作业 id（可空） | 归组/回收：reap 时按作业重置它的 running 子任务 |
+
+- **领取**是一条语句：`UPDATE index_tasks SET state='running', started_at, attempts+1, owner=?, lease_token=lease_token+1
+  WHERE id=(… queued + 依赖 done/skipped + 退避到期 …) AND state='queued' RETURNING *`；
+  运行时不支持 `RETURNING` 就回落 pick+update（最多循环 8 次）。
+- **写入围栏**：进度（`updateIndexTask`）与终态（`finishIndexTask`）都带
+  `AND owner=? AND lease_token=? AND state='running'`；**0 行不抛错**——
+  进度写入返回 false → pipeline 记一条 `lease_lost` 诊断并丢弃；终态写入返回 null → 同样丢弃。
+- **接管来源**：启动时 `running → queued`（§6）、人工重排、recover 之后重领都会让 token+1，
+  所以"崩溃前那份 worker 迟到的结果"永远写不进去（旧 failed 不可能覆盖新 done）。
+- **兼容**：v7 之前的历史行 `owner` 为 NULL，仍走未围栏的写入路径（不阻塞升级）。
+- **索引**：`ix_index_task_job(job_id, state)` 供"按顶层作业重置/统计子任务"。
+
 ---
 
 ## 4. 资源限制（默认值 = 安全优先）
@@ -192,6 +216,10 @@ lease_token=lease_token+1`（`WHERE id=? AND state=?`）；续租是
 - **解析器升级只失效相关 kind**：升级 archive 解析不会让缩略图 / 哈希失效。
 - **版本键当前都是 3**：`HASH_VERSION`、`ARCHIVE_PARSER_VERSION`、`UNITYPACKAGE_PARSER_VERSION` 均为 3；
   任一语义/限制变化就 +1，只让对应 kind 的旧缓存失效（不会牵连哈希与缩略图）。
+- **内容采样（v0.6.2）**：键的 `extra` 里带 `sample = sha256(首 64 KiB + 尾 64 KiB + size)` 的前 16 hex
+  （`contentSample`，单资产最多多读 128 KiB）。它把"元数据看不见的内容变化"带进键：
+  size/mtime 不变但文件被换掉 → 键变 → miss。**采不到样**（打不开 / 采样期间 size 变了 / 读不满）→ 返回 null
+  → **整个绕过缓存**（不 `get` 不 `put`），宁可贵一次也不复用可疑结果（日志记 `cache bypassed`）。
 
 ### 5.2 复用规则
 
@@ -220,6 +248,12 @@ lease_token=lease_token+1`（`WHERE id=? AND state=?`）；续租是
 - **jobs 级恢复**：v0.6.1 起不再"启动即回收一切在飞作业"，而是等**租约过期**（60s）再接管：
   `reapExpiredLeases()` 只动已过期的行、接管时 `lease_token+1`，仍在心跳的活任务不受影响（见 §3.1）。
 - **反复崩溃保护**：同一作业已恢复 3 次 → 标 `failed` 并写原因，避免无限重启循环。
+- **预览 / 应用的终态（v0.6.2）**：`expireScanPreviews()` 在启动与列表入口清扫失联状态——
+  `scanning` 且 `expires_at` 过期且无在飞生成作业 → `expired`；`applying` 且 `apply_job_id` 缺失 / 作业非在飞 → `failed`
+  （同时把 `scan_apply_runs` 的 running 行转 `failed`）；`ready/partial` 过期 → `expired`。
+  取消走 `POST /api/scan/previews/:id/cancel`：先 `stop → cancel_apply` 掉生成作业，再 CAS 预览
+  `scanning/ready/partial → cancelled`；**迟到的收尾结果按 CAS 丢弃**，不会把 cancelled 覆盖回 ready。
+  `applying` 之后不允许取消（409，改用"重试失败项"）。
 - **单写入者锁**：`<dataDir>/pipeline.lock`（pid + host）。
   拿不到锁的实例**既不启动 pipeline、也不启动 jobs runner**（`if (lock.acquired) runner.start(400)`），
   只提供 HTTP；作业留在库里排队，不会两个进程互相抢任务/重置 running。
@@ -236,6 +270,9 @@ lease_token=lease_token+1`（`WHERE id=? AND state=?`）；续租是
 - 临时文件只写系统临时目录或 `data/cache`，命名带 pid+随机串，`finally` 清理。
 - 清理逻辑只操作 AssetVault 自己的缓存目录；**任何清理都不会删除用户素材**。
 - 日志不记录 GitHub token；错误消息包含文件路径与阶段，便于定位但不 dump 整个异常。
+- **文件系统错误可判别（v0.6.2）**：`EBUSY / EMFILE / ETXTBSY` → 409 `FILE_BUSY`，`EACCES / EPERM` → 403 `PERMISSION`，
+  不再统一说成"不是压缩包"；重试分类据此区分——瞬时（`TIMEOUT / FILE_BUSY / EBUSY / EMFILE`）重试，
+  永久（`ENOENT / EACCES / EPERM / PERMISSION / NOT_FOUND / INVALID_INPUT / NOT_AN_ARCHIVE / ARCHIVE_PASSWORD`）直接 failed，不浪费重试。
 
 ---
 
@@ -259,7 +296,7 @@ lease_token=lease_token+1`（`WHERE id=? AND state=?`）；续租是
 
 ---
 
-## 9. 数据模型（schema v6）
+## 9. 数据模型（schema v7）
 
 v0.6.0 / v5 新增：
 
@@ -275,7 +312,13 @@ v0.6.1 / v6 只加列与索引（不动既有列语义）：
 - `cache_entries`：`weak INTEGER NOT NULL DEFAULT 0` —— 该条缓存的身份是否来自 size/mtime 的弱候选，
   供诊断与淘汰区分强键/弱键（见 §5.1）。
 
-迁移：`SCHEMA_VERSION 4 → 5 → 6`，启动时幂等执行；只加表/列/索引，不改既有列语义。
+v0.6.2 / v7 同样是"只加列与索引"：
+
+- `index_tasks`：`owner TEXT`、`lease_token INTEGER NOT NULL DEFAULT 0`、`job_id INTEGER`（见 §3.2），
+  并加索引 `ix_index_task_job(job_id, state)` 供按顶层作业重置/统计子任务。
+  历史行 `owner` 为 NULL / `lease_token=0`，未围栏的写入路径仍兼容。
+
+迁移：`SCHEMA_VERSION 4 → 5 → 6 → 7`，启动时幂等执行；只加表/列/索引，不改既有列语义。
 旧库升级后 items/assets/tags/collections/avatar 关联一律原样保留。
 
 **回滚**：v0.6.0 代码可以打开 v6 库（多出的 `jobs.holder/lease_until/lease_token/heartbeat_at`、
@@ -319,11 +362,14 @@ v0.6.1 / v6 只加列与索引（不动既有列语义）：
 ```bash
 node --import tsx scripts/bench-pipeline.mjs                 # 默认 1000 小文件 + 100MB 大包
 node --import tsx scripts/acceptance-pipeline.mjs            # 36 项流水线验收
-node scripts/test.mjs                                       # 全仓单测
+node scripts/test.mjs                                       # 全仓单测（691 用例：669 pass / 0 fail / 22 skip / 0 todo）
 ```
 
 基准输出 JSON 落在 `logs/bench-v06-*.json`（含 Node/CPU/冷热状态/数据量/限制指纹），
 字段定义见脚本头注释。**不预先承诺百分比**：以同机同数据集的前后对比为准。
+
+v0.6.2 只做正确性收紧（任务围栏 / 内容采样 / 终态恢复 / 错误码），没有改动吞吐基线；
+内容采样带来的额外读取见 §11。
 
 ### 本机实测（WSL2 / Node v22.22.0 / 8 vCPU）
 
@@ -382,9 +428,15 @@ node scripts/test.mjs                                       # 全仓单测
   要让第二个实例接手，得先停掉第一个进程。
 - 缓存淘汰只看 `cacheMaxBytes` / `cacheMaxAgeDays` / `cacheKeepEntries`，不区分强弱键；
   弱键首轮必然 miss，命中率天然低于强键，这是已知且可接受的代价。
+- **内容采样有额外读取**（v0.6.2）：每个资产最多多读 128 KiB（首尾各 64 KiB）。
+  采不到样时整条资产**绕过缓存**（不读不写），所以首轮大库的命中率会比纯 size/mtime 键略低——这是刻意的取舍。
 
-### 已收敛（v0.6.1）
+### 已收敛（v0.6.1 / v0.6.2）
 
 - 发现层不再保留全量 `filesOut` / `seen`（§4.1）——"接入 `onBatch`"这条 TODO 已完成。
 - `jobs` 具备租约与围栏（§3.1）——"lease/heartbeat"这条 TODO 已完成；跨进程的"谁在跑"由租约接管覆盖。
 - 作业 / pipeline 事件按 §9.1 的有界保留策略自动裁剪（默认 30 天/10 万 + 14 天/20 万；只删终态、不 VACUUM）。
+- `index_tasks` 具备 owner/lease_token 围栏（§3.2）——迟到写入不再能覆盖新终态。
+- 缓存键带内容采样（§5.1）——"size/mtime 没变但内容被换掉"不再复用旧解析结果。
+- 扫描预览可取消、失联终态自动清扫（§6）——不再出现"永远卡在 scanning/applying"的预览。
+- 文件系统错误码可判别（§7）：`FILE_BUSY`(409) / `PERMISSION`(403)，并按瞬时/永久决定是否重试。

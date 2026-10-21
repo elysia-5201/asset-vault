@@ -19,8 +19,7 @@
  */
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, renameSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { closeSync, ftruncateSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openTempDb, addItem, addRoot, type TempDb } from "../schema/_db";
@@ -32,6 +31,21 @@ import { buildTarGz, buildZip } from "../../packages/core/test/content/fixtures"
 import { ARCHIVE_PARSER_VERSION } from "../../packages/core/src/archive/list";
 import type { AssetRow } from "../../packages/core/src/contracts";
 import type { MediaStore } from "../../apps/server/src/services/media";
+
+// cp -p 的跨平台等价：就地截断+写入同一文件（inode 不变），再恢复 mtime。
+// Windows 无 cp；直接 spawnSync("cp") 会 ENOENT。
+function overwriteInPlace(src: string, dst: string): void {
+  const data = readFileSync(src);
+  const fd = openSync(dst, "r+");
+  try {
+    ftruncateSync(fd, 0);
+    writeSync(fd, data, 0, data.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const st = statSync(src);
+  utimesSync(dst, st.atime, st.mtime);
+}
 
 let t: TempDb;
 let repo: Repo;
@@ -445,7 +459,7 @@ describe("FIX-05 内容采样：元数据不可见的替换", () => {
     return victim;
   }
 
-  test("① GNU cp -p 就地覆盖（同 inode/size/mtime）→ 采样变 → MISS", async () => {
+  test("① 就地覆盖（同 inode/size/mtime）→ 采样变 → MISS", async () => {
     const { a, b } = twinZips();
     void a;
     const victim = victimWithA("f5cp", b);
@@ -455,8 +469,8 @@ describe("FIX-05 内容采样：元数据不可见的替换", () => {
     assert.match(String(first.note), /entries=/);
 
     const inoBefore = Number(statSync(victim).ino);
-    execFileSync("cp", ["-p", b, victim]);
-    assert.equal(Number(statSync(victim).ino), inoBefore, "前置：cp -p 就地写，inode 不变");
+    overwriteInPlace(b, victim);
+    assert.equal(Number(statSync(victim).ino), inoBefore, "前置：就地写，inode 不变");
     assert.notEqual(await sampleOf(victim), sampleBefore, "前置：内容变了采样必须变");
 
     const second = await stageArchive(makeCtx(), ra);
@@ -520,7 +534,7 @@ describe("FIX-05 内容采样：元数据不可见的替换", () => {
     const keyBefore = archiveKey("sha256:" + staleSha, "zip", { ...DEFAULT_LIMITS, maxArchiveBytes: 0 }, sampleBefore);
     assert.ok(await cache.get("archive-listing", keyBefore), "前置：旧 sha 键下已有条目");
 
-    execFileSync("cp", ["-p", b, victim]); // 同 inode/size/mtime，内容变了
+    overwriteInPlace(b, victim); // 同 inode/size/mtime，内容变了
     const row = repo.getAsset(ra.id)!;
     const live = liveOf(victim);
     assert.equal(contentIdentity(row, live).weak, false, "前置：元数据仍匹配 → 仍走强身份");

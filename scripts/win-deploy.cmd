@@ -102,7 +102,7 @@ echo [4/5] database backup SKIPPED >>"%LOG%"
 
 rem ---------- 5. sync source tree ----------
 echo [5/5] robocopy /MIR >>"%LOG%"
-robocopy "%AV_SRC%" "%AV_DST%" /MIR /XD node_modules data data-dev logs .npm-cache dist-desktop .git rollback-v0.5.1 /XF *.log /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >>"%LOG%" 2>&1
+robocopy "%AV_SRC%" "%AV_DST%" /MIR /XD node_modules data data-dev logs .npm-cache dist-desktop .git rollback-v0.5.1 rollback-v0.6.1 /XF *.log /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >>"%LOG%" 2>&1
 set "SYNC_RC=!ERRORLEVEL!"
 echo sync_rc=!SYNC_RC! >>"%LOG%"
 if !SYNC_RC! GEQ 8 (

@@ -63,6 +63,8 @@ $script:fail = 0
 
 $src = [IO.Path]::GetFullPath($SourceApp)
 $drill = [IO.Path]::GetFullPath($DrillDir)
+$expectSchema = "6"
+try { $mt = Get-Content -LiteralPath (Join-Path $src "apps\server\src\db\migrate.ts") -Raw -Encoding UTF8; if ($mt -match "SCHEMA_VERSION\s*=\s*(\d+)") { $expectSchema = $Matches[1] } } catch { }
 if (-not (Test-Path -LiteralPath $src)) { Write-Error ("SourceApp not found: " + $src); exit 1 }
 if ($drill -eq $src -or $drill.StartsWith($src + [IO.Path]::DirectorySeparatorChar)) {
   Write-Error ("refusing: DrillDir must be outside SourceApp (" + $src + ")"); exit 1
@@ -207,17 +209,17 @@ if ($Scenario -in @("S2", "All")) {
 
 # ---- S3 ----
 if ($Scenario -in @("S3", "All")) {
-  Step "S3 upgrade back to 0.6.1"
+  Step "S3 upgrade back to current package"
   $d = Join-Path $drill "data-s2"
   if (-not (Test-Path -LiteralPath (Join-Path $d "vault.db"))) { Bad "S3 requires S2 data dir" } else {
     $after = Join-Path $drill "s3-after.json"
     $app = Start-App $NewApp $d
     if (-not $app) { Bad "S3 new app did not start (or escaped drill dir)" } else {
-      Ok ("S3 0.6.1 up: version=" + $app.health.version)
+      Ok ("S3 current package up: version=" + $app.health.version)
       Stop-App $app
       Run-Snapshot (Join-Path $d "vault.db") $after "" | Out-Null
-      $ok = Run-Compare (Join-Path $drill "s2-before.json") $after "6"
-      if ($ok) { Ok "S3 counts unchanged; schema version 6" } else { Bad "S3 compare/version" }
+      $ok = Run-Compare (Join-Path $drill "s2-before.json") $after $expectSchema
+      if ($ok) { Ok ("S3 counts unchanged; schema version " + $expectSchema) } else { Bad "S3 compare/version" }
     }
     $summary.scenarios += [ordered]@{ id = "S3"; data = $d; after = $after }
   }
