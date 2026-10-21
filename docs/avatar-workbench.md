@@ -42,6 +42,7 @@
 - 打开「素材工作台」或对某个条目点「分析」时，前端调 `POST /api/workbench/scan { itemId }` → **202 `{jobId, itemId, state}`**。
 - 这是异步作业（`kind = structure`），同一条目重复点会被 jobs 的 `(item_id, kind)` 在飞唯一索引挡住 → 409 `CONFLICT`。
 - 分析完才会出现单元；**分析失败不会伪造单元**：解析不完整 → `parse_state = partial/failed`，policy 落 `unknown_structure`。
+- 发现/解析有硬预算（深度 ≤3、≤32 个内层归档、单包 ≤512MB、累计 ≤512MB、45s、条目 ≤1 万），超限标 `limited`。
 
 ### 3.2 选 Avatar
 
@@ -107,7 +108,10 @@
    - 已有在飞执行 → 409 `CONFLICT`（带 `jobId`）；
    - blocked / 未确认的 needs_confirmation / 已执行过 → 409。
 3. 前端轮询 `GET /api/import-plans/:id` 与 `GET /api/import-runs/:id` 显示逐单元状态。
-   **不要假设 execute 同步返回 run**——run 是执行过程中才建出来的。
+   **不要假设 execute 同步返回 run**——run 是执行过程中才建出来的。计划视图里的 `run_id` / `latestRun` 一旦出现，就据此拉 run。
+4. **前置失败也会留下可审计的 failed run**：Unity 离线、工程路径不匹配、指纹变化等发生在真正导包之前的错误，
+   会写一条 `status = failed` 的 run（每个单元一条 `failed` run_item，`detail.phase = "preflight"`），
+   同时计划视图给出 `lastError: { code, message, phase }`。**不会出现**「计划 failed 但看不到原因」的情况。
 
 ### 3.8 逐单元状态
 
@@ -170,9 +174,9 @@ run 级状态：`running` / `verified` / `partial_success` / `failed`（全成�
 | POST | `/api/workbench/scan` | `{ itemId, refresh? }` | **202** `{ jobId, itemId, state }` | 异步分析容器的资源单元（`kind = structure`） |
 | GET | `/api/workbench/avatars` | `?itemId=`（可选） | `[{ avatar: {id,name}, counts: {confirmed, probable, unknown, mixed} }]` | 按 Avatar 聚合单元证据计数（**裸数组**） |
 | GET | `/api/workbench/units` | `?itemId=&avatarId=&policy=&level=&itemStatus=&limit=` | `[{ id, assetId, itemId, relPath, format, kind, name, size, fingerprint, policy, importable, mixed, parseState, parseError, avatars[], evidence, item, asset, updatedAt }]` | 单元视图（**裸数组**） |
-| POST | `/api/import-plans` | `{ unitIds: number[], projectPath: string, includeSuggested?: boolean }` | **201** `{ plan, items, precheck }` | 建计划（快照 + 指纹 + precheck） |
-| GET | `/api/import-plans/:id` | — | `{ plan, items, precheck }` | 计划详情（轮询用） |
-| POST | `/api/import-plans/:id/confirm` | — | `{ plan, items, precheck }` | 人工确认（suggested → pending） |
+| POST | `/api/import-plans` | `{ unitIds: number[], projectPath: string, includeSuggested?: boolean }` | **201** PlanView `{ plan, items, precheck, run_id, latestRun, lastError }` | 建计划（快照 + 指纹 + precheck） |
+| GET | `/api/import-plans/:id` | — | PlanView（同上） | 计划详情（轮询用；`run_id` 出现后就去轮询 run） |
+| POST | `/api/import-plans/:id/confirm` | — | PlanView | 人工确认（suggested → pending） |
 | POST | `/api/import-plans/:id/execute` | — | **202** `{ jobId, planId }` | 建 import job（Job 化，不返回 run） |
 | GET | `/api/import-runs/:id` | — | `{ run, items }` | 执行进度与逐单元状态 |
 
@@ -186,6 +190,7 @@ run 级状态：`running` / `verified` / `partial_success` / `failed`（全成�
 | `CONFIRM_REQUIRED` | 409 | `needs_confirmation` 且未 `confirm` |
 | `PLAN_NOT_EXECUTABLE` | 409 | 计划已 executed/failed/running，**不可重放** |
 | `CONFLICT` | 409 | 已有在飞执行作业（带 `jobId`）/ 同条目已有结构分析作业 |
+| `UNITY_UNAVAILABLE` | 409 | 执行时探测不到打开的 Unity 编辑器 / 工程路径不匹配（**会落 failed run + `lastError`**） |
 
 ---
 
@@ -197,7 +202,10 @@ run 级状态：`running` / `verified` / `partial_success` / `failed`（全成�
 - **一次计划只能属于同一个条目**（后端硬校验 `itemIds.length === 1`）；跨条目请分别建计划。
 - **执行不可重放**：同一计划执行过就不能再 execute（外部副作用不自动重试）；要重跑请重新建计划。
 - **指纹口径**：`size:mtime:sha256前8:单元大小`。任一变化 → `blocked` / execute 拒绝，绝不按旧快照导入。
-- **嵌套发现深度 ≤2、最多 8 个内层归档**，条目数/字节/时间都有界，超限只标 `limited`（不伪造完整结果）。
+- **发现与解析预算（超限只标 `limited`，不伪造完整结果）**：
+  · 嵌套容器发现：深度 **≤3**、最多 **32** 个内层归档、单次 listing ≤5000 条；
+  · 单包 **≤512MB**、累计解压 **≤512MB**、时间 **≤45s**；
+  · 单元解析（读 `.unitypackage` 内容）：单包同上 **≤512MB**、条目 **≤1 万条**资产、最多 64 个包。
 - **7z / rar 内层缩略图不抽**：单元识别与缩略图无关；7z/rar 里图片仍不生成缩略图。
 - **混合包导入后需要你在 Unity 里清理**：工具只保证「导入的是原始整包」，不替你删工程里多出来的资源。
 - **关系建议只是建议**：`unit_relations` 只到 `probable`，不会自动进计划；要进计划必须你勾 `includeSuggested` 或手动选。

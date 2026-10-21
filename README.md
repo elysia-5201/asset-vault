@@ -5,7 +5,7 @@
 [![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](#-快速开始)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-709%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-717%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -116,7 +116,7 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（731 用例：709 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+node scripts/test.mjs            # 全仓单测（739 用例：717 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
 node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v8）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
@@ -258,9 +258,9 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
   `FILE_BUSY`(409) / `PERMISSION`(403)；`/api/stats` 不再把回收站算进物品/资产/体积。
 - **合并/删图的封面一致性（v0.6.3）**：合并条目时**先清空来源条目的 `cover_image_id`**，删缩略图时**清掉所有指向它的引用**；
   不再出现"删缩略图触发外键错误（`FOREIGN KEY constraint failed`）"的 500。
-- **资源单元（v0.7.0）**：`POST /api/workbench/scan` 异步分析条目容器 → `asset_units`（一个 `.unitypackage` 本体或压缩包内的一层 `.unitypackage`，含 rel_path/大小/指纹/policy/可导入性/avatar 证据）+ `unit_relations`（伴生/变体建议，只到 probable）；嵌套发现深度 ≤2、最多 8 个内层归档、条目/字节/时间有界，超限只标 `limited`。
+- **资源单元（v0.7.0）**：`POST /api/workbench/scan` 异步分析条目容器 → `asset_units`（一个 `.unitypackage` 本体或压缩包内的一层 `.unitypackage`，含 rel_path/大小/指纹/policy/可导入性/avatar 证据）+ `unit_relations`（伴生/变体建议，只到 probable）；发现/解析有硬预算（嵌套深度 ≤3、≤32 个内层归档、单包 ≤512MB、累计 ≤512MB、45s、条目 ≤1 万），超限只标 `limited`，不伪造完整结果。
 - **Avatar 素材工作台（v0.7.0）**：`GET /api/workbench/avatars`（按 Avatar 聚合证据计数：confirmed / probable / unknown / mixed）与 `GET /api/workbench/units`（单元视图：证据、policy、来源条目与资产）；工具栏「素材工作台」面板串起 选择 → 筛选 → 清单 → 计划 → 执行。
-- **导入计划与执行（v0.7.0）**：`POST /api/import-plans`（按 unitIds 建计划，快照路径 + 指纹 + precheck）→ `confirm`（suggested → pending，人工确认）→ `execute`（**202 {jobId, planId}**，Job 化）→ 轮询 `GET /api/import-plans/:id` 与 `GET /api/import-runs/:id`。每单元独立状态，互不覆盖；指纹变化 → plan `blocked` / execute 拒绝，绝不按旧快照导入；Unity 返回只算 `import_command_completed`，`verified` / `partial_success` 是另外的 GUID + 控制台校验结论。
+- **导入计划与执行（v0.7.0）**：`POST /api/import-plans`（按 unitIds 建计划，快照路径 + 指纹 + precheck）→ `confirm`（suggested → pending，人工确认）→ `execute`（**202 {jobId, planId}**，Job 化）→ 轮询 `GET /api/import-plans/:id` 与 `GET /api/import-runs/:id`。每单元独立状态，互不覆盖；指纹变化 → plan `blocked` / execute 拒绝，绝不按旧快照导入；Unity 返回只算 `import_command_completed`，`verified` / `partial_success` 是另外的 GUID + 控制台校验结论；**执行前置失败（Unity 离线 / 工程不匹配 / 指纹变化）也会落一条 failed run + 计划视图 `lastError{code,message,phase}`**，不会只剩一个没有原因的 failed。
 - **混合包整包策略（v0.7.0）**：`mixed_unitypackage`（≥2 个不同模型证据，或显式 `mixedConfirmed`）**永远导入原始整包**，不生成筛选包、不拆包；ZIP 里多个 `.unitypackage` 算「多独立包容器」（逐包导入），不算混合包；解析不完整且判不了 → `unknown_structure`（不猜、不可导入）。
 
 完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**；工作台用户手册与整包策略见 **`docs/avatar-workbench.md`**。
@@ -281,7 +281,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 731 用例（709 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线 + 工作台/导入计划）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs`、`scripts/acceptance-structure.mjs` |
+| 质检 | `node:test` 739 用例（717 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线 + 工作台/导入计划）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs`、`scripts/acceptance-structure.mjs` |
 
 ### 打包与迁移踩坑（留档）
 

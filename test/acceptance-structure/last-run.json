@@ -1,8 +1,8 @@
 {
-  "at": "2026-10-21T14:58:18.582Z",
+  "at": "2026-10-21T15:50:48.453Z",
   "banner": "PASS",
   "counts": {
-    "PASS": 50
+    "PASS": 54
   },
   "rows": [
     {
@@ -150,7 +150,7 @@
       "area": "E",
       "desc": "文件被改后 sha256 变化（指纹可检出）",
       "status": "PASS",
-      "detail": "6a184bbc80c83525 -> 41ef18c7a124c057"
+      "detail": "9d7e4cd9d8891263 -> b7be4142702a3f2f"
     },
     {
       "id": "E6-2",
@@ -283,7 +283,7 @@
       "area": "PLAN",
       "desc": "mixed plan_item.path === 原始整包路径",
       "status": "PASS",
-      "detail": "/tmp/av-structure-CBzOeb/e2e/B_mixed.unitypackage"
+      "detail": "/tmp/av-structure-jNAisx/e2e/B_mixed.unitypackage"
     },
     {
       "id": "B-2c",
@@ -332,39 +332,68 @@
       "area": "PLAN",
       "desc": "执行前后源文件 sha256 不变",
       "status": "PASS",
-      "detail": "133dbb262e45ce68 -> 133dbb262e45ce68"
+      "detail": "52af6879c9fcb0fc -> 52af6879c9fcb0fc"
     },
     {
       "id": "B-4c",
       "area": "PLAN",
-      "desc": "被拦截时不产生 run 记录（不伪造执行）",
+      "desc": "前置失败落 failed run（summary.phase=preflight）",
       "status": "PASS",
-      "detail": "run=null"
+      "detail": "run={\"id\":1,\"status\":\"failed\",\"phase\":\"preflight\"}"
+    },
+    {
+      "id": "B-4d",
+      "area": "PLAN",
+      "desc": "每个 plan_item 一条 failed run_item（可审计）",
+      "status": "PASS",
+      "detail": "runItems=[\"failed\"]"
+    },
+    {
+      "id": "B-4e",
+      "area": "PLAN",
+      "desc": "plan.lastError.code=UNITY_UNAVAILABLE（phase 见 run.summary）",
+      "status": "PASS",
+      "detail": "{\"code\":\"UNITY_UNAVAILABLE\",\"message\":\"Unity 编辑器不可用或未返回工程路径\"} summaryPhase=preflight"
     },
     {
       "id": "E5-2a",
       "area": "E",
-      "desc": "三层嵌套 → 服务只展开到深度上限，超限单元标 limited/failed 且不可导入",
+      "desc": "depth=3 嵌套 → 服务展开出可导入单元（rel_path 含 ::）",
       "status": "PASS",
-      "detail": "(container):unknown_structure:ok:imp=0 | layer1/middle.zip::inner.zip:unknown_structure:limited:imp=0"
+      "detail": "layer1/middle.zip::inner.zip::deep/inner.unitypackage:single_unitypackage:ok:imp=1"
     },
     {
       "id": "E5-2b",
       "area": "E",
-      "desc": "不可导入单元建计划 → INVALID_INPUT（不伪造可执行计划）",
+      "desc": "depth=3 单元可建计划（单条）",
+      "status": "PASS",
+      "detail": "planItems=1"
+    },
+    {
+      "id": "E5-2c",
+      "area": "E",
+      "desc": "depth=4 超过上限 → limited 单元、无可导入单元",
+      "status": "PASS",
+      "detail": "(container):unknown_structure:ok:imp=0 | L1/a.zip::L2/b.zip::L3/c.zip::L4/deep.zip:unknown_structure:limited:imp=0"
+    },
+    {
+      "id": "E5-2d",
+      "area": "E",
+      "desc": "超限单元建计划 → INVALID_INPUT（不伪造可执行计划）",
       "status": "PASS",
       "detail": "code=INVALID_INPUT"
     }
   ],
   "hashes": {
-    "A_multi_container.zip": "fe9e79e4bbc74c5f67a5fa09ddc85a62ddf4c0c389a81b65d719cb28f9be30a8",
-    "B_mixed.unitypackage": "6a184bbc80c835255a4328cf1b5fa7c97c920e145acf564149d099235ad58c6c",
-    "C_container_mixed.zip": "a9c1f020838ff87077d5550413f7e27404ab63bdd72c6d70e5c294c491cdb5ab",
-    "D_companion.zip": "8b8eb98f8c57bb1066b885cd0f63d1258fe141fd1d98f7e9cae4e13a9ecc69ac",
+    "A_multi_container.zip": "978676a388296b19e1ef4a0af8b1a6b2c1cd78e28707da552f5d5ae80e961c0d",
+    "B_mixed.unitypackage": "9d7e4cd9d8891263747422c7f5ddeaa3f6cb6d5637e1ee67831062fb742e1f89",
+    "C_container_mixed.zip": "9cbc7c3320efd3ac3c694f6d710cb186f9c73813c4f3864afcd90d2a4aace8b5",
+    "D_companion.zip": "f12c104e5be4929f882528e1e783994dfd5e38e2f5c661e43bff44e704a3321e",
     "E1_corrupt.zip": "faac88191b7a64cbb658816526fa8e1365e57df62be651c610dec25fe5987800",
-    "E2_truncated.unitypackage": "930004d5a1955d068fe5b33a36c8b207d6de55405ca2fe93598404bf7f078444",
-    "E3_overlimit.zip": "086732e15c9f3e8e5d38e83cc203392f87ae300e32af6a16c4125fe90d4c122a",
-    "E4_zipslip.zip": "18cbb166e52dd38fd2c331edb339ee6be8d5f0d6277bf49cfbe1da60c0f09d43",
-    "E5_nested3.zip": "b2e0225e770f969ccea203919fb3da02dbf8f07100faf6cddfeaefc6474e7c49"
+    "E2_truncated.unitypackage": "5b3b5d6b2017d255f451b741b79890930d0fb37357038d60cfa67b78a5b10b5a",
+    "E3_overlimit.zip": "980a22792d19db310c3ab97fa2a2ca90cf22b3d5bfd0d95c4718a366250db47b",
+    "E4_zipslip.zip": "10b30dfbc33e7435bec9fde229ac37ef658b975ad69fcf7e476077dbcb5247b5",
+    "E5_depth4.zip": "b24f5614c4a75411d51eea08b2d6671d500432a25f0365de669e3c19b617e311",
+    "E5_nested3.zip": "5c7ab59220d9698c95bb119058c5a9fa2caebe8fd41dab8e98a622b49eef34d5"
   }
 }

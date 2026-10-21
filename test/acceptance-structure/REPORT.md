@@ -1,21 +1,22 @@
 # v0.7.0 结构验收明细（task-40）
 
-> 自动生成：`node --import tsx scripts/acceptance-structure.mjs`；2026-10-21T14:58:18.582Z
-> 结果：**PASS**（PASS 50 / FAIL 0 / SKIP 0）
+> 自动生成：`node --import tsx scripts/acceptance-structure.mjs`；2026-10-21T15:50:48.453Z
+> 结果：**PASS**（PASS 54 / FAIL 0 / SKIP 0）
 
 ## 夹具（真实 zip / tar.gz，含 asset.meta guid）
 
 | 文件 | 大小 | sha256 |
 |---|---|---|
-| A_multi_container.zip | 1351 | `fe9e79e4bbc74c5f67a5fa09ddc85a62…` |
-| B_mixed.unitypackage | 381 | `6a184bbc80c835255a4328cf1b5fa7c9…` |
-| C_container_mixed.zip | 542 | `a9c1f020838ff87077d5550413f7e274…` |
-| D_companion.zip | 1268 | `8b8eb98f8c57bb1066b885cd0f63d125…` |
+| A_multi_container.zip | 1351 | `978676a388296b19e1ef4a0af8b1a6b2…` |
+| B_mixed.unitypackage | 381 | `9d7e4cd9d8891263747422c7f5ddeaa3…` |
+| C_container_mixed.zip | 542 | `9cbc7c3320efd3ac3c694f6d710cb186…` |
+| D_companion.zip | 1268 | `f12c104e5be4929f882528e1e783994d…` |
 | E1_corrupt.zip | 126 | `faac88191b7a64cbb658816526fa8e13…` |
-| E2_truncated.unitypackage | 199 | `930004d5a1955d068fe5b33a36c8b207…` |
-| E3_overlimit.zip | 6671 | `086732e15c9f3e8e5d38e83cc203392f…` |
-| E4_zipslip.zip | 514 | `18cbb166e52dd38fd2c331edb339ee6b…` |
-| E5_nested3.zip | 561 | `b2e0225e770f969ccea203919fb3da02…` |
+| E2_truncated.unitypackage | 199 | `5b3b5d6b2017d255f451b741b7989093…` |
+| E3_overlimit.zip | 6671 | `980a22792d19db310c3ab97fa2a2ca90…` |
+| E4_zipslip.zip | 514 | `10b30dfbc33e7435bec9fde229ac37ef…` |
+| E5_depth4.zip | 741 | `b24f5614c4a75411d51eea08b2d6671d…` |
+| E5_nested3.zip | 560 | `5c7ab59220d9698c95bb119058c5a9fa…` |
 
 ## 明细
 
@@ -41,7 +42,7 @@
 | E4-2 | E | 显式读取越界条目被拒绝（不存在/非法输入） | PASS | code=NOT_FOUND |
 | E4-3 | E | 若路径逃逸，isSubPath 可判定（防御对照） | PASS | normalized=../../../evil.unitypackage |
 | E5-1 | E | 嵌套 3 层可逐层解出 upkg | PASS | depth=3 assets=1 |
-| E6-1 | E | 文件被改后 sha256 变化（指纹可检出） | PASS | 6a184bbc80c83525 -> 41ef18c7a124c057 |
+| E6-1 | E | 文件被改后 sha256 变化（指纹可检出） | PASS | 9d7e4cd9d8891263 -> b7be4142702a3f2f |
 | E6-2 | E | 被改后的文件不再被当作完整包（抛错或 truncated/assets 变化） | PASS | code=NOT_AN_ARCHIVE |
 | G-1 | G | 全部夹具解析后原始 sha256 / mtime 不变（解析只读） | PASS |  |
 | P-7 | POLICY | evidence：别名/大小写/全半角命中并被合并 | PASS | [{"avatarId":1,"via":"filename","level":"probable","hits":["MANUKA.unitypackage","マヌカ","ＭＡＮＵＫＡ"]}] |
@@ -60,17 +61,21 @@
 | B-1c | PLAN | includeSuggested=true（真实 analyze 关系）：加入伴生单元且标 suggested | PASS | items=["MANUKA_material.unitypackage:pending","MANUKA_model.unitypackage:pending","MANUKA_texture.unitypackage:suggested"] relations=3 |
 | B-1e | PLAN | 正例对照：有关系时 includeSuggested 加入且仅标 suggested | PASS | ["MANUKA_texture.unitypackage:pending","MANUKA_material.unitypackage:suggested"] |
 | B-2a | PLAN | B 单元 policy=mixed_unitypackage 且可导入 | PASS | mixed_unitypackage |
-| B-2b | PLAN | mixed plan_item.path === 原始整包路径 | PASS | /tmp/av-structure-CBzOeb/e2e/B_mixed.unitypackage |
+| B-2b | PLAN | mixed plan_item.path === 原始整包路径 | PASS | /tmp/av-structure-jNAisx/e2e/B_mixed.unitypackage |
 | B-2c | PLAN | 计划阶段不产生暂存/筛选包（目录未新增文件） | PASS | dirs=B_mixed.unitypackage,D_companion.zip,UnityProject |
 | B-2d | PLAN | mixed 计划需人工确认（不自动执行） | PASS | needs_confirmation |
 | B-3a | PLAN | 单包计划建立（ready） | PASS | ready |
 | B-3b | PLAN | 改文件后 precheck → FINGERPRINT_CHANGED 且计划 blocked | PASS | code=FINGERPRINT_CHANGED |
 | B-3c | PLAN | execute 同样被拦截（不执行外部导入） | PASS | code=PLAN_BLOCKED |
 | B-4a | PLAN | Unity 不可用 → execute 被拦截（UNITY_UNAVAILABLE） | PASS | code=UNITY_UNAVAILABLE |
-| B-4b | PLAN | 执行前后源文件 sha256 不变 | PASS | 133dbb262e45ce68 -> 133dbb262e45ce68 |
-| B-4c | PLAN | 被拦截时不产生 run 记录（不伪造执行） | PASS | run=null |
-| E5-2a | E | 三层嵌套 → 服务只展开到深度上限，超限单元标 limited/failed 且不可导入 | PASS | (container):unknown_structure:ok:imp=0 \| layer1/middle.zip::inner.zip:unknown_structure:limited:imp=0 |
-| E5-2b | E | 不可导入单元建计划 → INVALID_INPUT（不伪造可执行计划） | PASS | code=INVALID_INPUT |
+| B-4b | PLAN | 执行前后源文件 sha256 不变 | PASS | 52af6879c9fcb0fc -> 52af6879c9fcb0fc |
+| B-4c | PLAN | 前置失败落 failed run（summary.phase=preflight） | PASS | run={"id":1,"status":"failed","phase":"preflight"} |
+| B-4d | PLAN | 每个 plan_item 一条 failed run_item（可审计） | PASS | runItems=["failed"] |
+| B-4e | PLAN | plan.lastError.code=UNITY_UNAVAILABLE（phase 见 run.summary） | PASS | {"code":"UNITY_UNAVAILABLE","message":"Unity 编辑器不可用或未返回工程路径"} summaryPhase=preflight |
+| E5-2a | E | depth=3 嵌套 → 服务展开出可导入单元（rel_path 含 ::） | PASS | layer1/middle.zip::inner.zip::deep/inner.unitypackage:single_unitypackage:ok:imp=1 |
+| E5-2b | E | depth=3 单元可建计划（单条） | PASS | planItems=1 |
+| E5-2c | E | depth=4 超过上限 → limited 单元、无可导入单元 | PASS | (container):unknown_structure:ok:imp=0 \| L1/a.zip::L2/b.zip::L3/c.zip::L4/deep.zip:unknown_structure:limited:imp=0 |
+| E5-2d | E | 超限单元建计划 → INVALID_INPUT（不伪造可执行计划） | PASS | code=INVALID_INPUT |
 
 ## SKIP 说明
 

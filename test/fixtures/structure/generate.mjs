@@ -103,10 +103,17 @@ write("E4_zipslip.zip", zip_bytes([
     ("ok/readme.txt", b"hello"),
 ]))
 
-# E5：嵌套 3 层（zip -> zip -> zip -> upkg）
+# E5：嵌套 3 层（zip -> zip -> upkg；depth=3 可展开）
 inner_zip = zip_bytes([("deep/inner.unitypackage", upkg_bytes([MANUKA]))])
 middle_zip = zip_bytes([("inner.zip", inner_zip)])
 write("E5_nested3.zip", zip_bytes([("layer1/middle.zip", middle_zip)]))
+
+# E5d：嵌套 4 层（外层 + L1 + L2 + L3 容器，upkg 在 L4；depth>3 → limited）
+l4 = zip_bytes([("deep/pkg.unitypackage", upkg_bytes([MANUKA]))])
+l3 = zip_bytes([("L4/deep.zip", l4)])
+l2 = zip_bytes([("L3/c.zip", l3)])
+l1 = zip_bytes([("L2/b.zip", l2)])
+write("E5_depth4.zip", zip_bytes([("L1/a.zip", l1)]))
 
 print("generated", len(os.listdir(out)), "files")
 `;

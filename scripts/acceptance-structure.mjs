@@ -27,7 +27,7 @@ import { isSubPath, normalizePath } from "../packages/core/src/pathnorm.ts";
 import { generateFixtures } from "../test/fixtures/structure/generate.mjs";
 import { openTempDb, addAsset, addAvatar, addItem, addRoot } from "../test/schema/_db";
 import { Repo } from "../apps/server/src/db/repo";
-import { analyzeItemStructure, createImportPlan, precheckImportPlan, executeImportPlan } from "../apps/server/src/services/structure";
+import { analyzeItemStructure, createImportPlan, precheckImportPlan, executeImportPlan, getPlanView } from "../apps/server/src/services/structure";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..");
@@ -378,22 +378,42 @@ async function main() {
       const h1 = await sha256File(single);
       check("B-4a", "PLAN", "Unity 不可用 → execute 被拦截（UNITY_UNAVAILABLE）", code === "UNITY_UNAVAILABLE", "code=" + code);
       check("B-4b", "PLAN", "执行前后源文件 sha256 不变", h0 === h1, h0.slice(0, 16) + " -> " + h1.slice(0, 16));
-      check("B-4c", "PLAN", "被拦截时不产生 run 记录（不伪造执行）", env.repo.latestImportRun(view.plan.id) === null, "run=" + JSON.stringify(env.repo.latestImportRun(view.plan.id)));
+      // task-46：前置失败也要留可审计的 failed run + 逐项 run_items + plan.lastError（不再要求"无 run"）
+      const pv = getPlanView(env.repo, view.plan.id);
+      const run = pv.latestRun;
+      const runItems = run ? env.repo.listImportRunItems(run.id) : [];
+      const phase = run && run.summary ? run.summary.phase : null;
+      check("B-4c", "PLAN", "前置失败落 failed run（summary.phase=preflight）", !!run && run.status === "failed" && phase === "preflight", "run=" + JSON.stringify(run && { id: run.id, status: run.status, phase }));
+      check("B-4d", "PLAN", "每个 plan_item 一条 failed run_item（可审计）", runItems.length === view.items.length && runItems.every((ri) => ri.status === "failed" && String(ri.error || "").includes("UNITY_UNAVAILABLE")), "runItems=" + JSON.stringify(runItems.map((ri) => ri.status)));
+      check("B-4e", "PLAN", "plan.lastError.code=UNITY_UNAVAILABLE（phase 见 run.summary）", pv.lastError && pv.lastError.code === "UNITY_UNAVAILABLE" && phase === "preflight", JSON.stringify(pv.lastError) + " summaryPhase=" + phase);
     } finally { env.t.close(); }
   } catch (e) { fail("B-4", "PLAN", "B-4 执行异常", String((e && e.stack) || e)); }
 
-  // E5-2：三层嵌套在服务层只展开到深度上限，超限单元不可导入、建计划被拒
+  // E5-2：嵌套上限（task-45：depth=3 / archives=32 / 512MB）
+  //  - depth 3 可展开且 importable（真实大包场景）
+  //  - depth 4 → limited、不可导入、建计划被拒
   try {
-    const env = await seedEnv([{ key: "e5", path: copyFix("E5_nested3.zip", "E5_nested3.zip"), container: "zip", kind: "archive" }]);
+    const env3 = await seedEnv([{ key: "e5d3", path: copyFix("E5_nested3.zip", "E5_nested3.zip"), container: "zip", kind: "archive" }]);
     try {
-      const limited = env.units.filter((u) => String(u.parse_state) !== "ok" || Number(u.importable) === 0);
-      const importable = env.units.filter((u) => Number(u.importable) === 1);
-      check("E5-2a", "E", "三层嵌套 → 服务只展开到深度上限，超限单元标 limited/failed 且不可导入", limited.length >= 1 && importable.length === 0, env.units.map((u) => (u.rel_path || "(container)") + ":" + u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
+      const importable = env3.units.filter((u) => Number(u.importable) === 1);
+      const nested = importable.find((u) => String(u.rel_path || "").includes("::"));
+      check("E5-2a", "E", "depth=3 嵌套 → 服务展开出可导入单元（rel_path 含 ::）", importable.length >= 1 && !!nested, env3.units.map((u) => (u.rel_path || "(container)") + ":" + u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
+      let planItems = -1;
+      try { planItems = createImportPlan(env3.repo, { unitIds: [Number(nested.id)], projectPath: project }).items.length; } catch { planItems = -1; }
+      check("E5-2b", "E", "depth=3 单元可建计划（单条）", planItems === 1, "planItems=" + planItems);
+    } finally { env3.t.close(); }
+  } catch (e) { fail("E5-2a", "E", "E5-2 depth3 执行异常", String((e && e.stack) || e)); }
+  try {
+    const env4 = await seedEnv([{ key: "e5d4", path: copyFix("E5_depth4.zip", "E5_depth4.zip"), container: "zip", kind: "archive" }]);
+    try {
+      const limited = env4.units.filter((u) => String(u.parse_state) === "limited" || String(u.parse_state) === "failed");
+      const importable = env4.units.filter((u) => Number(u.importable) === 1);
+      check("E5-2c", "E", "depth=4 超过上限 → limited 单元、无可导入单元", limited.length >= 1 && importable.length === 0, env4.units.map((u) => (u.rel_path || "(container)") + ":" + u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
       let code = null;
-      try { createImportPlan(env.repo, { unitIds: [Number(limited[0].id)], projectPath: project }); } catch (e) { code = errCode(e); }
-      check("E5-2b", "E", "不可导入单元建计划 → INVALID_INPUT（不伪造可执行计划）", code === "INVALID_INPUT", "code=" + code);
-    } finally { env.t.close(); }
-  } catch (e) { fail("E5-2", "E", "E5-2 执行异常", String((e && e.stack) || e)); }
+      try { createImportPlan(env4.repo, { unitIds: [Number(limited[0].id)], projectPath: project }); } catch (e) { code = errCode(e); }
+      check("E5-2d", "E", "超限单元建计划 → INVALID_INPUT（不伪造可执行计划）", code === "INVALID_INPUT", "code=" + code);
+    } finally { env4.t.close(); }
+  } catch (e) { fail("E5-2c", "E", "E5-2 depth4 执行异常", String((e && e.stack) || e)); }
 
   // ---------- 汇总 ----------
   const counts = rows.reduce((m, r) => (m[r.status] = (m[r.status] || 0) + 1, m), {});
