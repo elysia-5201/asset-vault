@@ -7,7 +7,7 @@
  *  - 指纹变化 → plan blocked / execute 拒绝（FINGERPRINT_CHANGED），绝不按旧快照导入；
  *  - Unity 调用返回只算 import_command_completed；verified/partial_success 是**另外**的验证结论。
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
@@ -19,8 +19,8 @@ import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
 import type { Repo } from "../db/repo";
 import {
-  UnityMcp, unityEditorInfo, stageUnityPackage, importPackagesIntoUnity,
-  readUnityConsole, clearUnityConsole, sleep, baseName, type UnityPackageCandidate,
+  UnityMcp, unityEditorInfo, importPackagesIntoUnity,
+  readUnityConsole, clearUnityConsole, sleep, baseName,
 } from "./unity";
 
 const IMPORTABLE_POLICIES = new Set<StructurePolicy>(["single_unitypackage", "mixed_unitypackage"]);
@@ -56,74 +56,114 @@ function evidenceCount(ev: AvatarEvidence[]): number {
   return new Set(ev.filter((e) => e.level === "confirmed" || e.level === "probable").map((e) => e.avatarId)).size;
 }
 
-/** 嵌套容器发现上限（task-42）：深度 ≤2，条目/字节/时间都有界，超限只标 limited，不伪造成功。 */
-const NESTED_MAX_DEPTH = 2;
-const NESTED_MAX_ARCHIVES = 8;
+/** 嵌套容器发现上限（task-45：depth=3 / archives=32 / 45s / 累计解压 512MB）。 */
+const NESTED_MAX_DEPTH = 3;
+const NESTED_MAX_ARCHIVES = 32;
 const NESTED_MAX_ENTRIES = 5000;
-const NESTED_MAX_BYTES = 256 * 1024 * 1024;
-const NESTED_TIME_BUDGET_MS = 20_000;
+const NESTED_MAX_BYTES = 512 * 1024 * 1024;
+const NESTED_TIME_BUDGET_MS = 45_000;
 const ARCHIVE_EXT_RE = /\.(zip|7z|rar)$/i;
 
 interface NestedDiscovery {
-  /** 内层 upkg 单元（rel_path='outer::inner'） */
-  packages: { entryPath: string; innerEntryPath: string; size: number }[];
+  /** 内层 upkg 单元（rel_path='outer::inner[:...]'） */
+  packages: { relPath: string; size: number }[];
   /** 读不了/超限/深度超限的嵌套容器（落 limited/failed 单元） */
   limited: { relPath: string; reason: string; state: "limited" | "failed" }[];
 }
 
 /**
- * 在外层压缩包里递归发现 .unitypackage：
- * 外层 archive_entries 里的 zip/7z/rar 条目 → 解出临时文件 → listArchive 找内层 *.unitypackage。
- * 深度上限 2（外层 + 一层内层容器）；内层再套压缩包 → limited，不再展开。
+ * 在外层压缩包里递归发现 .unitypackage（task-45：depth=3）。
+ * 外层 archive_entries 的 zip/7z/rar → 解出临时文件 → listArchive，递归到第 3 层容器；
+ * 能展开的内层 zip 不产生 limited 占位；只有超预算/超深度/读失败才留 limited 证据。
  */
 async function discoverNestedContainers(asset: any, outerArchives: { entryPath: string; size: number }[]): Promise<NestedDiscovery> {
   const out: NestedDiscovery = { packages: [], limited: [] };
-  const seen = new Set<string>();
+  const seenPkg = new Set<string>();
+  const seenLimited = new Set<string>();
   const started = Date.now();
-  let attempts = 0;
-  for (const entry of outerArchives) {
-    if (attempts >= NESTED_MAX_ARCHIVES) { out.limited.push({ relPath: entry.entryPath, reason: "嵌套容器数超过上限 " + NESTED_MAX_ARCHIVES, state: "limited" }); continue; }
-    if (Date.now() - started > NESTED_TIME_BUDGET_MS) { out.limited.push({ relPath: entry.entryPath, reason: "嵌套发现超过时间预算 " + NESTED_TIME_BUDGET_MS + "ms", state: "limited" }); continue; }
-    if (Number(entry.size) > NESTED_MAX_BYTES) { out.limited.push({ relPath: entry.entryPath, reason: "内层容器超过 " + Math.round(NESTED_MAX_BYTES / 1024 / 1024) + "MB", state: "limited" }); continue; }
-    attempts++;
+  let opened = 0;
+  let bytes = 0;
+  const addLimited = (relPath: string, reason: string, state: "limited" | "failed") => {
+    if (seenLimited.has(relPath)) return;
+    seenLimited.add(relPath);
+    out.limited.push({ relPath, reason, state });
+  };
+
+  /** 展开一个压缩包条目；level=该条目所在容器层级（外层条目=1，可展开到 3）。 */
+  const expand = async (containerFile: string, parts: string[], size: number, level: number): Promise<void> => {
+    const rel = parts.join("::");
+    if (opened >= NESTED_MAX_ARCHIVES) return addLimited(rel, "嵌套容器数超过上限 " + NESTED_MAX_ARCHIVES, "limited");
+    if (Date.now() - started > NESTED_TIME_BUDGET_MS) return addLimited(rel, "嵌套发现超过时间预算 " + NESTED_TIME_BUDGET_MS + "ms", "limited");
+    if (bytes + size > NESTED_MAX_BYTES) return addLimited(rel, "累计解压超过 " + Math.round(NESTED_MAX_BYTES / 1024 / 1024) + "MB 上限", "limited");
+    opened++;
     let dir: string | null = null;
     try {
-      const buf = await readArchiveEntry(String(asset.path), entry.entryPath, NESTED_MAX_BYTES);
+      const cap = Math.max(1, NESTED_MAX_BYTES - bytes);
+      const buf = await readArchiveEntry(containerFile, parts[parts.length - 1], cap);
+      bytes += buf.length;
       dir = mkdtempSync(join(tmpdir(), "av-nested-"));
-      const tmp = join(dir, "inner" + (ARCHIVE_EXT_RE.exec(entry.entryPath)?.[0] ?? ".zip"));
+      const tmp = join(dir, "inner" + (ARCHIVE_EXT_RE.exec(parts[parts.length - 1])?.[0] ?? ".zip"));
       writeFileSync(tmp, buf);
       const listing = await listArchive(tmp, { maxEntries: NESTED_MAX_ENTRIES });
       for (const e of listing.entries) {
         if (e.isDir) continue;
+        const childParts = [...parts, e.path];
+        const childRel = childParts.join("::");
         if (/\.unitypackage$/i.test(e.path)) {
-          const rel = entry.entryPath + "::" + e.path;
-          if (!seen.has(rel)) { seen.add(rel); out.packages.push({ entryPath: entry.entryPath, innerEntryPath: e.path, size: Number(e.size) || 0 }); }
+          if (!seenPkg.has(childRel)) { seenPkg.add(childRel); out.packages.push({ relPath: childRel, size: Number(e.size) || 0 }); }
           continue;
         }
         if (ARCHIVE_EXT_RE.test(e.path)) {
-          const rel = entry.entryPath + "::" + e.path;
-          if (!seen.has(rel)) { seen.add(rel); out.limited.push({ relPath: rel, reason: "嵌套深度超过 " + NESTED_MAX_DEPTH + " 层，未展开", state: "limited" }); }
+          if (level < NESTED_MAX_DEPTH) await expand(tmp, childParts, Number(e.size) || 0, level + 1);
+          else addLimited(childRel, "嵌套深度超过 " + NESTED_MAX_DEPTH + " 层，未展开", "limited");
         }
       }
-      if (listing.truncated) out.limited.push({ relPath: entry.entryPath, reason: "内层条目数超过上限 " + NESTED_MAX_ENTRIES, state: "limited" });
+      if (listing.truncated) addLimited(rel, "内层条目数超过上限 " + NESTED_MAX_ENTRIES, "limited");
     } catch (e) {
-      out.limited.push({ relPath: entry.entryPath, reason: "无法读取内层容器：" + ((e as Error)?.message ?? String(e)).slice(0, 200), state: "failed" });
+      addLimited(rel, "无法读取内层容器：" + ((e as Error)?.message ?? String(e)).slice(0, 200), "failed");
     } finally {
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } }
     }
-  }
+  };
+
+  for (const entry of outerArchives) await expand(String(asset.path), [entry.entryPath], Number(entry.size) || 0, 1);
   return out;
 }
 
-/** task-44：按需解析 unitypackage 内容的预算（每个条目 ≤12 包 / 256MB / 20s / 1 万条资产）。 */
-const MAX_PACKAGE_PARSES = 12;
-const MAX_PACKAGE_BYTES = 256 * 1024 * 1024;
-const PACKAGE_PARSE_BUDGET_MS = 20_000;
+/** task-45：按需解析 unitypackage 内容的预算（每项 ≤64 包 / 累计 512MB / 45s / 1 万条资产）。 */
+const MAX_PACKAGE_PARSES = 64;
+const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
+const PACKAGE_PARSE_BUDGET_MS = 45_000;
 const MAX_PACKAGE_ASSETS = 10_000;
 
 interface PackageBudget { packages: number; bytes: number; started: number }
 type PackagePathsResult = { ok: true; paths: string[] } | { ok: false; state: "limited" | "failed"; error: string };
 interface AnalyzeCtx { cache: Map<string, PackagePathsResult>; budget: PackageBudget }
+
+/**
+ * 把压缩包条目按 'outer::inner::...' 递归解出最终 .unitypackage 文件（返回磁盘路径）。
+ * 调用方负责删除 dir（解析场景）；执行场景保留到 Unity 读完后由 staging 目录清理。
+ */
+async function extractNestedToFile(sourcePath: string, parts: string[], dir: string): Promise<string> {
+  let current = sourcePath;
+  for (let i = 0; i < parts.length; i++) {
+    const buf = await readArchiveEntry(current, parts[i], MAX_PACKAGE_BYTES);
+    const last = i === parts.length - 1;
+    const out = join(dir, last ? "pkg.unitypackage" : "lvl" + i + (ARCHIVE_EXT_RE.exec(parts[i])?.[0] ?? ".zip"));
+    writeFileSync(out, buf);
+    current = out;
+  }
+  return current;
+}
+
+/** 执行端 staging：direct 直接用原文件；压缩包条目（含 depth3 outer::inner::pkg）递归解到 staging 目录。 */
+export async function stageUnitPackage(asset: any, relPath: string, stagingDir: string, key: string): Promise<string> {
+  const direct = String(asset.kind) === "unitypackage" || String(asset.container) === "unitypackage";
+  if (direct) return String(asset.path);
+  mkdirSync(stagingDir, { recursive: true });
+  const dir = mkdtempSync(join(stagingDir, "unit-" + String(key).replace(/[^\w.-]+/g, "_") + "-"));
+  return extractNestedToFile(String(asset.path), String(relPath).split("::").filter(Boolean), dir);
+}
 
 /**
  * 读出一个单元的 unitypackage 内 asset_path 列表（含 outer::inner 嵌套）。
@@ -149,28 +189,10 @@ async function readPackageAssetPaths(asset: any, relPath: string, ctx: AnalyzeCt
   let bytes = 0;
   try {
     if (!direct) {
-      const parts = relPath.split("::");
+      const parts = relPath.split("::").filter(Boolean);
       dir = mkdtempSync(join(tmpdir(), "av-upkg-"));
-      if (parts.length === 2 && parts[0] && parts[1]) {
-        const outerBuf = await readArchiveEntry(String(asset.path), parts[0], MAX_PACKAGE_BYTES);
-        bytes += outerBuf.length;
-        if (bytes > MAX_PACKAGE_BYTES) return fail("limited", "内层包超过 " + Math.round(MAX_PACKAGE_BYTES / 1024 / 1024) + "MB");
-        const zpath = join(dir, "inner" + (ARCHIVE_EXT_RE.exec(parts[0])?.[0] ?? ".zip"));
-        writeFileSync(zpath, outerBuf);
-        const buf = await readArchiveEntry(zpath, parts[1], MAX_PACKAGE_BYTES - bytes);
-        bytes += buf.length;
-        if (bytes > MAX_PACKAGE_BYTES) return fail("limited", "内层包超过 " + Math.round(MAX_PACKAGE_BYTES / 1024 / 1024) + "MB");
-        target = join(dir, "pkg.unitypackage");
-        writeFileSync(target, buf);
-      } else if (parts.length === 1 && parts[0]) {
-        const buf = await readArchiveEntry(String(asset.path), parts[0], MAX_PACKAGE_BYTES - bytes);
-        bytes += buf.length;
-        if (bytes > MAX_PACKAGE_BYTES) return fail("limited", "内层包超过 " + Math.round(MAX_PACKAGE_BYTES / 1024 / 1024) + "MB");
-        target = join(dir, "pkg.unitypackage");
-        writeFileSync(target, buf);
-      } else {
-        return fail("limited", "嵌套路径过深，无法按需解析: " + relPath);
-      }
+      if (parts.length === 0) return fail("limited", "空嵌套路径，无法按需解析");
+      target = await extractNestedToFile(String(asset.path), parts, dir);
     }
     const listing = await listUnityPackage(target, { maxAssets: MAX_PACKAGE_ASSETS, maxTotalBytes: MAX_PACKAGE_BYTES - bytes });
     const paths = (listing.assets ?? []).map((a) => String(a.assetPath)).filter(Boolean);
@@ -217,10 +239,12 @@ async function unitsOfAsset(repo: Repo, asset: any, avatars: AvatarLite[], itemA
       paths = parsed.paths;
     }
     const ev = detectUnitAvatars([name, ...paths], avatars, itemAvatarIds);
-    const d = decidePolicy({ container: container || "unitypackage", kind: "unitypackage", innerUnitypackagePaths: [name], mixedAvatarCount: evidenceCount(ev), parseState });
+    // 包级解析成功即视为 ok（外层资产 index_state=partial 只说明外层没扫完，不代表这个 upkg 不可判定）
+    const unitParseState = paths.length > 0 ? "ok" : parseState;
+    const d = decidePolicy({ container: container || "unitypackage", kind: "unitypackage", innerUnitypackagePaths: [name], mixedAvatarCount: evidenceCount(ev), parseState: unitParseState });
     return [{
       relPath: name, format: "unitypackage", kind: "unitypackage", name, size: Number(asset.size) || 0, fingerprint: fp,
-      policy: d.policy, importable: IMPORTABLE_POLICIES.has(d.policy), parseState, parseError,
+      policy: d.policy, importable: IMPORTABLE_POLICIES.has(d.policy), parseState: unitParseState, parseError,
       avatars: ev, evidence: { reason: d.reason, contentParsed: true, packagePaths: paths.length },
     }];
   }
@@ -241,7 +265,7 @@ async function unitsOfAsset(repo: Repo, asset: any, avatars: AvatarLite[], itemA
     }));
     const pkgRows = [
       ...entries.map((e) => ({ relPath: e.entryPath, size: Number(e.size) || 0 })),
-      ...nested.packages.map((p) => ({ relPath: p.entryPath + "::" + p.innerEntryPath, size: p.size })),
+      ...nested.packages.map((p) => ({ relPath: p.relPath, size: p.size })),
     ];
     if (pkgRows.length === 0) {
       const d = decidePolicy({ container, kind: "archive", innerUnitypackagePaths: [], mixedAvatarCount: 0, parseState });
@@ -257,13 +281,14 @@ async function unitsOfAsset(repo: Repo, asset: any, avatars: AvatarLite[], itemA
       const parsed = await readPackageAssetPaths(asset, e.relPath, ctx);
       if (!parsed.ok) { units.push(parseFailUnit(e.relPath, baseName(e.relPath), e.size, fingerprintOf(asset, e.size), parsed)); continue; }
       const ev = detectUnitAvatars([e.relPath, name, ...parsed.paths], avatars, itemAvatarIds);
+      const unitParseState = parsed.paths.length > 0 ? "ok" : parseState;
       const d = pkgRows.length > 1
-        ? decidePolicy({ container, kind: "unitypackage", innerUnitypackagePaths: [e.relPath], mixedAvatarCount: evidenceCount(ev), parseState })
-        : decidePolicy({ container, kind: "archive", innerUnitypackagePaths: [e.relPath], mixedAvatarCount: evidenceCount(ev), parseState });
+        ? decidePolicy({ container, kind: "unitypackage", innerUnitypackagePaths: [e.relPath], mixedAvatarCount: evidenceCount(ev), parseState: unitParseState })
+        : decidePolicy({ container, kind: "archive", innerUnitypackagePaths: [e.relPath], mixedAvatarCount: evidenceCount(ev), parseState: unitParseState });
       units.push({
         relPath: e.relPath, format: "unitypackage", kind: "unitypackage", name: baseName(e.relPath), size: e.size,
         fingerprint: fingerprintOf(asset, e.size), policy: d.policy, importable: IMPORTABLE_POLICIES.has(d.policy),
-        parseState, parseError, avatars: ev,
+        parseState: unitParseState, parseError, avatars: ev,
         evidence: { reason: d.reason, nested: e.relPath.includes("::"), contentParsed: true, packagePaths: parsed.paths.length },
       });
     }
@@ -474,27 +499,6 @@ export interface ExecuteDeps {
   waitMs?: number;
 }
 
-/** 用单元记录重建 Unity 候选：mixed 永远是整个原始包（entryPath 只定位原始包内条目）。 */
-function candidateOfUnit(repo: Repo, planItem: any): UnityPackageCandidate {
-  const asset = repo.getAsset(Number(planItem.asset_id));
-  if (!asset) throw appErr("NOT_FOUND", "资产不存在: " + planItem.asset_id, 404);
-  const direct = String(asset.kind) === "unitypackage" || String(asset.container) === "unitypackage";
-  const rel = String(planItem.rel_path ?? "");
-  let entryPath: string | null = null; let innerEntryPath: string | null = null;
-  if (!direct && rel) {
-    const parts = rel.split("::");
-    entryPath = parts[0] || null;
-    innerEntryPath = parts[1] || null;
-  }
-  return {
-    key: "unit:" + planItem.unit_id,
-    label: baseName(rel || String(asset.path)),
-    assetId: Number(asset.id), container: String(asset.container ?? ""),
-    sourcePath: String(asset.path), entryPath, innerEntryPath,
-    size: Number(asset.size) || 0,
-  };
-}
-
 /** 抽样 GUID 验证：工程 Assets 下的 .meta 文本里是否出现期望 guid。 */
 function verifyGuids(projectPath: string, expected: string[], sampleLimit = 20, fileLimit = 8000): string[] {
   if (!expected.length) return [];
@@ -582,23 +586,25 @@ export async function executeImportPlan(deps: ExecuteDeps, planId: number): Prom
   for (const { it, ri } of runItems) {
     repo.updateImportRunItem(ri.id, { status: "importing", started_at: nowIso() });
     try {
-      const cand = candidateOfUnit(repo, it);
-      const staged = await stageUnityPackage(cand, deps.stagingDir);
+      const asset = repo.getAsset(Number(it.asset_id));
+      if (!asset) throw appErr("NOT_FOUND", "资产不存在: " + it.asset_id, 404);
+      // task-45：depth3 的 outer::inner::pkg 也递归解到 staging（原包内容，不生成筛选包）
+      const stagedPath = await stageUnitPackage(asset, String(it.rel_path ?? ""), deps.stagingDir, String(it.unit_id));
       await clearUnityConsole(unity);
-      const r = await importPackagesIntoUnity(unity, [staged.path]);
+      const r = await importPackagesIntoUnity(unity, [stagedPath]);
       if (r.failed.length > 0) {
         failed++;
-        repo.updateImportRunItem(ri.id, { status: "failed", finished_at: nowIso(), error: r.failed.join("; "), detail_json: JSON.stringify({ stagedPath: staged.path, raw: r.raw }) });
+        repo.updateImportRunItem(ri.id, { status: "failed", finished_at: nowIso(), error: r.failed.join("; "), detail_json: JSON.stringify({ stagedPath, raw: r.raw }) });
         continue;
       }
-      repo.updateImportRunItem(ri.id, { status: "import_command_completed", detail_json: JSON.stringify({ stagedPath: staged.path, queued: r.queued, raw: r.raw }) });
+      repo.updateImportRunItem(ri.id, { status: "import_command_completed", detail_json: JSON.stringify({ stagedPath, queued: r.queued, raw: r.raw }) });
       repo.updateImportRunItem(ri.id, { status: "verifying" });
       await sleep(deps.waitMs ?? 1500);
       const errs = await readUnityConsole(unity, ["error"], 20);
       consoleAll.push(...errs);
       const expected = repo.listUnitypackageGuids(Number(it.asset_id));
       const matched = verifyGuids(String(plan.project_path), expected, 20);
-      const detail = { stagedPath: staged.path, consoleErrors: errs, guidsExpected: expected.slice(0, 20).length, guidsMatched: matched, policy: it.policy, relPath: it.rel_path };
+      const detail = { stagedPath, consoleErrors: errs, guidsExpected: expected.slice(0, 20).length, guidsMatched: matched, policy: it.policy, relPath: it.rel_path };
       if (matched.length >= 1 && errs.length === 0) {
         verified++;
         repo.updateImportRunItem(ri.id, { status: "verified", finished_at: nowIso(), detail_json: JSON.stringify(detail) });

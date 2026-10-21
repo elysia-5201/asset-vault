@@ -129,21 +129,50 @@ describe("analyzeItemStructure", () => {
     assert.ok(view.items.every((i: any) => String(i.rel_path).includes("::")));
   });
 
-  test("嵌套深度 >2：不再展开，落 limited 单元且不伪造 importable", async () => {
-    const deep = join(dir, "deep.zip");
-    execFileSync(path7za, ["a", "-tzip", "-bd", deep, "C.unitypackage"], { cwd: makeZipDir({ "C.unitypackage": Buffer.alloc(4) }) });
-    const inner = join(dir, "inner2.zip");
-    execFileSync(path7za, ["a", "-tzip", "-bd", inner, "deep.zip"], { cwd: makeZipDir({ "deep.zip": readFileSync(deep) }) });
-    const outer = join(dir, "outer2.zip");
-    execFileSync(path7za, ["a", "-tzip", "-bd", outer, "inner2.zip"], { cwd: makeZipDir({ "inner2.zip": readFileSync(inner) }) });
+  test("task-45：depth3 的 upkg（outer::inner1::inner2::pkg）能发现并解析包内路径", async () => {
+    const deep = join(dir, "deep3.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", deep, "C.unitypackage"], { cwd: makeZipDir({ "C.unitypackage": readFileSync(join(FIX, "B_mixed.unitypackage")) }) });
+    const inner = join(dir, "inner3.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", inner, "deep3.zip"], { cwd: makeZipDir({ "deep3.zip": readFileSync(deep) }) });
+    const outer = join(dir, "outer3.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", outer, "inner3.zip"], { cwd: makeZipDir({ "inner3.zip": readFileSync(inner) }) });
     const a = archive(outer);
     t.db.prepare("UPDATE assets SET size=? WHERE id=?").run(statSync(outer).size, a);
-    t.db.prepare("INSERT INTO archive_entries(asset_id,entry_path,entry_size,is_dir,ext) VALUES (?,?,?,0,'.zip')").run(a, "inner2.zip", statSync(inner).size);
+    t.db.prepare("INSERT INTO archive_entries(asset_id,entry_path,entry_size,is_dir,ext) VALUES (?,?,?,0,'.zip')").run(a, "inner3.zip", statSync(inner).size);
+    t.db.prepare("UPDATE assets SET index_state='done' WHERE id=?").run(a);
+    addAvatar(t.db, "Manuka"); addAvatar(t.db, "Kikyo");
+    await analyzeItemStructure(repo, itemId);
+    const pkg = unitsOf().find((u) => u.importable === 1);
+    assert.ok(pkg, "depth3 的 upkg 必须被发现");
+    assert.equal(pkg.rel_path, "inner3.zip::deep3.zip::C.unitypackage");
+    assert.ok(pkg.rel_path.split("::").length >= 3);
+    assert.equal(pkg.policy, "mixed_unitypackage", "包内路径解析后按内容判 mixed");
+    const ev = JSON.parse(pkg.avatar_json);
+    assert.ok(ev.some((x: any) => x.level === "probable"));
+    // 计划仍指向原始外层整包
+    const view = createImportPlan(repo, { unitIds: [Number(pkg.id)], projectPath: join(dir, "UnityProject") });
+    assert.equal(view.items[0].path, outer);
+  });
+
+  test("task-45：depth4 停止展开，落 limited 且不伪造 importable", async () => {
+    const lvl5 = join(dir, "deeper2.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", lvl5, "C.unitypackage"], { cwd: makeZipDir({ "C.unitypackage": Buffer.alloc(4) }) });
+    const deepest = join(dir, "deeper.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", deepest, "deeper2.zip"], { cwd: makeZipDir({ "deeper2.zip": readFileSync(lvl5) }) });
+    const deep = join(dir, "deep4.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", deep, "deeper.zip"], { cwd: makeZipDir({ "deeper.zip": readFileSync(deepest) }) });
+    const inner = join(dir, "inner4.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", inner, "deep4.zip"], { cwd: makeZipDir({ "deep4.zip": readFileSync(deep) }) });
+    const outer = join(dir, "outer4.zip");
+    execFileSync(path7za, ["a", "-tzip", "-bd", outer, "inner4.zip"], { cwd: makeZipDir({ "inner4.zip": readFileSync(inner) }) });
+    const a = archive(outer);
+    t.db.prepare("UPDATE assets SET size=? WHERE id=?").run(statSync(outer).size, a);
+    t.db.prepare("INSERT INTO archive_entries(asset_id,entry_path,entry_size,is_dir,ext) VALUES (?,?,?,0,'.zip')").run(a, "inner4.zip", statSync(inner).size);
     t.db.prepare("UPDATE assets SET index_state='done' WHERE id=?").run(a);
     await analyzeItemStructure(repo, itemId);
     const units = unitsOf();
-    assert.equal(units.filter((u) => u.importable === 1).length, 0, "深度 3 的包不得成为可导入单元");
-    const limited = units.find((u) => u.rel_path === "inner2.zip::deep.zip");
+    assert.equal(units.filter((u) => u.importable === 1).length, 0, "depth4 的包不得成为可导入单元");
+    const limited = units.find((u) => String(u.rel_path).endsWith("deeper2.zip"));
     assert.ok(limited, "应留下 limited 证据");
     assert.equal(limited.parse_state, "limited");
     assert.equal(limited.policy, "unknown_structure");

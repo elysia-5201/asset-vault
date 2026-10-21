@@ -1,5 +1,5 @@
 {
-  "at": "2026-10-21T14:32:42.869Z",
+  "at": "2026-10-21T14:58:18.582Z",
   "banner": "PASS",
   "counts": {
     "PASS": 50
@@ -150,7 +150,7 @@
       "area": "E",
       "desc": "文件被改后 sha256 变化（指纹可检出）",
       "status": "PASS",
-      "detail": "be1a537555fd5ade -> f63b80ae1d9b996a"
+      "detail": "6a184bbc80c83525 -> 41ef18c7a124c057"
     },
     {
       "id": "E6-2",
@@ -283,7 +283,7 @@
       "area": "PLAN",
       "desc": "mixed plan_item.path === 原始整包路径",
       "status": "PASS",
-      "detail": "/tmp/av-structure-NSqnCH/e2e/B_mixed.unitypackage"
+      "detail": "/tmp/av-structure-CBzOeb/e2e/B_mixed.unitypackage"
     },
     {
       "id": "B-2c",
@@ -332,7 +332,7 @@
       "area": "PLAN",
       "desc": "执行前后源文件 sha256 不变",
       "status": "PASS",
-      "detail": "59aad1ed08ba2730 -> 59aad1ed08ba2730"
+      "detail": "133dbb262e45ce68 -> 133dbb262e45ce68"
     },
     {
       "id": "B-4c",
@@ -357,14 +357,14 @@
     }
   ],
   "hashes": {
-    "A_multi_container.zip": "c36d55bef1650a4852ed63140bfa12de2ddb97a09158ffc311c85b41abde938c",
-    "B_mixed.unitypackage": "be1a537555fd5ade050ff8d9e2ece7a21b1736cf2cea3e53c6c9dda19590e24f",
-    "C_container_mixed.zip": "ed42b296da06dc0ab7ea529d5c60e8284c241a887929c64295941db856a003f4",
-    "D_companion.zip": "410f54a12dfae31eebd16dde209a7ce607e1cdb772edb21eb8304b262e4a36c2",
+    "A_multi_container.zip": "fe9e79e4bbc74c5f67a5fa09ddc85a62ddf4c0c389a81b65d719cb28f9be30a8",
+    "B_mixed.unitypackage": "6a184bbc80c835255a4328cf1b5fa7c97c920e145acf564149d099235ad58c6c",
+    "C_container_mixed.zip": "a9c1f020838ff87077d5550413f7e27404ab63bdd72c6d70e5c294c491cdb5ab",
+    "D_companion.zip": "8b8eb98f8c57bb1066b885cd0f63d1258fe141fd1d98f7e9cae4e13a9ecc69ac",
     "E1_corrupt.zip": "faac88191b7a64cbb658816526fa8e1365e57df62be651c610dec25fe5987800",
-    "E2_truncated.unitypackage": "bbcd3bb88f0e3817504b6b7c04451e2af96b6a6917f83b7e44d48f9c4d2e02dc",
-    "E3_overlimit.zip": "64c992c925fc655698b69bb2b8a0900b50b886978d29c521d3dc0e9d4239b80c",
-    "E4_zipslip.zip": "f9d10a9821a651d704a61f350fd123fc20994f7577364f72f87410a88502a3ad",
-    "E5_nested3.zip": "2fcf1f9ea450994b5f461484973cca00b31e959a2c81cad39902f395740fd88d"
+    "E2_truncated.unitypackage": "930004d5a1955d068fe5b33a36c8b207d6de55405ca2fe93598404bf7f078444",
+    "E3_overlimit.zip": "086732e15c9f3e8e5d38e83cc203392f87ae300e32af6a16c4125fe90d4c122a",
+    "E4_zipslip.zip": "18cbb166e52dd38fd2c331edb339ee6be8d5f0d6277bf49cfbe1da60c0f09d43",
+    "E5_nested3.zip": "b2e0225e770f969ccea203919fb3da02dbf8f07100faf6cddfeaefc6474e7c49"
   }
 }
