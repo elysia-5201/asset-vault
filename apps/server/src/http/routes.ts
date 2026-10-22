@@ -12,7 +12,7 @@ import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
-import { createImportPlan, confirmImportPlan, getPlanView, precheckImportPlan, getRunView } from "../services/structure";
+import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlan, getRunView } from "../services/structure";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
@@ -1847,8 +1847,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const b = (req.body ?? {}) as any;
       const unitIds = Array.isArray(b.unitIds) ? b.unitIds.map((n: any) => toInt(n, 0)).filter((n: number) => n > 0) : [];
-      const view = createImportPlan(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
-      return reply.status(201).send(view);
+      const batch = createImportPlanBatch(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
+      // 单 item 保持原契约 {plan,items,precheck}；跨 item 返回 {plans:[...]}（失败组带 error，隔离）
+      return reply.status(201).send(batch.single ? batch.view : { plans: batch.plans });
     } catch (e) { return fail(reply, e); }
   });
 

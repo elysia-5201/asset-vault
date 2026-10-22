@@ -687,6 +687,8 @@ export interface ImportPrecheck {
 }
 export interface ImportPlan {
   id: number;
+  /** 计划所属条目（后端 import_plans.item_id）；跨条目建计划时后端按 item 拆成多个 PlanView。 */
+  itemId: number | null;
   state: string;
   avatarId: number | null;
   avatarName: string | null;

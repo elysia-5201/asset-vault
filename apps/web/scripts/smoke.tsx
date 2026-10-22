@@ -11,7 +11,7 @@ import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
 import { CategoryManager } from "../src/components/CategoryManager";
 import { PipelinePanel } from "../src/components/PipelinePanel";
-import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, SCAN_ALL_LABEL, UNIT_STATE_LABEL, UnitsEmptyState, fallbackAvatarOf, isRunBusy, pickAvatarId, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
+import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, PlansSection, SCAN_ALL_LABEL, UNIT_STATE_LABEL, UnitsEmptyState, fallbackAvatarOf, isRunBusy, pickAvatarId, plansToastText, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
 import { confirmImportPlan, executeImportPlan } from "../src/api";
 
 type Fail = string;
@@ -448,7 +448,7 @@ for (const needle of ["Avatar 素材工作台", "选择 Avatar", "生成导入�
 }
 
 const planFixture = {
-  id: 12, state: "planned", avatarId: 1, avatarName: "MANUKA", projectPath: "E:/unity/P", projectName: "P",
+  id: 12, itemId: 7, state: "planned", avatarId: 1, avatarName: "MANUKA", projectPath: "E:/unity/P", projectName: "P",
   precheck: { ok: false, status: "has_warnings", warnings: ["工程里已有同名目录"], errors: [{ code: "PATH_MISSING", message: "路径不存在" }] },
   units: [
     { unitId: "a", itemId: 7, assetId: 3, title: "MANUKA 裙装", packagePath: "/lib/dress.zip", policy: "mixed", mixed: true, suggested: false, state: "planned", error: null },
@@ -476,6 +476,21 @@ expect(typeof executeImportPlan === "function" && confirmImportPlan.length <= 1,
   "工作台：执行走独立 execute 端点（confirm 只做确认，不返回 run）");
 expect(!!PLAN_STATE_LABEL.executed && !!PLAN_STATE_LABEL.blocked && !!PLAN_STATE_LABEL.failed,
   "工作台：计划终态标签齐全（executed / blocked / failed）");
+
+// 跨条目建计划 → 后端返回 {plans:[...]}（每 item 一个 PlanView）：UI 必须逐个渲染/confirm/execute
+expect(plansToastText(3) === "已生成 3 个计划（按条目分组）", "工作台多计划：toast 文案「已生成 N 个计划（按条目分组）」");
+expect(plansToastText(2, 1).includes("其中 1 个预检有警告"), "工作台多计划：toast 追加预检警告数");
+const planB = { ...planFixture, id: 13, itemId: 8, units: [{ ...planFixture.units[0], unitId: "c", itemId: 8, title: "第二条目的包", mixed: false, policy: "single_unitypackage" }] } as any;
+const plansHtml = render("PlansSection", createElement(PlansSection, {
+  plans: [planFixture, planB] as any,
+  checksFor: (p: any) => ({ [p.units[0].unitId]: true }),
+  onToggle: () => {}, onConfirm: () => {}, busy: false, ackedJobs: {},
+} as any));
+const planCards = (plansHtml.match(/导入计划 #/g) ?? []).length;
+expect(planCards === 2, "工作台多计划：两个 PlanView 各渲染一个 PlanPanel（实际 " + planCards + "）");
+expect(stripSsr(plansHtml).includes("按条目分成 2 个，各自 confirm → execute"), "工作台多计划：分组说明可见");
+expect(stripSsr(plansHtml).includes("条目 #7") && stripSsr(plansHtml).includes("条目 #8"), "工作台多计划：每个计划标注所属条目");
+expect((plansHtml.match(/type="checkbox"/g) ?? []).length === 3, "工作台多计划：两个计划的复选框都渲染（2 + 1）");
 
 // ---- ② SSR 冒烟 ----
 let html = "";

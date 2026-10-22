@@ -1197,6 +1197,7 @@ function planOf(raw: unknown): ImportPlan {
   const precheckSrc = outer.precheck ?? p.precheck ?? p.precheck_json;
   return {
     id: numOr(p.id ?? p.planId, 0),
+    itemId: numField(p, "itemId", "item_id"),
     state: String(p.state ?? p.status ?? ""),
     avatarId: numField(p, "avatarId", "avatar_id"),
     avatarName: strField(p, "avatarName", "avatar_name"),

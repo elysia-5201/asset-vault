@@ -218,6 +218,7 @@ export function PlanPanel(props: {
     <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
       <div className="row" style={{ gap: "6px" }}>
         <b>导入计划 #{plan.id}</b>
+        {plan.itemId !== null && plan.itemId !== undefined ? <span className="hint mono">条目 #{plan.itemId}</span> : null}
         {plan.state ? <Badge tone={PLAN_STATE_TONE[plan.state] ?? "muted"} title={plan.state}>{PLAN_STATE_LABEL[plan.state] ?? plan.state}</Badge> : null}
         <Badge tone={plan.precheck.ok ? "ok" : "warn"}>{plan.precheck.ok ? "预检通过" : "预检有警告"}</Badge>
         {props.jobId !== null && props.jobId !== undefined ? <span className="hint mono">job #{props.jobId}</span> : null}
@@ -259,6 +260,47 @@ export function PlanPanel(props: {
         {suggestedCount > 0 && <span className="hint">「建议」项默认不勾选，需你确认后才加入</span>}
       </div>
     </div>
+  );
+}
+
+/** 生成计划后的 toast 文案（按条目分组时点明个数；smoke 断言用）。 */
+export function plansToastText(count: number, warnCount = 0): string {
+  const base = "已生成 " + count + " 个计划（按条目分组）";
+  return warnCount > 0 ? base + "，其中 " + warnCount + " 个预检有警告" : base;
+}
+
+/**
+ * 计划列表：**每个计划一个 PlanPanel**，各自勾选 / confirm / execute / 轮询。
+ * 跨条目建计划时后端返回 {plans:[...]}（每 item 一个），这里逐条渲染并标注所属条目。
+ */
+export function PlansSection(props: {
+  plans: ImportPlan[];
+  checksFor: (p: ImportPlan) => Record<string, boolean>;
+  onToggle: (planId: number, unitId: string) => void;
+  onConfirm: () => void;
+  busy: boolean;
+  ackedJobs: Record<number, number>;
+}) {
+  if (!props.plans.length) return null;
+  return (
+    <>
+      <div className="hint">
+        {props.plans.length > 1
+          ? "④ 计划：按条目分成 " + props.plans.length + " 个，各自 confirm → execute，互不影响"
+          : "④ 计划（suggested 需勾选才入计划）"}
+      </div>
+      {props.plans.map((p) => (
+        <PlanPanel
+          key={p.id}
+          plan={p}
+          checks={props.checksFor(p)}
+          onToggle={(uid) => props.onToggle(p.id, uid)}
+          onConfirm={props.onConfirm}
+          busy={props.busy}
+          jobId={props.ackedJobs[p.id] ?? p.jobId}
+        />
+      ))}
+    </>
   );
 }
 
@@ -489,8 +531,8 @@ export function AvatarWorkbench(props: {
         const next: Record<string, boolean> = {};
         for (const p of list) for (const u of p.units) next[p.id + ":" + u.unitId] = !(u.suggested || u.state === "suggested");
         setChecks(next);
-        props.onToast("ok", "已生成 " + list.length + " 个导入计划" +
-          (list.every((p) => p.precheck.ok) ? "（预检通过）" : "（预检有警告）"));
+        const warned = list.filter((p) => !p.precheck.ok).length;
+        props.onToast("ok", plansToastText(list.length, warned));
       })
       .catch((e) => { setPlans([]); setPlanErr(describeError(e)); props.onToast("bad", "生成计划失败：" + describeError(e)); })
       .finally(() => setPlanBusy(false));
@@ -503,9 +545,11 @@ export function AvatarWorkbench(props: {
       .filter((t) => t.unitIds.length > 0);
     if (!targets.length) { props.onToast("bad", "至少要勾选一个单元"); return; }
     setPlanBusy(true);
-    try {
-      const jobs: number[] = [];
-      for (const t of targets) {
+    const jobs: number[] = [];
+    const failures: string[] = [];
+    // 每个计划**独立** confirm → execute：一个失败不影响其它计划（跨条目建计划时会有多个 PlanView）
+    for (const t of targets) {
+      try {
         // ① confirm：只做人工确认（suggested → pending、user_confirmed=1），**不执行**
         const confirmed = await confirmImportPlan(t.plan.id);
         setPlans((list) => list.map((x) => (x.id === confirmed.plan.id ? confirmed.plan : x)));
@@ -525,14 +569,17 @@ export function AvatarWorkbench(props: {
             if (np.runId !== null) refreshRun(np.runId);
           })
           .catch(() => { /* 轮询里会再试 */ });
+      } catch (e) {
+        failures.push("计划 #" + t.plan.id + "：" + describeError(e));
       }
-      props.onToast("ok", jobs.length
-        ? "已提交执行（job " + jobs.map((n) => "#" + n).join(", ") + "），正在轮询计划/执行状态"
-        : "已确认并提交 " + targets.length + " 个计划，正在轮询执行状态");
-    } catch (e) {
-      props.onToast("bad", "提交执行失败：" + describeError(e));
-    } finally {
-      setPlanBusy(false);
+    }
+    setPlanBusy(false);
+    if (failures.length) {
+      props.onToast("bad", failures.length + " / " + targets.length + " 个计划提交失败：" + failures.slice(0, 2).join("；"));
+    } else if (jobs.length) {
+      props.onToast("ok", "已提交执行（job " + jobs.map((n) => "#" + n).join(", ") + "），正在轮询计划/执行状态");
+    } else {
+      props.onToast("ok", "已确认并提交 " + targets.length + " 个计划，正在轮询执行状态");
     }
   };
 
@@ -691,22 +738,14 @@ export function AvatarWorkbench(props: {
               {planErr && <div className="err">{planErr}</div>}
             </div>
 
-            {plans.length > 0 && (
-              <>
-                <div className="hint">④ 计划（suggested 需勾选才入计划）</div>
-                {plans.map((p) => (
-                  <PlanPanel
-                    key={p.id}
-                    plan={p}
-                    checks={checksOf(p)}
-                    onToggle={(uid) => toggleCheck(p.id, uid)}
-                    onConfirm={() => void doConfirm()}
-                    busy={planBusy}
-                    jobId={ackedJobs[p.id] ?? p.jobId}
-                  />
-                ))}
-              </>
-            )}
+            <PlansSection
+              plans={plans}
+              checksFor={checksOf}
+              onToggle={toggleCheck}
+              onConfirm={() => void doConfirm()}
+              busy={planBusy}
+              ackedJobs={ackedJobs}
+            />
 
             {(runs.length > 0 || runErr) && (
               <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>

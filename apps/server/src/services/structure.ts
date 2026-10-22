@@ -458,6 +458,44 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
   return getPlanView(repo, plan.id)!;
 }
 
+/**
+ * task-49：跨 item 选择 → 按 item 分组各建一个计划；单 item 保持原 PlanView 形状。
+ * 组内失败隔离：某组建计划失败只返回该组 error，不影响其它组。
+ */
+export function createImportPlanBatch(
+  repo: Repo,
+  input: { unitIds: number[]; projectPath: string; includeSuggested?: boolean },
+): { single: true; view: PlanView } | { single: false; plans: any[] } {
+  const ids = [...new Set((input.unitIds ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+  if (ids.length === 0) throw appErr("INVALID_INPUT", "unitIds 不能为空", 400);
+  const units = repo.getUnitsByIds(ids);
+  if (units.length === 0) throw appErr("INVALID_INPUT", "unitIds 全部不存在", 400);
+  const byItem = new Map<number, number[]>();
+  for (const u of units) {
+    const itemId = Number(u.item_id);
+    if (!Number.isFinite(itemId) || itemId <= 0) continue;
+    const arr = byItem.get(itemId) ?? [];
+    arr.push(Number(u.id));
+    byItem.set(itemId, arr);
+  }
+  const known = new Set(units.map((u) => Number(u.id)));
+  const unknown = ids.filter((id) => !known.has(id));
+  if (byItem.size <= 1 && unknown.length === 0) {
+    return { single: true, view: createImportPlan(repo, { ...input, unitIds: ids }) };
+  }
+  const plans: any[] = [];
+  for (const [itemId, groupIds] of byItem) {
+    try {
+      const view = createImportPlan(repo, { ...input, unitIds: groupIds });
+      plans.push({ itemId, ...view });
+    } catch (e) {
+      plans.push({ itemId, error: { code: String((e as any)?.code ?? "ERROR"), message: String((e as any)?.message ?? e) } });
+    }
+  }
+  if (unknown.length) plans.push({ itemId: null, error: { code: "INVALID_INPUT", message: "存在不存在的 unitId: " + unknown.join(",") } });
+  return { single: false, plans };
+}
+
 export function getPlanView(repo: Repo, planId: number): PlanView | null {
   const plan = repo.getImportPlan(planId);
   if (!plan) return null;
