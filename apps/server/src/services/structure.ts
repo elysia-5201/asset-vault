@@ -860,6 +860,43 @@ export function sweepStaging(repo: Repo, stagingDir: string, opts: { olderThanDa
   return res;
 }
 
+/**
+ * task-57：启动收养历史 staging 文件（生产可能已有未登记文件）。
+ * 递归扫描 stagingDir：只认普通文件（拒符号链接/目录），跳过已登记 path_norm；登记 state='stale'，
+ * last_used_at 用文件 mtime（过期判断基于历史时间）；返回收养数量。
+ */
+export function adoptLegacyStaging(repo: Repo, stagingDir: string, opts: { maxFiles?: number; maxDepth?: number } = {}): { adopted: number; skipped: number; errors: string[] } {
+  const maxFiles = Math.max(1, Number(opts.maxFiles ?? 5000));
+  const maxDepth = Math.max(1, Number(opts.maxDepth ?? 8));
+  const res = { adopted: 0, skipped: 0, errors: [] as string[] };
+  if (!existsSync(stagingDir)) return res;
+  const walk = (dir: string, depth: number): void => {
+    if (depth > maxDepth || res.adopted >= maxFiles) return;
+    let entries: import("node:fs").Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { res.errors.push("无法读取目录 " + dir); res.skipped++; return; }
+    for (const e of entries) {
+      if (res.adopted >= maxFiles) return;
+      const full = join(dir, e.name);
+      if (e.isSymbolicLink()) { res.skipped++; res.errors.push("符号链接，拒绝收养: " + full); continue; }
+      if (e.isDirectory()) { walk(full, depth + 1); continue; }
+      if (!e.isFile()) { res.skipped++; continue; }
+      let st: import("node:fs").Stats;
+      try { st = lstatSync(full); } catch { res.skipped++; continue; }
+      if (!st.isFile()) { res.skipped++; continue; }
+      if (!underDir(stagingDir, full)) { res.skipped++; res.errors.push("越界路径，拒绝收养: " + full); continue; }
+      const existing = repo.getStagingFileByPath(full);
+      if (existing) { res.skipped++; continue; }
+      try {
+        const row = repo.registerStagingFile({ path: full, size: Number(st.size) || 0, state: "stale" });
+        repo.updateStagingFile(row.id, { last_used_at: new Date(st.mtimeMs).toISOString() });
+        res.adopted++;
+      } catch (e) { res.skipped++; res.errors.push("登记失败 " + full + ": " + String((e as Error)?.message ?? e)); }
+    }
+  };
+  walk(stagingDir, 0);
+  return res;
+}
+
 export function sweepStagingOnStartup(repo: Repo, stagingDir: string): StagingSweepResult {
   return sweepStaging(repo, stagingDir, { olderThanDays: 7, dryRun: false });
 }

@@ -16,7 +16,7 @@ import { DerivedCache } from "./services/pipeline/cache";
 import { IndexPipeline } from "./services/pipeline/pipeline";
 import { resolveLimits, limitsHash } from "./services/pipeline/limits";
 import { acquirePipelineLock, type PipelineLock } from "./services/pipeline/lock";
-import { sweepStagingOnStartup } from "./services/structure";
+import { adoptLegacyStaging, sweepStagingOnStartup } from "./services/structure";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -97,8 +97,12 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   const sweptPreviews = repo.expireScanPreviews();
   if (sweptPreviews) log("scan previews swept: " + sweptPreviews + " row(s) -> expired/failed");
   // task-51：启动清理 >7 天且非活跃的 Unity staging（路径必须在本实例 unity-staging 内、拒符号链接）
-  const sweptStaging = sweepStagingOnStartup(repo, join(dataDir, "unity-staging"));
+  const stagingDir = join(dataDir, "unity-staging");
+  const sweptStaging = sweepStagingOnStartup(repo, stagingDir);
   if (sweptStaging.candidates || sweptStaging.failed) log("unity staging swept: removed=" + sweptStaging.removed + " failed=" + sweptStaging.failed + " skipped=" + sweptStaging.skipped);
+  // task-57：收养历史未登记 staging（stale）；放在 sweep 之后，避免刚收养就被启动 sweep 删掉
+  const adoptedStaging = adoptLegacyStaging(repo, stagingDir);
+  if (adoptedStaging.adopted || adoptedStaging.skipped) log("unity staging adopted legacy: adopted=" + adoptedStaging.adopted + " skipped=" + adoptedStaging.skipped + (adoptedStaging.errors.length ? " errors=" + adoptedStaging.errors.slice(0, 3).join("; ") : ""));
   const recovered = lock.acquired ? repo.recoverInFlight() : 0;
 
   let app: FastifyInstance | null = null;
