@@ -2394,9 +2394,9 @@ export class Repo {
     return this.getStagingFile(id);
   }
   deleteStagingFile(id: number): boolean { return this.stmt("DELETE FROM staging_files WHERE id=?").run(id).changes > 0; }
-  /** 启动 sweep：超过 cutoff 且非 in_use（或 in_use 但已过期）的登记行；活跃判断由调用方用 job/run 再做。 */
+  /** 启动/清理 sweep：stale（收养的历史文件）或上次清理未完成，且超过 cutoff；活跃 run 由调用方再排除。 */
   listStaleStagingFiles(cutoffIso: string, limit = 500): any[] {
-    return this.stmt("SELECT * FROM staging_files WHERE state IN ('in_use','cleanup_pending','cleanup_failed') AND last_used_at < ? ORDER BY last_used_at ASC LIMIT ?")
+    return this.stmt("SELECT * FROM staging_files WHERE state IN ('stale','cleanup_pending','cleanup_failed') AND last_used_at < ? ORDER BY last_used_at ASC LIMIT ?")
       .all(cutoffIso, Math.min(2000, Math.max(1, limit))) as any[];
   }
 
