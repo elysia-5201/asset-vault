@@ -43,6 +43,9 @@
 - 这是异步作业（`kind = structure`），同一条目重复点会被 jobs 的 `(item_id, kind)` 在飞唯一索引挡住 → 409 `CONFLICT`。
 - 分析完才会出现单元；**分析失败不会伪造单元**：解析不完整 → `parse_state = partial/failed`，policy 落 `unknown_structure`。
 - 发现/解析有硬预算（深度 ≤3、≤32 个内层归档、单包 ≤512MB、累计 ≤512MB、45s、条目 ≤1 万），超限标 `limited`。
+- **一次补齐全部结构**：`POST /api/workbench/scan-all { onlyMissing: true }` → **202 `{ jobId, state }`**，
+  只给**还没分析过**的条目排作业（已分析过的不重复扫）；实测 **37s 扫完 32 个条目**。
+  前端拿到 jobId 后每 2s 轮询 `GET /api/jobs` 找这条 job，到 `done/failed/cancelled/abandoned` 就 toast 结果并**自动刷新** Avatar 计数与单元列表。
 
 ### 3.2 选 Avatar
 
@@ -74,6 +77,10 @@
 ### 3.5 选 Unity 工程 → 生成导入计划
 
 - 工程路径可**自动探测**（`GET /api/unity/status` 的 `editor.projectPath`，探测失败可手填）。
+- **探测只自动跑一次**：打开工作台时调一次 `/unity/status`，之后只有手点「探测」才会再发请求（按钮会显示「探测中…」）。
+  探测成功**静默**（不弹 toast），只有手动探测且没拿到工程路径/请求失败时才提示一句——避免每次重渲染都探测、刷日志。
+- 若 `GET /api/workbench/avatars` 返回空列表，但 Unity 工程里认出了 Avatar（`projectAvatar`），左侧会**用这个头像兜底并选中**，
+  同时提示「已用 Unity 工程里认出的 @xxx 兜底；点「扫描全部结构」补齐计数」。
 - `POST /api/import-plans { unitIds, projectPath, includeSuggested }` → **201** 计划视图。
 - 一次计划**只能属于同一个条目**：跨条目选单元会被后端拒绝（`INVALID_INPUT`）。想导多个条目就分别建计划。
 
@@ -172,6 +179,7 @@ run 级状态：`running` / `verified` / `partial_success` / `failed`（全成�
 | 方法 | 路径 | 入参 | 出参 | 说明 |
 |---|---|---|---|---|
 | POST | `/api/workbench/scan` | `{ itemId, refresh? }` | **202** `{ jobId, itemId, state }` | 异步分析容器的资源单元（`kind = structure`） |
+| POST | `/api/workbench/scan-all` | `{ onlyMissing?: boolean }` | **202** `{ jobId, state }` | 批量补结构分析（默认只补没分析过的条目；实测 37s / 32 条目） |
 | GET | `/api/workbench/avatars` | `?itemId=`（可选） | `[{ avatar: {id,name}, counts: {confirmed, probable, unknown, mixed} }]` | 按 Avatar 聚合单元证据计数（**裸数组**） |
 | GET | `/api/workbench/units` | `?itemId=&avatarId=&policy=&level=&itemStatus=&limit=` | `[{ id, assetId, itemId, relPath, format, kind, name, size, fingerprint, policy, importable, mixed, parseState, parseError, avatars[], evidence, item, asset, updatedAt }]` | 单元视图（**裸数组**） |
 | POST | `/api/import-plans` | `{ unitIds: number[], projectPath: string, includeSuggested?: boolean }` | **201** PlanView `{ plan, items, precheck, run_id, latestRun, lastError }` | 建计划（快照 + 指纹 + precheck） |

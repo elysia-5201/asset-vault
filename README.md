@@ -2,10 +2,10 @@
 # AssetVault · 资源库
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](#-快速开始)
+[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](#-快速开始)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-717%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
+[![Tests](https://img.shields.io/badge/tests-721%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -116,7 +116,7 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（739 用例：717 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+node scripts/test.mjs            # 全仓单测（743 用例：721 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
 node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v8）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
@@ -262,6 +262,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 - **Avatar 素材工作台（v0.7.0）**：`GET /api/workbench/avatars`（按 Avatar 聚合证据计数：confirmed / probable / unknown / mixed）与 `GET /api/workbench/units`（单元视图：证据、policy、来源条目与资产）；工具栏「素材工作台」面板串起 选择 → 筛选 → 清单 → 计划 → 执行。
 - **导入计划与执行（v0.7.0）**：`POST /api/import-plans`（按 unitIds 建计划，快照路径 + 指纹 + precheck）→ `confirm`（suggested → pending，人工确认）→ `execute`（**202 {jobId, planId}**，Job 化）→ 轮询 `GET /api/import-plans/:id` 与 `GET /api/import-runs/:id`。每单元独立状态，互不覆盖；指纹变化 → plan `blocked` / execute 拒绝，绝不按旧快照导入；Unity 返回只算 `import_command_completed`，`verified` / `partial_success` 是另外的 GUID + 控制台校验结论；**执行前置失败（Unity 离线 / 工程不匹配 / 指纹变化）也会落一条 failed run + 计划视图 `lastError{code,message,phase}`**，不会只剩一个没有原因的 failed。
 - **混合包整包策略（v0.7.0）**：`mixed_unitypackage`（≥2 个不同模型证据，或显式 `mixedConfirmed`）**永远导入原始整包**，不生成筛选包、不拆包；ZIP 里多个 `.unitypackage` 算「多独立包容器」（逐包导入），不算混合包；解析不完整且判不了 → `unknown_structure`（不猜、不可导入）。
+- **扫描全部结构 / 探测降噪（v0.7.1）**：`POST /api/workbench/scan-all { onlyMissing: true }` 一次给**还没分析过**的条目补结构分析（**202 `{jobId, state}`**，实测 37s 扫完 32 个条目），完成后自动刷新 Avatar 计数与单元列表；Unity 工程探测改为**打开面板只自动一次**，之后只有手点「探测」才发请求，成功静默。
 
 完整设计、限制默认值、缓存键与回滚说明见 **`docs/pipeline-v06.md`**；工作台用户手册与整包策略见 **`docs/avatar-workbench.md`**。
 
@@ -281,7 +282,7 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 | 前端 | React 19 + Vite 8，手写 CSS（无 UI 框架） |
 | 桌面 | Electron 38 + electron-builder（便携 `--win dir`，`asar:false`） |
 | 归档 / 媒体 | node-stream-zip（zip 直读）· 7zip-bin（7z）· node-unrar-js（rar）· sharp（缩略图）· undici（BOOTH 抓取） |
-| 质检 | `node:test` 739 用例（717 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线 + 工作台/导入计划）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs`、`scripts/acceptance-structure.mjs` |
+| 质检 | `node:test` 743 用例（721 pass / 0 fail / 22 skip / 0 todo；分类 + 扫描变更中心 + 流水线 + 工作台/导入计划）+ `tsc --noEmit` + 验收脚本：AC1–AC12、`scripts/acceptance-categories.mjs`、`scripts/acceptance-scan-preview.mjs`、`scripts/acceptance-pipeline.mjs`、`scripts/acceptance-structure.mjs` |
 
 ### 打包与迁移踩坑（留档）
 
