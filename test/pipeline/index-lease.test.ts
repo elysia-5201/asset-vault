@@ -27,8 +27,8 @@ const task = (id: number) => repo.getIndexTask(id) as any;
 const enqueue = (assetId: number, jobId?: number | null) => repo.enqueueIndexTask({ assetId, stage: "hash", priority: 50, jobId });
 
 describe("v7 迁移", () => {
-  test("SCHEMA_VERSION=8；v6 老表补 owner/lease_token/job_id 且幂等；新索引可建", () => {
-    assert.equal(SCHEMA_VERSION, 8);
+  test("SCHEMA_VERSION=9；v6 老表补 owner/lease_token/job_id 且幂等；新索引可建", () => {
+    assert.equal(SCHEMA_VERSION, 9);
     const dir = mkdtempSync(join(tmpdir(), "av-v7-"));
     const db = new Database(join(dir, "v6.db"));
     try {

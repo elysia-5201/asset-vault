@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import {
-  addRoot, addWatch, describeError, getSettings, listRoots, listWatches, removeRoot, removeWatch, scan, updateSettings,
+  addRoot, addWatch, describeError, getSettings, listRoots, listWatches, removeRoot, removeWatch, scan,
+  stagingCleanup, stagingUsage, updateSettings,
 } from "../api";
-import type { LibraryRootRow, SettingsResponse, WatchEntry } from "../types";
-import { shortenPath } from "../util";
+import type { LibraryRootRow, SettingsResponse, StagingCleanupResult, StagingUsage, WatchEntry } from "../types";
+import { formatBytes, shortenPath } from "../util";
 import { Badge, Spinner } from "./ui";
 
 /**
@@ -25,6 +26,12 @@ export function SettingsPanel(props: {
   const [newRoot, setNewRoot] = useState("");
   const [newWatch, setNewWatch] = useState("");
   const [draft, setDraft] = useState({ downloadRoot: "", unityMcpUrl: "", updateRepo: "", updateToken: "" });
+  // staging（导入落地包缓存）用量与清理
+  const [staging, setStaging] = useState<StagingUsage | null>(null);
+  const [stagingErr, setStagingErr] = useState("");
+  const [olderDays, setOlderDays] = useState(7);
+  const [dryResult, setDryResult] = useState<StagingCleanupResult | null>(null);
+  const [cleanResult, setCleanResult] = useState<StagingCleanupResult | null>(null);
 
   const reload = () => Promise.all([listRoots(), listWatches(), getSettings()])
     .then(([r, w, s]) => {
@@ -34,6 +41,33 @@ export function SettingsPanel(props: {
     .catch((e) => setErr(describeError(e)));
 
   useEffect(() => { setLoading(true); void reload().finally(() => setLoading(false)); }, []);
+
+  const loadStaging = () => {
+    setStagingErr("");
+    stagingUsage()
+      .then((u) => setStaging(u))
+      .catch((e) => setStagingErr(describeError(e)));
+  };
+  useEffect(() => { loadStaging(); }, []);
+
+  /** dry-run：只预览会删多少，不动磁盘。 */
+  const doStagingDryRun = () => run("staging 预览", async () => {
+    const r = await stagingCleanup(olderDays, true);
+    setDryResult(r);
+    props.onToast("info", "dry-run：可清理 " + r.files + " 个文件 / " + formatBytes(r.bytes) +
+      (r.failed ? "，预计失败 " + r.failed : ""));
+  });
+
+  /** 真清理：只删 unity-staging 里 N 天以前的落地包，不碰素材。 */
+  const doStagingCleanup = () => run("staging 清理", async () => {
+    if (!window.confirm("清理 unity-staging 中 " + olderDays + " 天以前的落地包？\n只删导入缓存，不删素材、不改工程。")) return;
+    const r = await stagingCleanup(olderDays, false);
+    setCleanResult(r);
+    setDryResult(null);
+    props.onToast("ok", "已清理 " + r.files + " 个文件，释放 " + formatBytes(r.bytes) +
+      (r.failed ? "；失败 " + r.failed : ""));
+    loadStaging();
+  });
 
   const run = (label: string, fn: () => Promise<void>) => {
     if (busy) return;
@@ -139,6 +173,47 @@ export function SettingsPanel(props: {
               <input style={{ flex: 1 }} value={newWatch} onChange={(e) => setNewWatch(e.target.value)} placeholder="例如 E:\Downloads\booth" />
               <button className="btn" disabled={!!busy} onClick={doAddWatch}>添加监听</button>
             </div>
+          </div>
+
+          <div className="section">
+            <h4>导入落地缓存（staging）</h4>
+            <div className="hint" style={{ marginBottom: "6px" }}>
+              导入时把压缩包里的 .unitypackage 落到这个目录再交给 Unity。它只是缓存，可以随时清；**不会动素材、不改工程**。
+            </div>
+            {stagingErr ? (
+              <div className="hint">staging 接口不可用：{stagingErr}</div>
+            ) : (
+              <div className="hint">
+                当前用量：{staging ? formatBytes(staging.bytes) + " · " + staging.files + " 个文件" + (staging.dirs !== null ? " · " + staging.dirs + " 个目录" : "") : "载入中…"}
+                <button className="btn tiny" style={{ marginLeft: "6px" }} disabled={!!busy} onClick={loadStaging}>刷新</button>
+              </div>
+            )}
+            <div className="row" style={{ gap: "6px", marginTop: "8px", alignItems: "center" }}>
+              <label className="chk">
+                清理
+                <input
+                  type="number" min={0} value={olderDays}
+                  onChange={(e) => setOlderDays(Math.max(0, Number(e.target.value) || 0))}
+                  style={{ width: "64px" }}
+                />
+                天以前的
+              </label>
+              <button className="btn tiny" disabled={!!busy} onClick={doStagingDryRun}>预览清理（dry-run）</button>
+              <button className="btn tiny danger" disabled={!!busy} onClick={doStagingCleanup}>执行清理</button>
+            </div>
+            {dryResult && (
+              <div className="hint" data-staging="dry">
+                dry-run：将删除 {dryResult.files} 个文件 / 释放 {formatBytes(dryResult.bytes)}
+                {dryResult.failed ? "；预计失败 " + dryResult.failed + " 项（可能被占用）" : ""}
+              </div>
+            )}
+            {cleanResult && (
+              <div className="hint" data-staging="done">
+                已清理 {cleanResult.files} 个文件 / 释放 {formatBytes(cleanResult.bytes)}
+                {cleanResult.failed ? "；失败 " + cleanResult.failed + " 项" : ""}
+              </div>
+            )}
+            <div className="hint" style={{ marginTop: "4px" }}>dry-run 只统计不删除；「执行清理」会二次确认。</div>
           </div>
 
           <div className="section">

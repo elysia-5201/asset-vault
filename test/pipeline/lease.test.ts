@@ -46,8 +46,8 @@ function openV5Db(): { db: Database.Database; close: () => void } {
 }
 
 describe("v6/v7 迁移：jobs 租约列 + cache_entries.weak + index_tasks 围栏列", () => {
-  test("SCHEMA_VERSION = 8", () => {
-    assert.equal(SCHEMA_VERSION, 8);
+  test("SCHEMA_VERSION = 9", () => {
+    assert.equal(SCHEMA_VERSION, 9);
   });
 
   test("v5 老库：补 5 列（4 租约 + weak），幂等；schema.sql 随后可执行（新索引可建）", () => {

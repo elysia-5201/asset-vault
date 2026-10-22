@@ -19,10 +19,41 @@ import type { Repo } from "../db/repo";
 export const UNITY_MCP_URLS = ["http://127.0.0.1:8080/mcp", "http://127.0.0.1:14523/mcp"];
 
 /** 按 settings.unity_mcp_url 优先构造客户端（routes 与 Job runner 共用，避免两套 URL 逻辑）。 */
-export function unityClientFor(repo: Pick<Repo, "getSetting">): UnityMcp {
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+/** task-51：MCP 端点仅允许 loopback；非 loopback 必须显式 settings.unity_mcp_allow_remote='1'。 */
+export function isLoopbackMcpUrl(raw: string): boolean {
+  try {
+    const u = new URL(String(raw));
+    const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return LOOPBACK_HOSTS.has(host);
+  } catch { return false; }
+}
+
+/** 日志/健康只显示 protocol+host+port+path，不泄露 URL 里的 token/凭据。 */
+export function sanitizeMcpUrl(raw: string): string {
+  try { const u = new URL(String(raw)); return u.protocol + "//" + u.hostname + (u.port ? ":" + u.port : "") + u.pathname; }
+  catch { return "<invalid-url>"; }
+}
+
+export interface McpBoundary { allowRemote: boolean; urls: string[]; dropped: string[] }
+export function unityMcpBoundary(repo: Pick<Repo, "getSetting">): McpBoundary {
   const saved = String(repo.getSetting("unity_mcp_url") ?? "").trim();
-  const urls = saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
-  return new UnityMcp(urls);
+  const allowRemote = String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1";
+  const candidates = saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
+  const urls: string[] = []; const dropped: string[] = [];
+  for (const c of candidates) {
+    if (isLoopbackMcpUrl(c) || allowRemote) urls.push(c);
+    else dropped.push(sanitizeMcpUrl(c));
+  }
+  if (dropped.length) {
+    console.warn("[assetvault] unity MCP non-loopback endpoint(s) ignored: " + dropped.join(", ") + " (set settings.unity_mcp_allow_remote='1' to permit)");
+  }
+  return { allowRemote, urls: urls.length ? urls : UNITY_MCP_URLS.slice(), dropped };
+}
+
+export function unityClientFor(repo: Pick<Repo, "getSetting">): UnityMcp {
+  return new UnityMcp(unityMcpBoundary(repo).urls);
 }
 const MAX_PACKAGE_BYTES = 2 * 1024 * 1024 * 1024;
 /** 内层 zip 下钻上限：VRChat 素材常见"一个 7z 里 9 个 per-avatar zip"，所以放得比较宽。 */
@@ -408,6 +439,12 @@ export async function readUnityConsole(u: UnityMcp, types: string[] = ["error"],
     }
     return clean(t.split(/\r?\n/));
   } catch { return []; }
+}
+
+/** 命令发出后的会话健康检查（read_console 探活）；失败说明 Unity/MCP 断线，调用方应标 unknown。 */
+export async function unitySessionHealthy(u: UnityMcp): Promise<boolean> {
+  try { await u.call("read_console", { action: "get", types: [], count: "1", format: "plain" }); return true; }
+  catch { return false; }
 }
 
 /** 导入前先清空控制台，这样导入后读到的 error 一定是这次导入产生的。 */

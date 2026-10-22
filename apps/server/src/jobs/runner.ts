@@ -426,6 +426,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           repo, log: deps.log,
           unity: deps.unity ?? unityClientFor(repo),
           stagingDir: join(deps.dataDir ?? tmpdir(), "unity-staging"),
+          jobId,
         }, planId);
         ensureLease();
         scratch.note = `import: plan=${planId} run=${result.run.id} status=${result.run.status} items=${result.items.length}`;

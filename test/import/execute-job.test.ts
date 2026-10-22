@@ -11,7 +11,7 @@ import { openTempDb, addItem, addRoot, addAsset, type TempDb } from "../schema/_
 import { Repo } from "../../apps/server/src/db/repo";
 import { registerRoutes } from "../../apps/server/src/http/routes";
 import { resolveLimits } from "../../apps/server/src/services/pipeline/limits";
-import { analyzeItemStructure, createImportPlan, executeImportPlan, getPlanView, precheckImportPlan } from "../../apps/server/src/services/structure";
+import { analyzeItemStructure, cancelImportRun, canTransitionRunItem, createImportPlan, executeImportPlan, getPlanView, precheckImportPlan } from "../../apps/server/src/services/structure";
 import { runJob, type JobDeps } from "../../apps/server/src/jobs/runner";
 
 let t: TempDb; let repo: Repo; let itemId: number; let rootId: number; let dir: string; let project: string;
@@ -22,8 +22,9 @@ beforeEach(() => {
 });
 afterEach(() => { t.close(); rmSync(dir, { recursive: true, force: true }); });
 
-async function readyPlan(guid = "guid-abc") {
-  const pkg = join(dir, "pkg.unitypackage"); writeFileSync(pkg, Buffer.alloc(12, 1));
+const GUID_HEX = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+async function readyPlan(guid = GUID_HEX, pkgName = "pkg.unitypackage") {
+  const pkg = join(dir, pkgName); writeFileSync(pkg, Buffer.alloc(12, 1));
   const a = addAsset(t.db, itemId, rootId, pkg, { kind: "unitypackage", container: "unitypackage", path: pkg, path_norm: pkg, size: 12, mtime: "2026-10-02T00:00:00.000Z", sha256: "abcdef0123456789" });
   repo.replaceUnityPackageAssets(a, [{ guid, assetPath: "Assets/Thing.fbx", type: "Model", size: 1, hasPreview: false }]);
   t.db.prepare("UPDATE assets SET index_state='done' WHERE id=?").run(a);
@@ -79,7 +80,7 @@ describe("execute → job", () => {
 
   test("执行中：plan.status=running，PlanView.run_id 指向当前 run", async () => {
     const { plan } = await readyPlan();
-    writeFileSync(join(project, "Assets", "Thing.meta"), "fileFormatVersion: 2\nguid: guid-abc\n");
+    writeFileSync(join(project, "Assets", "Thing.meta"), "fileFormatVersion: 2\nguid: " + GUID_HEX + "\n");
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
     const unity: any = fakeUnity();
@@ -108,7 +109,7 @@ describe("execute → job", () => {
 
   test("runner 成功：run_items verified + plan executed（命令完成与验证分离）", async () => {
     const { plan } = await readyPlan();
-    writeFileSync(join(project, "Assets", "Thing.meta"), "fileFormatVersion: 2\nguid: guid-abc\n");
+    writeFileSync(join(project, "Assets", "Thing.meta"), "fileFormatVersion: 2\nguid: " + GUID_HEX + "\n");
     const job = repo.createJob("import", plan.item_id, { planId: plan.id }, 40);
     const claimed = repo.claimNextJob("test-holder", { leaseMs: 60_000 })!;
     assert.equal(claimed.id, job.id);
@@ -124,7 +125,8 @@ describe("execute → job", () => {
     assert.equal(items.length, 1);
     assert.equal(items[0].status, "verified");
     const detail = JSON.parse(items[0].detail_json);
-    assert.ok(detail.guidsMatched.length >= 1, "GUID 验证必须记录命中");
+    assert.equal(detail.missing, 0, "GUID 验证必须无缺失");
+    assert.ok(detail.found >= 1);
     const app = routeApp();
     const gp = await app.inject({ method: "GET", url: "/api/import-plans/" + plan.id });
     const pv = JSON.parse(gp.body);
@@ -154,6 +156,107 @@ describe("execute → job", () => {
     assert.equal(view.run_id, run.id);
     assert.equal(view.lastError?.code, "UPSTREAM_ERROR");
     assert.match(String(view.lastError?.message), /connect refused/);
+  });
+
+  test("task-51：≤500 GUID 全量验证 → verified/all/checked=expected", async () => {
+    const { plan } = await readyPlan();
+    writeFileSync(join(project, "Assets", "Thing.meta"), "fileFormatVersion: 2\nguid: " + GUID_HEX + "\n");
+    const res = await executeImportPlan({ repo, unity: fakeUnity() as any, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id);
+    assert.equal(res.run.status, "verified");
+    assert.equal(res.run.verification_scope, "all");
+    assert.equal(res.run.checked_count, 1);
+    assert.equal(res.run.expected_count, 1);
+    const detail = JSON.parse(res.items[0].detail_json);
+    assert.equal(detail.missing, 0);
+    assert.equal(detail.checked, 1);
+    assert.equal(detail.expected, 1);
+  });
+
+  test("task-51：>500 GUID 抽样 500 → verification_scope=sampled", async () => {
+    const { plan } = await readyPlan();
+    const assets = Array.from({ length: 600 }, (_, i) => ({ guid: String(i).padStart(8, "0") + "0".repeat(24), assetPath: "Assets/F" + i + ".fbx", type: "Model", size: 1, hasPreview: false }));
+    const first = repo.listAssets(plan.item_id)[0];
+    repo.replaceUnityPackageAssets(first.id, assets);
+    for (let i = 0; i < 600; i++) writeFileSync(join(project, "Assets", "F" + i + ".meta"), "guid: " + assets[i].guid + "\n");
+    const res = await executeImportPlan({ repo, unity: fakeUnity() as any, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id);
+    assert.equal(res.run.status, "verified");
+    assert.equal(res.run.verification_scope, "sampled");
+    assert.equal(res.run.checked_count, 500);
+    assert.equal(res.run.expected_count, 600);
+    const detail = JSON.parse(res.items[0].detail_json);
+    assert.equal(detail.verificationScope, "sampled");
+    assert.equal(detail.missing, 0);
+  });
+
+  test("task-51：缺 GUID → partial_success；工程不可读 → unknown", async () => {
+    const { plan } = await readyPlan();
+    // 3 个期望只落 2 个
+    const a = repo.listAssets(plan.item_id)[0];
+    repo.replaceUnityPackageAssets(a.id, [
+      { guid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", assetPath: "Assets/A.fbx", type: "Model", size: 1, hasPreview: false },
+      { guid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", assetPath: "Assets/B.fbx", type: "Model", size: 1, hasPreview: false },
+      { guid: "cccccccccccccccccccccccccccccccc", assetPath: "Assets/C.fbx", type: "Model", size: 1, hasPreview: false },
+    ]);
+    writeFileSync(join(project, "Assets", "A.meta"), "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    writeFileSync(join(project, "Assets", "B.meta"), "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    const res = await executeImportPlan({ repo, unity: fakeUnity() as any, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id);
+    assert.equal(res.run.status, "partial_success");
+    assert.equal(res.items[0].status, "partial_success");
+    assert.equal(JSON.parse(res.items[0].detail_json).missing, 1);
+
+    const { plan: p2 } = await readyPlan(GUID_HEX, "pkg2.unitypackage");
+    rmSync(join(project, "Assets"), { recursive: true, force: true });
+    const res2 = await executeImportPlan({ repo, unity: fakeUnity() as any, stagingDir: join(dir, "stage2"), waitMs: 0 }, p2.id);
+    assert.equal(res2.run.status, "unknown");
+    assert.equal(res2.items[0].status, "unknown");
+    assert.equal(JSON.parse(res2.items[0].detail_json).possible_side_effect, true);
+  });
+  test("task-51：命令已发后 Unity 断线 → unknown（possible_side_effect），不自动重试", async () => {
+    const { plan } = await readyPlan();
+    const unity: any = fakeUnity();
+    unity.call = async (name: string, args: any) => {
+      if (name === "read_console" && args?.action === "clear") return { isError: false, text: "", structured: { data: [] } };
+      throw Object.assign(new Error("session lost"), { code: "UPSTREAM_ERROR" });
+    };
+    const res = await executeImportPlan({ repo, unity, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id);
+    assert.equal(res.run.status, "unknown");
+    assert.equal(res.items[0].status, "unknown");
+    const detail = JSON.parse(res.items[0].detail_json);
+    assert.equal(detail.possible_side_effect, true);
+    assert.equal(repo.getImportPlan(plan.id).status, "unknown");
+    assert.throws(() => precheckImportPlan(repo, plan.id), /不可执行/, "unknown 计划不得自动重试");
+    assert.equal(canTransitionRunItem("unknown", "importing"), false, "unknown 是终态");
+  });
+
+  test("task-51：取消执行 → run/item cancelled 且记录 possible_side_effect", async () => {
+    const { plan } = await readyPlan();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const unity: any = fakeUnity();
+    const baseCsharp = unity.csharp;
+    unity.csharp = async (code: string) => {
+      if (code.includes("AssetDatabase.ImportPackage")) { await gate; return "QUEUED|fake|1"; }
+      return baseCsharp(code);
+    };
+    const exec = executeImportPlan({ repo, unity, stagingDir: join(dir, "stage"), waitMs: 0 }, plan.id);
+    const deadline = Date.now() + 3000;
+    let run: any = null;
+    while (Date.now() < deadline) {
+      run = repo.latestImportRun(plan.id);
+      if (run && String(run.status) === "running" && repo.listImportRunItems(run.id).some((i: any) => i.status === "importing")) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(run, "必须进入 importing 阶段");
+    const cancelled = cancelImportRun(repo, run.id);
+    assert.equal(cancelled.run.status, "cancelled");
+    release();
+    const res = await exec;
+    assert.equal(res.run.status, "cancelled");
+    const item = res.items[0];
+    assert.equal(item.status, "cancelled");
+    const detail = JSON.parse(item.detail_json);
+    assert.equal(detail.possible_side_effect, true, "已进入 importing 的取消必须标记可能副作用");
+    assert.equal(repo.getImportPlan(plan.id).status, "cancelled");
   });
 
   test("task-46：执行时指纹变化 → 仍记录 failed run/run_items 与 lastError", async () => {

@@ -2309,8 +2309,8 @@ export class Repo {
       .run(input.planId, input.unitId, input.assetId, input.path, input.policy ?? null, input.fingerprint ?? null, input.status ?? "pending", input.error ?? null);
     return this.stmt("SELECT * FROM import_plan_items WHERE id=?").get(Number(info.lastInsertRowid));
   }
-  updateImportPlan(id: number, patch: { status?: string; policy?: string | null; user_confirmed?: number; precheck_json?: string | null; version?: number }): any {
-    const allowed = ["status", "policy", "user_confirmed", "precheck_json", "version"];
+  updateImportPlan(id: number, patch: { status?: string; policy?: string | null; user_confirmed?: number; precheck_json?: string | null; version?: number; risk_json?: string | null; risk_state?: string | null }): any {
+    const allowed = ["status", "policy", "user_confirmed", "precheck_json", "version", "risk_json", "risk_state"];
     const sets: string[] = []; const p: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
     if (sets.length) { p.push(id); this.stmt("UPDATE import_plans SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
@@ -2335,8 +2335,8 @@ export class Repo {
   findInflightImportJob(planId: number): any {
     return this.stmt("SELECT * FROM jobs WHERE kind='import' AND json_extract(payload,'$.planId')=? AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1").get(planId) ?? null;
   }
-  updateImportRun(id: number, patch: { status?: string; finished_at?: string | null; console_errors?: string | null; summary_json?: string | null; project_id?: number | null }): any {
-    const allowed = ["status", "finished_at", "console_errors", "summary_json", "project_id"];
+  updateImportRun(id: number, patch: { status?: string; finished_at?: string | null; console_errors?: string | null; summary_json?: string | null; project_id?: number | null; verification_scope?: string | null; checked_count?: number; expected_count?: number }): any {
+    const allowed = ["status", "finished_at", "console_errors", "summary_json", "project_id", "verification_scope", "checked_count", "expected_count"];
     const sets: string[] = []; const p: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
     if (sets.length) { p.push(id); this.stmt("UPDATE import_runs SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
@@ -2353,12 +2353,51 @@ export class Repo {
       "FROM import_run_items ri JOIN import_plan_items pi ON pi.id=ri.plan_item_id JOIN asset_units au ON au.id=ri.unit_id WHERE ri.run_id=? ORDER BY ri.id"
     ).all(runId) as any[];
   }
+  getImportRunItem(id: number): any { return this.stmt("SELECT * FROM import_run_items WHERE id=?").get(id) ?? null; }
   updateImportRunItem(id: number, patch: { status?: string; started_at?: string | null; finished_at?: string | null; error?: string | null; detail_json?: string | null }): any {
     const allowed = ["status", "started_at", "finished_at", "error", "detail_json"];
     const sets: string[] = []; const p: unknown[] = [];
     for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
     if (sets.length) { p.push(id); this.stmt("UPDATE import_run_items SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
     return this.stmt("SELECT * FROM import_run_items WHERE id=?").get(id) ?? null;
+  }
+
+
+  // ---------- Unity staging 台账（v9）----------
+  /** 登记/刷新 staging 文件（path_norm 唯一；同路径重复 stage 复用行）。 */
+  registerStagingFile(input: { path: string; size: number; planId?: number | null; runId?: number | null; jobId?: number | null; state?: string }): any {
+    const norm = normalizePath(input.path);
+    const t = now();
+    this.stmt(
+      "INSERT INTO staging_files(path_norm,path,size,plan_id,run_id,job_id,state,created_at,last_used_at) VALUES (?,?,?,?,?,?,?,?,?) " +
+      "ON CONFLICT(path_norm) DO UPDATE SET path=excluded.path, size=excluded.size, " +
+      "plan_id=COALESCE(excluded.plan_id, staging_files.plan_id), run_id=COALESCE(excluded.run_id, staging_files.run_id), " +
+      "job_id=COALESCE(excluded.job_id, staging_files.job_id), state=excluded.state, last_used_at=excluded.last_used_at"
+    ).run(norm, input.path, Math.max(0, Math.floor(input.size)), input.planId ?? null, input.runId ?? null, input.jobId ?? null, input.state ?? "in_use", t, t);
+    return this.getStagingFileByPath(norm);
+  }
+  getStagingFileByPath(pathNorm: string): any { return this.stmt("SELECT * FROM staging_files WHERE path_norm=?").get(normalizePath(pathNorm)) ?? null; }
+  getStagingFile(id: number): any { return this.stmt("SELECT * FROM staging_files WHERE id=?").get(id) ?? null; }
+  listStagingFiles(f: { state?: string; planId?: number; runId?: number; limit?: number } = {}): any[] {
+    const w: string[] = ["1=1"]; const p: unknown[] = [];
+    if (f.state) { w.push("state=?"); p.push(f.state); }
+    if (f.planId) { w.push("plan_id=?"); p.push(f.planId); }
+    if (f.runId) { w.push("run_id=?"); p.push(f.runId); }
+    const limit = Math.min(2000, Math.max(1, Math.floor(f.limit ?? 500)));
+    return this.stmt("SELECT * FROM staging_files WHERE " + w.join(" AND ") + " ORDER BY id DESC LIMIT ?").all(...p as any[], limit) as any[];
+  }
+  updateStagingFile(id: number, patch: { state?: string; last_used_at?: string; cleanup_error?: string | null; cleanup_attempts?: number; size?: number; run_id?: number | null; plan_id?: number | null; job_id?: number | null }): any {
+    const allowed = ["state", "last_used_at", "cleanup_error", "cleanup_attempts", "size", "run_id", "plan_id", "job_id"];
+    const sets: string[] = []; const p: unknown[] = [];
+    for (const [k, v] of Object.entries(patch)) if (allowed.includes(k) && v !== undefined) { sets.push(k + " = ?"); p.push(v as any); }
+    if (sets.length) { p.push(id); this.stmt("UPDATE staging_files SET " + sets.join(", ") + " WHERE id=?").run(...p as any[]); }
+    return this.getStagingFile(id);
+  }
+  deleteStagingFile(id: number): boolean { return this.stmt("DELETE FROM staging_files WHERE id=?").run(id).changes > 0; }
+  /** 启动 sweep：超过 cutoff 且非 in_use（或 in_use 但已过期）的登记行；活跃判断由调用方用 job/run 再做。 */
+  listStaleStagingFiles(cutoffIso: string, limit = 500): any[] {
+    return this.stmt("SELECT * FROM staging_files WHERE state IN ('in_use','cleanup_pending','cleanup_failed') AND last_used_at < ? ORDER BY last_used_at ASC LIMIT ?")
+      .all(cutoffIso, Math.min(2000, Math.max(1, limit))) as any[];
   }
 
   // ---------- stats / export ----------

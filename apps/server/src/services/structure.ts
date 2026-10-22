@@ -7,7 +7,8 @@
  *  - 指纹变化 → plan blocked / execute 拒绝（FINGERPRINT_CHANGED），绝不按旧快照导入；
  *  - Unity 调用返回只算 import_command_completed；verified/partial_success 是**另外**的验证结论。
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listArchive, readArchiveEntry } from "../../../../packages/core/src/archive/list";
@@ -17,10 +18,11 @@ import {
 } from "../../../../packages/core/src/structure";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
+import { scanPaths, RISK_SCANNER_VERSION, type RiskHit, type RiskState, type RiskScanResult } from "../../../../packages/core/src/risk";
 import type { Repo } from "../db/repo";
 import {
   UnityMcp, unityEditorInfo, importPackagesIntoUnity,
-  readUnityConsole, clearUnityConsole, sleep, baseName,
+  readUnityConsole, clearUnityConsole, sleep, baseName, unitySessionHealthy,
 } from "./unity";
 
 const IMPORTABLE_POLICIES = new Set<StructurePolicy>(["single_unitypackage", "mixed_unitypackage"]);
@@ -130,6 +132,34 @@ async function discoverNestedContainers(asset: any, outerArchives: { entryPath: 
   return out;
 }
 
+/** task-51：统一 run_item 状态机（unknown/cancelled 为终态；unknown 不自动重试）。 */
+export type RunItemStatus = "queued" | "prechecking" | "blocked" | "importing" | "import_command_completed" | "verifying" | "verified" | "partial_success" | "failed" | "unknown" | "cancelled";
+const RUN_ITEM_TRANSITIONS: Record<string, string[]> = {
+  pending: ["queued", "blocked", "importing", "failed", "cancelled"],
+  queued: ["prechecking", "blocked", "importing", "failed", "cancelled"],
+  prechecking: ["blocked", "importing", "failed", "cancelled"],
+  blocked: ["queued", "cancelled"],
+  importing: ["import_command_completed", "failed", "unknown", "cancelled"],
+  import_command_completed: ["verifying", "failed", "unknown", "cancelled"],
+  verifying: ["verified", "partial_success", "failed", "unknown", "cancelled"],
+  verified: [],
+  partial_success: ["queued", "cancelled"],
+  failed: ["queued"],
+  unknown: [],
+  cancelled: [],
+};
+export function canTransitionRunItem(from: string, to: string): boolean {
+  if (from === to) return true;
+  return (RUN_ITEM_TRANSITIONS[from] ?? []).includes(to);
+}
+/** 带状态机校验的 run_item 迁移；非法迁移抛 INVALID_TRANSITION（绝不静默写坏状态）。 */
+export function transitionRunItem(repo: Repo, id: number, to: RunItemStatus, patch: { started_at?: string | null; finished_at?: string | null; error?: string | null; detail_json?: string | null } = {}): any {
+  const row = repo.getImportRunItem(id);
+  const from = String(row?.status ?? "pending");
+  if (!canTransitionRunItem(from, to)) throw appErr("INVALID_TRANSITION", "run_item " + id + " 不允许 " + from + " → " + to, 409);
+  return repo.updateImportRunItem(id, { ...patch, status: to });
+}
+
 /** task-45：按需解析 unitypackage 内容的预算（每项 ≤64 包 / 累计 512MB / 45s / 1 万条资产）。 */
 const MAX_PACKAGE_PARSES = 64;
 const MAX_PACKAGE_BYTES = 512 * 1024 * 1024;
@@ -137,7 +167,7 @@ const PACKAGE_PARSE_BUDGET_MS = 45_000;
 const MAX_PACKAGE_ASSETS = 10_000;
 
 interface PackageBudget { packages: number; bytes: number; started: number }
-type PackagePathsResult = { ok: true; paths: string[] } | { ok: false; state: "limited" | "failed"; error: string };
+type PackagePathsResult = { ok: true; paths: string[]; guids: string[] } | { ok: false; state: "limited" | "failed"; error: string };
 interface AnalyzeCtx { cache: Map<string, PackagePathsResult>; budget: PackageBudget }
 
 /**
@@ -196,9 +226,10 @@ async function readPackageAssetPaths(asset: any, relPath: string, ctx: AnalyzeCt
     }
     const listing = await listUnityPackage(target, { maxAssets: MAX_PACKAGE_ASSETS, maxTotalBytes: MAX_PACKAGE_BYTES - bytes });
     const paths = (listing.assets ?? []).map((a) => String(a.assetPath)).filter(Boolean);
+    const guids = (listing.assets ?? []).map((a) => String(a.guid)).filter(Boolean);
     ctx.budget.packages++;
     ctx.budget.bytes += bytes;
-    const ok: PackagePathsResult = { ok: true, paths };
+    const ok: PackagePathsResult = { ok: true, paths, guids };
     ctx.cache.set(key, ok);
     return ok;
   } catch (e) {
@@ -376,6 +407,9 @@ export interface PlanView {
   latestRun: { id: number; status: string; started_at: string | null; finished_at: string | null; summary: any; console_errors: any } | null;
   /** 最近一次执行失败的 {code,message,phase}（来自 latestRun.summary.error）；成功/未执行为 null。 */
   lastError: { code: string; message: string; phase?: string } | null;
+  /** task-51：计划风险摘要 + 状态（clear/warning/blocked/unknown）；precheck 直接暴露给 UI。 */
+  risks: PlanRiskSummary | null;
+  risk_state: string | null;
 }
 
 function nowIso(): string { return new Date().toISOString(); }
@@ -511,6 +545,7 @@ export function getPlanView(repo: Repo, planId: number): PlanView | null {
       summary, console_errors: safeJson(latest.console_errors),
     } : null,
     lastError: err && typeof err === "object" ? { code: String(err.code ?? "ERROR"), message: String(err.message ?? ""), ...(err.phase ? { phase: String(err.phase) } : {}) } : null,
+    risks: safeJson(plan.risk_json), risk_state: plan.risk_state ?? null,
   };
 }
 
@@ -520,14 +555,29 @@ function safeJson(text: string | null | undefined): any {
 }
 
 /** 人工确认：blocked 不可确认；suggested 条目转 pending。 */
-export function confirmImportPlan(repo: Repo, planId: number): PlanView {
+/**
+ * task-51 风险确认：confirm 必须带 riskAck。warning/unknown 未 ack → 409 RISK_REQUIRES_ACK；
+ * blocked 未 ack → RISK_BLOCKED（blocked 即使 ack 也不放行）。ack 时间/摘要写进 risk_json。
+ */
+export function confirmImportPlan(repo: Repo, planId: number, opts: { riskAck?: boolean } = {}): PlanView {
   const plan = repo.getImportPlan(planId);
   if (!plan) throw appErr("NOT_FOUND", "计划不存在", 404);
-  if (plan.status === "blocked") throw appErr("PLAN_BLOCKED", "计划被 precheck 阻断（指纹/文件变化），请重新扫描后再建计划", 409);
+  if (plan.status === "blocked" || plan.risk_state === "blocked") {
+    throw appErr("RISK_BLOCKED", "计划被风险规则阻断，不能确认执行", 409);
+  }
+  const riskState = String(plan.risk_state ?? "");
+  if ((riskState === "warning" || riskState === "unknown") && opts.riskAck !== true) {
+    throw appErr("RISK_REQUIRES_ACK", "计划包含风险内容，需要显式 riskAck 确认后才能执行", 409);
+  }
+  let riskJson = plan.risk_json ?? null;
+  if (riskState === "warning" || riskState === "unknown") {
+    const prev = safeJson(plan.risk_json) ?? {};
+    riskJson = JSON.stringify({ ...prev, risk_ack_at: nowIso(), risk_ack_digest: String(prev.digest ?? "") });
+  }
   for (const it of repo.listImportPlanItems(planId)) {
     if (it.status === "suggested") repo.updateImportPlanItem(it.id, { status: "pending" });
   }
-  repo.updateImportPlan(planId, { user_confirmed: 1, status: "ready" });
+  repo.updateImportPlan(planId, { user_confirmed: 1, status: "ready", ...(riskJson ? { risk_json: riskJson } : {}) });
   return getPlanView(repo, planId)!;
 }
 
@@ -540,39 +590,162 @@ export interface ExecuteDeps {
   log?: (m: string) => void;
   /** 导入命令返回后等 Unity 落盘的毫秒数（默认 1500） */
   waitMs?: number;
+  /** 触发执行的 job id（写 staging 台账） */
+  jobId?: number;
 }
 
-/** 抽样 GUID 验证：工程 Assets 下的 .meta 文本里是否出现期望 guid。 */
-function verifyGuids(projectPath: string, expected: string[], sampleLimit = 20, fileLimit = 8000): string[] {
-  if (!expected.length) return [];
-  const wanted = new Set(expected.slice(0, sampleLimit).map((g) => g.trim()).filter(Boolean));
-  if (wanted.size === 0) return [];
-  const matched = new Set<string>();
-  const stack = [join(projectPath, "Assets")];
+/** task-51：扫描工程 Assets 下全部 .meta 的 guid（读不了工程 → ok=false，调用方落 unknown）。 */
+export function scanProjectGuids(projectPath: string, fileLimit = 200_000): { ok: boolean; guids: Set<string>; files: number } {
+  const root = join(projectPath, "Assets");
+  if (!existsSync(root)) return { ok: false, guids: new Set(), files: 0 };
+  const guids = new Set<string>();
+  const stack = [root];
   let files = 0;
-  while (stack.length && files < fileLimit && matched.size < wanted.size) {
+  while (stack.length) {
     const dir = stack.pop()!;
     let entries: import("node:fs").Dirent[];
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return { ok: false, guids, files }; }
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) { stack.push(full); continue; }
       if (!e.name.toLowerCase().endsWith(".meta")) continue;
-      if (++files > fileLimit) break;
+      if (++files > fileLimit) return { ok: false, guids, files };
       try {
-        const text = readFileSync(full, "utf8");
-        for (const g of wanted) if (text.includes(g)) matched.add(g);
-      } catch { /* 单文件读失败忽略 */ }
+        const m = /\bguid:\s*([0-9a-f]{32})\b/i.exec(readFileSync(full, "utf8"));
+        if (m) guids.add(m[1]!.toLowerCase());
+      } catch { return { ok: false, guids, files }; }
     }
   }
-  return [...matched];
+  return { ok: true, guids, files };
+}
+
+export interface VerificationCoverage {
+  ok: boolean; scope: "all" | "sampled"; expected: number; checked: number;
+  found: number; missing: number; missingGuids: string[]; detail?: string;
+}
+
+/** task-51：验证覆盖。≤500 全量比对；>500 抽样 500 并标 sampled；missing=0 才算 verified。 */
+export function verifyCoverage(projectPath: string, expectedGuids: string[]): VerificationCoverage {
+  const all = [...new Set(expectedGuids.map((g) => String(g).trim().toLowerCase()).filter(Boolean))];
+  if (all.length === 0) return { ok: false, scope: "all", expected: 0, checked: 0, found: 0, missing: 0, missingGuids: [], detail: "没有可验证的期望 GUID" };
+  const scope: "all" | "sampled" = all.length <= 500 ? "all" : "sampled";
+  const list = scope === "all" ? all : all.slice(0, 500);
+  const scan = scanProjectGuids(projectPath);
+  if (!scan.ok) return { ok: false, scope, expected: all.length, checked: 0, found: 0, missing: list.length, missingGuids: list.slice(0, 50), detail: "无法读取工程 Assets" };
+  const missing = list.filter((g) => !scan.guids.has(g));
+  return { ok: true, scope, expected: all.length, checked: list.length, found: list.length - missing.length, missing: missing.length, missingGuids: missing.slice(0, 50) };
 }
 
 /** 执行前置校验（路由与 runner 共用）：blocked/confirm/指纹；不产生任何副作用。 */
+/** task-51：计划级风险摘要（包内路径 + 外层 archive_entries；扫描器版本/摘要用于执行前一致性校验）。 */
+export interface PlanRiskSummary {
+  scannerVersion: number;
+  digest: string;
+  state: RiskState;
+  hits: RiskHit[];
+  scanned: number;
+  truncated: boolean;
+  itemDigests: Record<string, string>;
+  generatedAt: string;
+}
+function digestOf(text: string): string { return createHash("sha256").update(text).digest("hex").slice(0, 16); }
+
+/** 计算计划的当前风险（只读；不写库）。包内路径解析失败按 unknown，绝不猜 clear。 */
+export async function computePlanRisk(repo: Repo, planId: number): Promise<PlanRiskSummary> {
+  const items = repo.listImportPlanItems(planId);
+  const ctx: AnalyzeCtx = { cache: new Map(), budget: { packages: 0, bytes: 0, started: Date.now() } };
+  const all: string[] = [];
+  const itemDigests: Record<string, string> = {};
+  let incomplete = false;
+  for (const it of items) {
+    const asset = repo.getAsset(Number(it.asset_id));
+    if (!asset) { incomplete = true; continue; }
+    const direct = String(asset.kind) === "unitypackage" || String(asset.container) === "unitypackage";
+    all.push(String(asset.path));
+    let paths: string[] = [];
+    if (direct) {
+      paths = (repo.getUnityPackageAssets(asset.id) as any[]).map((r) => String(r.assetPath));
+    }
+    if (paths.length === 0) {
+      const parsed = await readPackageAssetPaths(asset, String(it.rel_path ?? ""), ctx);
+      if (parsed.ok) paths = parsed.paths; else incomplete = true;
+    }
+    // 外层容器条目同样是 Unity 包可能携带的内容
+    if (!direct) paths.push(...(repo.getArchiveEntries(asset.id) as any[]).map((e) => String(e.path)));
+    itemDigests[String(it.id)] = digestOf([...paths].sort().join("\n"));
+    all.push(...paths);
+  }
+  // task-51/56：magic 检测只读真实磁盘文件前 ≤8B（包内虚拟路径读不到就返回 null，不猜）
+  const magicReader = (p: string): string | null => {
+    try {
+      if (!existsSync(p) || !statSync(p).isFile()) return null;
+      const fd = openSync(p, "r");
+      try { const b = Buffer.alloc(8); const n = readSync(fd, b, 0, 8, 0); return b.subarray(0, n).toString("latin1"); }
+      finally { closeSync(fd); }
+    } catch { return null; }
+  };
+  const scan: RiskScanResult = scanPaths([...new Set(all)], { incomplete, magic: magicReader });
+  return {
+    scannerVersion: RISK_SCANNER_VERSION,
+    digest: digestOf(items.map((it: any) => it.id + ":" + (itemDigests[String(it.id)] ?? "")).sort().join("|") + "|v" + RISK_SCANNER_VERSION),
+    state: scan.state, hits: scan.hits.slice(0, 200), scanned: scan.scanned, truncated: scan.truncated,
+    itemDigests, generatedAt: nowIso(),
+  };
+}
+
+/** 建计划后写入风险；warning/unknown 要求人工确认，blocked 直接阻断（已确认计划不改状态）。 */
+export async function applyPlanRisk(repo: Repo, planId: number): Promise<PlanView | null> {
+  const risk = await computePlanRisk(repo, planId);
+  const plan = repo.getImportPlan(planId);
+  if (!plan) return null;
+  let status = String(plan.status);
+  if (!plan.user_confirmed) {
+    if (risk.state === "blocked") status = "blocked";
+    else if (risk.state === "warning" || risk.state === "unknown") status = "needs_confirmation";
+  }
+  repo.updateImportPlan(planId, { risk_json: JSON.stringify(risk), risk_state: risk.state, status });
+  return getPlanView(repo, planId);
+}
+
+/**
+ * 执行前 precheck（含风险重扫）：风险扫描器版本/摘要与计划快照不一致 → 写回新风险并 blocked。
+ * 返回 risks 供 UI/日志；风险一致才允许继续执行。
+ */
+export async function precheckImportPlanWithRisk(repo: Repo, planId: number): Promise<{ plan: any; items: any[]; changed: any[]; risks: PlanRiskSummary }> {
+  const checked = precheckImportPlan(repo, planId);
+  const current = await computePlanRisk(repo, planId);
+  const stored = safeJson(checked.plan.risk_json) as PlanRiskSummary | null;
+  if (!stored) {
+    // 计划由旧版本/服务直建时没有风险快照：先补扫一次；warning/unknown 要求确认，blocked 阻断。
+    let status = String(checked.plan.status);
+    if (!checked.plan.user_confirmed) {
+      if (current.state === "blocked") status = "blocked";
+      else if (current.state === "warning" || current.state === "unknown") status = "needs_confirmation";
+    }
+    repo.updateImportPlan(planId, { risk_json: JSON.stringify(current), risk_state: current.state, status });
+    if (status === "blocked") throw appErr("RISK_BLOCKED", "包内风险规则阻断导入", 409);
+    if (status === "needs_confirmation" && !checked.plan.user_confirmed) throw appErr("CONFIRM_REQUIRED", "风险扫描需要人工确认后才能执行", 409);
+    return { ...checked, plan: { ...checked.plan, risk_json: JSON.stringify(current), risk_state: current.state, status }, risks: current };
+  }
+  const mismatch = Number(stored.scannerVersion) !== current.scannerVersion || String(stored.digest) !== current.digest || String(checked.plan.risk_state ?? "") !== current.state;
+  if (mismatch) {
+    repo.updateImportPlan(planId, {
+      risk_json: JSON.stringify(current), risk_state: current.state, status: "blocked",
+      precheck_json: JSON.stringify({ checkedAt: nowIso(), riskChanged: true, previous: { scannerVersion: stored.scannerVersion, digest: stored.digest, state: stored.state }, current: { scannerVersion: current.scannerVersion, digest: current.digest, state: current.state } }),
+    });
+    throw appErr("RISK_CHANGED", "风险扫描与计划快照不一致（版本/摘要变化），已阻断，请重新确认", 409);
+  }
+  return { ...checked, risks: stored };
+}
+
 export function precheckImportPlan(repo: Repo, planId: number): { plan: any; items: any[]; changed: any[] } {
   const plan = repo.getImportPlan(planId);
   if (!plan) throw appErr("NOT_FOUND", "计划不存在", 404);
   if (plan.status === "blocked") throw appErr("PLAN_BLOCKED", "计划已被阻断（precheck 失败）", 409);
+  if (plan.risk_state === "blocked") throw appErr("RISK_BLOCKED", "计划被风险规则阻断，不能执行", 409);
+  if (!plan.user_confirmed && (plan.risk_state === "warning" || plan.risk_state === "unknown")) {
+    throw appErr("RISK_REQUIRES_ACK", "计划包含风险内容，需要 riskAck 确认后才能执行", 409);
+  }
   if (!plan.user_confirmed && plan.status === "needs_confirmation") throw appErr("CONFIRM_REQUIRED", "计划需要人工确认后才能执行", 409);
   // 已执行/失败/执行中的计划不允许再次执行（外部副作用不可重放；需要重跑请重新建计划）
   if (!["ready", "needs_confirmation"].includes(String(plan.status))) {
@@ -621,8 +794,74 @@ function recordPreflightFailure(repo: Repo, planId: number, err: unknown): void 
       console_errors: JSON.stringify([code + ": " + message]),
       summary_json: JSON.stringify({ phase: "preflight", error: { code, message }, total: items.length, failed: items.length }),
     });
-    repo.updateImportPlan(planId, { status: "failed" });
+    // precheck 已把计划置 blocked（风险/指纹）时保留 blocked 语义，只有真正执行失败才落 failed
+    const cur = repo.getImportPlan(planId);
+    if (cur && !["blocked", "needs_confirmation"].includes(String(cur.status))) repo.updateImportPlan(planId, { status: "failed" });
   } catch { /* 审计记录失败不掩盖原始错误 */ }
+}
+
+/** task-51：staging 台账清理。verified/partial_success 结束即清理；unknown/failed 保留（供 7 天 sweep）。 */
+export function cleanupStagingForRun(repo: Repo, runId: number, status: string): { removed: number; failed: number; kept: number } {
+  const rows = repo.listStagingFiles({ runId, limit: 2000 });
+  if (!["verified", "partial_success"].includes(String(status))) return { removed: 0, failed: 0, kept: rows.length };
+  let removed = 0; let failed = 0;
+  for (const row of rows) {
+    repo.updateStagingFile(row.id, { state: "cleanup_pending" });
+    try { unlinkSync(String(row.path)); repo.deleteStagingFile(row.id); removed++; }
+    catch (e) {
+      if ((e as any)?.code === "ENOENT") { repo.deleteStagingFile(row.id); removed++; continue; }
+      failed++;
+      repo.updateStagingFile(row.id, { state: "cleanup_failed", cleanup_error: String((e as Error)?.message ?? e).slice(0, 300), cleanup_attempts: Number(row.cleanup_attempts ?? 0) + 1 });
+    }
+  }
+  return { removed, failed, kept: rows.length - removed - failed };
+}
+
+function underDir(parent: string, child: string): boolean {
+  const p = normalizePath(parent).replace(/\/+$/, "");
+  const c = normalizePath(child);
+  return c === p || c.startsWith(p + "/");
+}
+
+export interface StagingSweepResult { candidates: number; removed: number; failed: number; skipped: number; errors: string[] }
+
+/**
+ * task-51：清理过期 staging（默认 >7 天且非活跃）。安全边界：
+ * 路径必须在 stagingDir 内、拒绝符号链接、只删已登记行；dryRun 只报告不写库/不删文件。
+ */
+export function sweepStaging(repo: Repo, stagingDir: string, opts: { olderThanDays?: number; dryRun?: boolean; now?: number } = {}): StagingSweepResult {
+  const days = Math.max(0, Number(opts.olderThanDays ?? 7));
+  const dryRun = opts.dryRun === true;
+  const nowMs = Number(opts.now ?? Date.now());
+  const cutoff = new Date(nowMs - days * 86_400_000).toISOString();
+  const rows = repo.listStaleStagingFiles(cutoff, 1000);
+  const res: StagingSweepResult = { candidates: 0, removed: 0, failed: 0, skipped: 0, errors: [] };
+  for (const row of rows) {
+    const path = String(row.path);
+    if (!underDir(stagingDir, path)) { res.skipped++; res.errors.push("越界路径，拒绝清理: " + path); if (!dryRun) repo.updateStagingFile(row.id, { cleanup_error: "路径不在 unity-staging 内" }); continue; }
+    try {
+      const st = lstatSync(path);
+      if (st.isSymbolicLink()) { res.skipped++; res.errors.push("符号链接，拒绝清理: " + path); if (!dryRun) repo.updateStagingFile(row.id, { cleanup_error: "符号链接，拒绝清理" }); continue; }
+    } catch (e) {
+      if ((e as any)?.code === "ENOENT") { res.candidates++; if (!dryRun) { repo.deleteStagingFile(row.id); res.removed++; } continue; }
+      res.failed++; res.errors.push("无法 stat: " + path); continue;
+    }
+    // 活跃执行中的 staging 不清理
+    const run = row.run_id ? repo.getImportRun(Number(row.run_id)) : null;
+    if (run && (run.status === "running" || run.status === "prechecking")) { res.skipped++; continue; }
+    res.candidates++;
+    if (dryRun) continue;
+    try { unlinkSync(path); repo.deleteStagingFile(row.id); res.removed++; }
+    catch (e) {
+      res.failed++;
+      repo.updateStagingFile(row.id, { state: "cleanup_failed", cleanup_error: String((e as Error)?.message ?? e).slice(0, 300), cleanup_attempts: Number(row.cleanup_attempts ?? 0) + 1 });
+    }
+  }
+  return res;
+}
+
+export function sweepStagingOnStartup(repo: Repo, stagingDir: string): StagingSweepResult {
+  return sweepStaging(repo, stagingDir, { olderThanDays: 7, dryRun: false });
 }
 
 /** 执行计划：逐单元独立状态；命令返回 ≠ 验证成功。 */
@@ -642,7 +881,7 @@ export async function executeImportPlan(deps: ExecuteDeps, planId: number): Prom
   }
   let checked: { plan: any; items: any[] };
   try {
-    checked = precheckImportPlan(repo, planId);
+    checked = await precheckImportPlanWithRisk(repo, planId);
   } catch (e) {
     recordPreflightFailure(repo, planId, e);
     throw e;
@@ -665,52 +904,149 @@ export async function executeImportPlan(deps: ExecuteDeps, planId: number): Prom
   const runItems = items.map((it: any) => ({ it, ri: repo.addImportRunItem({ runId: run.id, planItemId: it.id, unitId: it.unit_id }) }));
   repo.updateImportPlan(planId, { status: "running" });
   const consoleAll: string[] = [];
-  let verified = 0; let partial = 0; let failed = 0;
+  let verified = 0; let partial = 0; let failed = 0; let unknown = 0; let cancelled = 0;
+  let checkedTotal = 0; let expectedTotal = 0; const scopes: string[] = [];
+  const verifyCtx: AnalyzeCtx = { cache: new Map(), budget: { packages: 0, bytes: 0, started: Date.now() } };
 
   for (const { it, ri } of runItems) {
-    repo.updateImportRunItem(ri.id, { status: "importing", started_at: nowIso() });
+    if (String(repo.getImportRun(run.id)?.status) === "cancelled") { cancelled++; continue; }
+    let phase = "staging";
+    let commandSent = false;
     try {
       const asset = repo.getAsset(Number(it.asset_id));
       if (!asset) throw appErr("NOT_FOUND", "资产不存在: " + it.asset_id, 404);
       // task-45：depth3 的 outer::inner::pkg 也递归解到 staging（原包内容，不生成筛选包）
       const stagedPath = await stageUnitPackage(asset, String(it.rel_path ?? ""), deps.stagingDir, String(it.unit_id));
+      let stagedSize = 0;
+      try { stagedSize = statSync(stagedPath).size; } catch { /* 记录 0 也保留台账 */ }
+      repo.registerStagingFile({ path: stagedPath, size: stagedSize, planId, runId: run.id, jobId: deps.jobId ?? null, state: "in_use" });
+      if (String(repo.getImportRun(run.id)?.status) === "cancelled") {
+        cancelled++;
+        transitionRunItem(repo, ri.id, "cancelled", { finished_at: nowIso(), error: "CANCELLED: user cancelled", detail_json: JSON.stringify({ phase: "staging", possible_side_effect: false }) });
+        continue;
+      }
+      phase = "importing";
+      transitionRunItem(repo, ri.id, "importing", { started_at: nowIso() });
       await clearUnityConsole(unity);
       const r = await importPackagesIntoUnity(unity, [stagedPath]);
       if (r.failed.length > 0) {
         failed++;
-        repo.updateImportRunItem(ri.id, { status: "failed", finished_at: nowIso(), error: r.failed.join("; "), detail_json: JSON.stringify({ stagedPath, raw: r.raw }) });
+        transitionRunItem(repo, ri.id, "failed", { finished_at: nowIso(), error: r.failed.join("; "), detail_json: JSON.stringify({ stagedPath, raw: r.raw, phase: "importing", possible_side_effect: false }) });
         continue;
       }
-      repo.updateImportRunItem(ri.id, { status: "import_command_completed", detail_json: JSON.stringify({ stagedPath, queued: r.queued, raw: r.raw }) });
-      repo.updateImportRunItem(ri.id, { status: "verifying" });
+      commandSent = true; phase = "verifying";
+      transitionRunItem(repo, ri.id, "import_command_completed", { detail_json: JSON.stringify({ stagedPath, queued: r.queued, raw: r.raw }) });
+      transitionRunItem(repo, ri.id, "verifying");
+      if (String(repo.getImportRun(run.id)?.status) === "cancelled") {
+        cancelled++;
+        transitionRunItem(repo, ri.id, "cancelled", { finished_at: nowIso(), error: "CANCELLED: user cancelled", detail_json: JSON.stringify({ phase: "verifying", possible_side_effect: true }) });
+        continue;
+      }
       await sleep(deps.waitMs ?? 1500);
+      // 命令已发：先探活，读控制台内部会吞网络错误，不能作为断线判据
+      if (!(await unitySessionHealthy(unity))) throw appErr("UNITY_DISCONNECTED", "Unity 会话在导入命令发出后断开（可能已产生副作用）", 409);
       const errs = await readUnityConsole(unity, ["error"], 20);
       consoleAll.push(...errs);
-      const expected = repo.listUnitypackageGuids(Number(it.asset_id));
-      const matched = verifyGuids(String(plan.project_path), expected, 20);
-      const detail = { stagedPath, consoleErrors: errs, guidsExpected: expected.slice(0, 20).length, guidsMatched: matched, policy: it.policy, relPath: it.rel_path };
-      if (matched.length >= 1 && errs.length === 0) {
+      // task-51：expected GUID ≤500 全量、>500 抽样；工程 .meta 全量扫描后比对
+      let expectedGuids = repo.listUnitypackageGuids(Number(it.asset_id));
+      if (expectedGuids.length === 0) {
+        const parsed = await readPackageAssetPaths(asset, String(it.rel_path ?? ""), verifyCtx);
+        if (parsed.ok) expectedGuids = parsed.guids;
+      }
+      const cov = verifyCoverage(String(plan.project_path), expectedGuids);
+      if (!cov.ok) {
+        unknown++;
+        const cur = String(repo.getImportRunItem(ri.id)?.status ?? "verifying");
+        if (canTransitionRunItem(cur, "unknown")) {
+          repo.updateImportRunItem(ri.id, {
+            status: "unknown", finished_at: nowIso(), error: "UNKNOWN: " + (cov.detail ?? "无法验证"),
+            detail_json: JSON.stringify({ phase: "verifying", possible_side_effect: true, verification: cov, policy: it.policy, relPath: it.rel_path }),
+          });
+        }
+        continue;
+      }
+      checkedTotal += cov.checked; expectedTotal += cov.expected; scopes.push(cov.scope);
+      const detail = { stagedPath, consoleErrors: errs, verificationScope: cov.scope, checked: cov.checked, expected: cov.expected, found: cov.found, missing: cov.missing, missingGuids: cov.missingGuids, policy: it.policy, relPath: it.rel_path };
+      if (cov.missing === 0 && errs.length === 0) {
         verified++;
-        repo.updateImportRunItem(ri.id, { status: "verified", finished_at: nowIso(), detail_json: JSON.stringify(detail) });
+        transitionRunItem(repo, ri.id, "verified", { finished_at: nowIso(), detail_json: JSON.stringify(detail) });
       } else {
         partial++;
-        repo.updateImportRunItem(ri.id, { status: "partial_success", finished_at: nowIso(), detail_json: JSON.stringify(detail) });
+        transitionRunItem(repo, ri.id, "partial_success", { finished_at: nowIso(), detail_json: JSON.stringify(detail) });
       }
     } catch (e) {
       const msg = (e as Error)?.message ?? String(e);
-      failed++;
-      repo.updateImportRunItem(ri.id, { status: "failed", finished_at: nowIso(), error: msg, detail_json: JSON.stringify({ relPath: it.rel_path, policy: it.policy }) });
-      log("import plan " + planId + " unit " + it.unit_id + " failed: " + msg);
+      const code = String((e as any)?.code ?? "");
+      const disconnected = commandSent || /UPSTREAM|HTTP|session|connect|socket|ECONN|timeout|abort|disconnect/i.test(msg + " " + code);
+      if (disconnected) {
+        // 命令可能已送达：unknown（可能产生副作用），绝不自动重试
+        unknown++;
+        const curStatus = String(repo.getImportRunItem(ri.id)?.status ?? "importing");
+        try {
+          if (canTransitionRunItem(curStatus, "unknown")) {
+            repo.updateImportRunItem(ri.id, { status: "unknown", finished_at: nowIso(), error: "UNKNOWN: " + msg, detail_json: JSON.stringify({ phase, possible_side_effect: commandSent, relPath: it.rel_path, policy: it.policy }) });
+          }
+        } catch { /* 状态已终态 */ }
+        log("import plan " + planId + " unit " + it.unit_id + " unknown: " + msg);
+      } else {
+        failed++;
+        const curStatus = String(repo.getImportRunItem(ri.id)?.status ?? "importing");
+        if (canTransitionRunItem(curStatus, "failed")) {
+          repo.updateImportRunItem(ri.id, { status: "failed", finished_at: nowIso(), error: msg, detail_json: JSON.stringify({ relPath: it.rel_path, policy: it.policy, phase }) });
+        }
+        log("import plan " + planId + " unit " + it.unit_id + " failed: " + msg);
+      }
     }
   }
 
-  const status = failed === runItems.length ? "failed" : verified === runItems.length ? "verified" : "partial_success";
+  const runNow = repo.getImportRun(run.id);
+  const wasCancelled = String(runNow?.status) === "cancelled";
+  const status = wasCancelled ? "cancelled"
+    : unknown > 0 ? "unknown"
+    : failed === runItems.length ? "failed"
+    : verified === runItems.length ? "verified"
+    : "partial_success";
+  const verificationScope = scopes.length === 0 ? null : scopes.some((s) => s === "sampled") ? "sampled" : "all";
   const updatedRun = repo.updateImportRun(run.id, {
     status, finished_at: nowIso(), console_errors: JSON.stringify(consoleAll.slice(0, 100)),
-    summary_json: JSON.stringify({ total: runItems.length, verified, partial_success: partial, failed }),
+    verification_scope: verificationScope, checked_count: checkedTotal, expected_count: expectedTotal,
+    summary_json: JSON.stringify({ total: runItems.length, verified, partial_success: partial, failed, unknown, cancelled, verificationScope, checked: checkedTotal, expected: expectedTotal, phase: wasCancelled ? "cancelled" : "done" }),
   });
-  repo.updateImportPlan(planId, { status: status === "verified" ? "executed" : status === "failed" ? "failed" : "executed" });
+  // verified/partial_success 结束后清 staging；unknown/failed 保留（7 天后 sweep）
+  cleanupStagingForRun(repo, run.id, status);
+  const planStatus = status === "verified" || status === "partial_success" ? "executed" : status;
+  repo.updateImportPlan(planId, { status: planStatus });
   return { run: updatedRun, items: repo.listImportRunItems(run.id) };
+}
+
+/**
+ * task-51：取消执行（不自动重试）。已进入导入/验证阶段的 item 标 possible_side_effect=true。
+ * 幂等：终态 run 原样返回。
+ */
+export function cancelImportRun(repo: Repo, runId: number): { run: any; items: any[] } {
+  const run = repo.getImportRun(runId);
+  if (!run) throw appErr("NOT_FOUND", "执行记录不存在", 404);
+  const terminal = ["verified", "partial_success", "failed", "unknown", "cancelled", "interrupted"];
+  if (!terminal.includes(String(run.status))) {
+    let possible = false;
+    for (const it of repo.listImportRunItems(runId)) {
+      if (["verified", "partial_success", "failed", "unknown", "cancelled"].includes(String(it.status))) continue;
+      const phase = String(it.status);
+      const sideEffect = ["importing", "import_command_completed", "verifying"].includes(phase);
+      if (sideEffect) possible = true;
+      if (canTransitionRunItem(phase, "cancelled")) {
+        repo.updateImportRunItem(it.id, {
+          status: "cancelled", finished_at: nowIso(), error: "CANCELLED: user cancelled",
+          detail_json: JSON.stringify({ phase, possible_side_effect: sideEffect }),
+        });
+      }
+    }
+    repo.updateImportRun(runId, {
+      status: "cancelled", finished_at: nowIso(),
+      summary_json: JSON.stringify({ phase: "cancelled", possible_side_effect: possible }),
+    });
+  }
+  return getRunView(repo, runId)!;
 }
 
 export function getRunView(repo: Repo, runId: number): { run: any; items: any[] } | null {

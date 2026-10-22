@@ -6,8 +6,9 @@ import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/sr
 /** 数据库结构版本：v1=15 张核心表；v2=物品分类；v3=分类体系 v3；v4=扫描变更中心；v5=深度索引流水线/派生缓存；
  *  v6=jobs 租约/心跳列（辅助元数据，不改状态机）+ cache_entries.weak（缓存弱身份标记）；
  *  v7=index_tasks 租约围栏列（owner/lease_token/job_id）+ (job_id,state) 索引；
- *  v8=工作台：asset_units/unit_relations + import_plans/plan_items/runs/run_items（新表，无老表改列） */
-export const SCHEMA_VERSION = 8;
+ *  v8=工作台：asset_units/unit_relations + import_plans/plan_items/runs/run_items（新表，无老表改列）；
+ *  v9=导入可靠性：import_plans.risk_json/risk_state、import_runs.verification_scope/checked/expected + staging_files */
+export const SCHEMA_VERSION = 9;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 
@@ -47,6 +48,12 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   { table: "index_tasks", column: "owner", ddl: "TEXT" },
   { table: "index_tasks", column: "lease_token", ddl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "index_tasks", column: "job_id", ddl: "INTEGER" },
+  // v9：导入风险/验证覆盖（老库补列；新库由 schema.sql 建）
+  { table: "import_plans", column: "risk_json", ddl: "TEXT" },
+  { table: "import_plans", column: "risk_state", ddl: "TEXT" },
+  { table: "import_runs", column: "verification_scope", ddl: "TEXT" },
+  { table: "import_runs", column: "checked_count", ddl: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "import_runs", column: "expected_count", ddl: "INTEGER NOT NULL DEFAULT 0" },
 ];
 
 function tableColumns(db: Database.Database, table: string): Set<string> {

@@ -2,7 +2,9 @@
 import { build } from "esbuild";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { copyFileSync } from "node:fs";
+import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..");
@@ -18,4 +20,13 @@ await build({
 });
 // schema.sql 必须与 bundle 同目录：运行时用 new URL("./schema.sql", import.meta.url) 定位
 copyFileSync(join(repoRoot, "apps", "server", "src", "db", "schema.sql"), join(here, "build", "schema.sql"));
-console.log("server bundle -> apps/desktop/build/server.mjs (+ schema.sql)");
+
+// task-51：构建信息（/api/health 暴露；CLI 启动与 package.json 版本比对告警）
+const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+let commit = "unknown";
+try { commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim(); } catch { /* 非 git 构建 */ }
+const serverSha256 = createHash("sha256").update(readFileSync(join(here, "build", "server.mjs"))).digest("hex");
+writeFileSync(join(here, "build", "build-info.json"), JSON.stringify({
+  version: String(pkg.version ?? "0.0.0"), commit, builtAt: new Date().toISOString(), serverSha256,
+}, null, 2) + "\n");
+console.log("server bundle -> apps/desktop/build/server.mjs (+ schema.sql, build-info.json)");

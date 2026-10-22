@@ -12,7 +12,8 @@ import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
-import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlan, getRunView } from "../services/structure";
+import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlanWithRisk, applyPlanRisk, getRunView, cancelImportRun, sweepStaging } from "../services/structure";
+import { unityMcpBoundary } from "../services/unity";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
@@ -41,6 +42,8 @@ export interface RouteDeps {
   pipeline?: IndexPipeline | null;
   cache?: DerivedCache;
   limits?: PipelineLimits;
+  /** task-51：构建信息（/api/health.build；开发运行可为 null） */
+  build?: any;
 }
 
 const DEFAULT_DOWNLOAD_SUBDIR = "downloads";
@@ -245,6 +248,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.get("/api/health", async () => ({
     ok: true, version: deps.version, dbPath: deps.dbPath,
     roots: repo.listRoots(), counts: repo.stats(),
+    unity_mcp: unityMcpBoundary(repo),
+    build: deps.build ?? null,
   }));
 
   // ---------- items ----------
@@ -1848,8 +1853,19 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const b = (req.body ?? {}) as any;
       const unitIds = Array.isArray(b.unitIds) ? b.unitIds.map((n: any) => toInt(n, 0)).filter((n: number) => n > 0) : [];
       const batch = createImportPlanBatch(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
-      // 单 item 保持原契约 {plan,items,precheck}；跨 item 返回 {plans:[...]}（失败组带 error，隔离）
-      return reply.status(201).send(batch.single ? batch.view : { plans: batch.plans });
+      // task-51：建计划即写入风险；warning/unknown → needs_confirmation，blocked → blocked
+      if (batch.single) {
+        const withRisk = (await applyPlanRisk(repo, batch.view.plan.id)) ?? batch.view;
+        return reply.status(201).send(withRisk);
+      }
+      const plans = [];
+      for (const p of batch.plans) {
+        if (p?.plan?.id) {
+          const view = (await applyPlanRisk(repo, p.plan.id)) ?? p;
+          plans.push({ itemId: p.itemId, ...view });
+        } else plans.push(p);
+      }
+      return reply.status(201).send({ plans });
     } catch (e) { return fail(reply, e); }
   });
 
@@ -1862,8 +1878,10 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   });
 
   app.post("/api/import-plans/:id/confirm", async (req, reply) => {
-    try { return confirmImportPlan(repo, toInt((req.params as any).id, 0)); }
-    catch (e) { return fail(reply, e); }
+    try {
+      const b = (req.body ?? {}) as any;
+      return confirmImportPlan(repo, toInt((req.params as any).id, 0), { riskAck: b.riskAck === true });
+    } catch (e) { return fail(reply, e); }
   });
 
   /**
@@ -1873,7 +1891,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/import-plans/:id/execute", async (req, reply) => {
     try {
       const planId = toInt((req.params as any).id, 0);
-      const pre = precheckImportPlan(repo, planId);
+      const pre = await precheckImportPlanWithRisk(repo, planId);
       const inflight = repo.findInflightImportJob(planId);
       if (inflight) {
         return reply.status(409).send({ error: { code: "CONFLICT", message: "该计划已有执行作业在跑", jobId: inflight.id } });
@@ -1888,6 +1906,38 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const view = getRunView(repo, toInt((req.params as any).id, 0));
       if (!view) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "执行记录不存在" } });
       return view;
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** task-51：取消执行（终态幂等；可能副作用写 possible_side_effect）。 */
+  app.post("/api/import-runs/:id/cancel", async (req, reply) => {
+    try { return cancelImportRun(repo, toInt((req.params as any).id, 0)); }
+    catch (e) { return fail(reply, e); }
+  });
+
+  /** task-51：staging 台账查询。 */
+  app.get("/api/staging", async (req, reply) => {
+    try {
+      const q = req.query as any;
+      const files = repo.listStagingFiles({
+        state: q.state ? String(q.state) : undefined,
+        runId: q.runId ? toInt(q.runId, 0) || undefined : undefined,
+        planId: q.planId ? toInt(q.planId, 0) || undefined : undefined,
+        limit: q.limit ? toInt(q.limit, 500) : 500,
+      });
+      return { stagingDir: join(deps.dataDir, "unity-staging"), files };
+    } catch (e) { return fail(reply, e); }
+  });
+
+  /** task-51：清理过期 staging（dryRun 只报告；只删 dataDir/unity-staging 内已登记行）。 */
+  app.post("/api/staging/cleanup", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const res = sweepStaging(repo, join(deps.dataDir, "unity-staging"), {
+        olderThanDays: b.olderThanDays !== undefined ? Number(b.olderThanDays) : 7,
+        dryRun: b.dryRun === true,
+      });
+      return res;
     } catch (e) { return fail(reply, e); }
   });
 

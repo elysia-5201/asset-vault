@@ -1,22 +1,22 @@
 # v0.7.0 结构验收明细（task-40）
 
-> 自动生成：`node --import tsx scripts/acceptance-structure.mjs`；2026-10-22T10:47:18.428Z
+> 自动生成：`node --import tsx scripts/acceptance-structure.mjs`；2026-10-22T11:48:23.209Z
 > 结果：**PASS**（PASS 54 / FAIL 0 / SKIP 0）
 
 ## 夹具（真实 zip / tar.gz，含 asset.meta guid）
 
 | 文件 | 大小 | sha256 |
 |---|---|---|
-| A_multi_container.zip | 1351 | `1d39f6e7e4f104d48e9f97568e256652…` |
-| B_mixed.unitypackage | 381 | `70e503b68d02484ac6e9aece20a22437…` |
-| C_container_mixed.zip | 542 | `4d99be216a86ab983e50989242430876…` |
-| D_companion.zip | 1268 | `3d49aea335d06666f3bd4c6958364ccb…` |
+| A_multi_container.zip | 1351 | `270c94269ec0c0f9c1ea7d1088e0d859…` |
+| B_mixed.unitypackage | 381 | `cc71f701abdeb7853cafd46ffe67e1a6…` |
+| C_container_mixed.zip | 542 | `3e82fcfa1e0bd920bb441da4fd724cdb…` |
+| D_companion.zip | 1268 | `1a9c0882f6cd925e52d0b4ffeef86c7d…` |
 | E1_corrupt.zip | 126 | `faac88191b7a64cbb658816526fa8e13…` |
-| E2_truncated.unitypackage | 199 | `81734fec3ca5c7bafbd1b0191a1e590f…` |
-| E3_overlimit.zip | 6671 | `21d90034d5fb26618bcc3b762dff6c46…` |
-| E4_zipslip.zip | 514 | `95e28162e43e7155927a9d5842cd0dce…` |
-| E5_depth4.zip | 744 | `2bcd746f7971db6b1109d4004d99e153…` |
-| E5_nested3.zip | 561 | `5e286dfaafbf685eeb12a78e5868d663…` |
+| E2_truncated.unitypackage | 199 | `107b35f7440c6634edd4a149aeaddee7…` |
+| E3_overlimit.zip | 6671 | `c982976b86141a4c254eefdb9e1a3c72…` |
+| E4_zipslip.zip | 514 | `3501a5c427b6903242528d2efa0c110a…` |
+| E5_depth4.zip | 741 | `2b74dd47765df0ec5a033435f2578425…` |
+| E5_nested3.zip | 560 | `386a50a93c2a25226d4a949bee876ce6…` |
 
 ## 明细
 
@@ -42,7 +42,7 @@
 | E4-2 | E | 显式读取越界条目被拒绝（不存在/非法输入） | PASS | code=NOT_FOUND |
 | E4-3 | E | 若路径逃逸，isSubPath 可判定（防御对照） | PASS | normalized=../../../evil.unitypackage |
 | E5-1 | E | 嵌套 3 层可逐层解出 upkg | PASS | depth=3 assets=1 |
-| E6-1 | E | 文件被改后 sha256 变化（指纹可检出） | PASS | 70e503b68d02484a -> beeb931af0e885f1 |
+| E6-1 | E | 文件被改后 sha256 变化（指纹可检出） | PASS | cc71f701abdeb785 -> 5c5320a5aed57503 |
 | E6-2 | E | 被改后的文件不再被当作完整包（抛错或 truncated/assets 变化） | PASS | code=NOT_AN_ARCHIVE |
 | G-1 | G | 全部夹具解析后原始 sha256 / mtime 不变（解析只读） | PASS |  |
 | P-7 | POLICY | evidence：别名/大小写/全半角命中并被合并 | PASS | [{"avatarId":1,"via":"filename","level":"probable","hits":["MANUKA.unitypackage","マヌカ","ＭＡＮＵＫＡ"]}] |
@@ -61,14 +61,14 @@
 | B-1c | PLAN | includeSuggested=true（真实 analyze 关系）：加入伴生单元且标 suggested | PASS | items=["MANUKA_material.unitypackage:pending","MANUKA_model.unitypackage:pending","MANUKA_texture.unitypackage:suggested"] relations=3 |
 | B-1e | PLAN | 正例对照：有关系时 includeSuggested 加入且仅标 suggested | PASS | ["MANUKA_texture.unitypackage:pending","MANUKA_material.unitypackage:suggested"] |
 | B-2a | PLAN | B 单元 policy=mixed_unitypackage 且可导入 | PASS | mixed_unitypackage |
-| B-2b | PLAN | mixed plan_item.path === 原始整包路径 | PASS | /tmp/av-structure-Rj7aiv/e2e/B_mixed.unitypackage |
+| B-2b | PLAN | mixed plan_item.path === 原始整包路径 | PASS | /tmp/av-structure-xigoPK/e2e/B_mixed.unitypackage |
 | B-2c | PLAN | 计划阶段不产生暂存/筛选包（目录未新增文件） | PASS | dirs=B_mixed.unitypackage,D_companion.zip,UnityProject |
 | B-2d | PLAN | mixed 计划需人工确认（不自动执行） | PASS | needs_confirmation |
 | B-3a | PLAN | 单包计划建立（ready） | PASS | ready |
 | B-3b | PLAN | 改文件后 precheck → FINGERPRINT_CHANGED 且计划 blocked | PASS | code=FINGERPRINT_CHANGED |
 | B-3c | PLAN | execute 同样被拦截（不执行外部导入） | PASS | code=PLAN_BLOCKED |
 | B-4a | PLAN | Unity 不可用 → execute 被拦截（UNITY_UNAVAILABLE） | PASS | code=UNITY_UNAVAILABLE |
-| B-4b | PLAN | 执行前后源文件 sha256 不变 | PASS | c6a2c026799f65c4 -> c6a2c026799f65c4 |
+| B-4b | PLAN | 执行前后源文件 sha256 不变 | PASS | d1ddd31e0e5f95c5 -> d1ddd31e0e5f95c5 |
 | B-4c | PLAN | 前置失败落 failed run（summary.phase=preflight） | PASS | run={"id":1,"status":"failed","phase":"preflight"} |
 | B-4d | PLAN | 每个 plan_item 一条 failed run_item（可审计） | PASS | runItems=["failed"] |
 | B-4e | PLAN | plan.lastError.code=UNITY_UNAVAILABLE（phase 见 run.summary） | PASS | {"code":"UNITY_UNAVAILABLE","message":"Unity 编辑器不可用或未返回工程路径"} summaryPhase=preflight |

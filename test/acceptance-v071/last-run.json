@@ -1,0 +1,318 @@
+{
+  "at": "2026-10-22T11:48:22.746Z",
+  "banner": "PASS",
+  "counts": {
+    "PASS": 42,
+    "BLOCKED": 2
+  },
+  "rows": [
+    {
+      "id": "S1",
+      "area": "SCHEMA",
+      "desc": "v9：import_plans.risk_json/risk_state + import_runs.verification_scope/checked_count/expected_count 存在",
+      "status": "PASS",
+      "detail": "plan=risk_json,risk_state run=verification_scope,checked_count,expected_count"
+    },
+    {
+      "id": "S2",
+      "area": "SCHEMA",
+      "desc": "staging_files 台账表存在（v9）",
+      "status": "PASS",
+      "detail": "tables=staging_files"
+    },
+    {
+      "id": "S3",
+      "area": "SCHEMA",
+      "desc": "migrate 幂等（连续两次执行版本一致）",
+      "status": "PASS",
+      "detail": "version=9→9 (SCHEMA_VERSION=9)"
+    },
+    {
+      "id": "R0a",
+      "area": "RISK",
+      "desc": "风险夹具解析出可导入单元（前置）",
+      "status": "PASS",
+      "detail": "risky.unitypackage:single_unitypackage:imp=1"
+    },
+    {
+      "id": "R0b",
+      "area": "RISK",
+      "desc": "applyPlanRisk 落库 risks（scannerVersion/digest/hits/state）",
+      "status": "PASS",
+      "detail": "{\"v\":2,\"digest\":\"60d8d46cdf45\",\"state\":\"warning\",\"hits\":4}"
+    },
+    {
+      "id": "R1",
+      "area": "RISK",
+      "desc": ".cs → hits 含 code/editor_code；计划进入 needs_confirmation（或 blocked）",
+      "status": "PASS",
+      "detail": "types=assembly,code,editor_code,asmdef state=warning status=needs_confirmation"
+    },
+    {
+      "id": "R2",
+      "area": "RISK",
+      "desc": ".dll → hits 含 assembly",
+      "status": "PASS",
+      "detail": "types=assembly,code,editor_code,asmdef"
+    },
+    {
+      "id": "R3",
+      "area": "RISK",
+      "desc": "Editor/ 下 .cs → 单独归为 editor_code",
+      "status": "PASS",
+      "detail": "types=assembly,code,editor_code,asmdef"
+    },
+    {
+      "id": "R4",
+      "area": "RISK",
+      "desc": ".asmdef → hits 含 asmdef 且 severity=info",
+      "status": "PASS",
+      "detail": "{\"path\":\"Assets/Data/Evil.asmdef\",\"type\":\"asmdef\",\"reason\":\".asmdef/.asmref 会改变程序集与编译边界\",\"severity\":\"info\"}"
+    },
+    {
+      "id": "R5",
+      "area": "RISK",
+      "desc": "大小写/反斜杠（ASSETS\\\\EDITOR\\\\Bad.CS、.DLL）→ editor_code + assembly",
+      "status": "PASS",
+      "detail": "types=assembly,editor_code"
+    },
+    {
+      "id": "R6a",
+      "area": "RISK",
+      "desc": "scanPaths+magic：pdf→PK / png→MZ 判 disguised；zip→PK、pdf→%PDF 不误报",
+      "status": "PASS",
+      "detail": "pdf=[\"disguised\"] png=[\"disguised\"] zip=[] realPdf=[]"
+    },
+    {
+      "id": "R6b",
+      "area": "RISK",
+      "desc": "computePlanRisk 接 magic：真实 .pdf（内容 zip）→ disguised",
+      "status": "PASS",
+      "detail": "state=warning types=[\"disguised\"] path=/tmp/av-v071-6IEkQy/fixtures/disguised_container.pdf"
+    },
+    {
+      "id": "R7",
+      "area": "RISK",
+      "desc": "损坏包 → 无可导入单元（unknown/limited，不伪造成功）",
+      "status": "PASS",
+      "detail": "unknown_structure:failed:imp=0"
+    },
+    {
+      "id": "R8",
+      "area": "RISK",
+      "desc": "unknown/limited 单元建计划被拒（INVALID_INPUT）",
+      "status": "PASS",
+      "detail": "code=INVALID_INPUT"
+    },
+    {
+      "id": "R9",
+      "area": "RISK",
+      "desc": "blocked 风险计划 confirm → RISK_BLOCKED（即使 ack 也不放行）",
+      "status": "PASS",
+      "detail": "code=RISK_BLOCKED"
+    },
+    {
+      "id": "R9b",
+      "area": "RISK",
+      "desc": "blocked + riskAck=true 仍 → RISK_BLOCKED（风险阻断不可确认）",
+      "status": "PASS",
+      "detail": "code=RISK_BLOCKED"
+    },
+    {
+      "id": "R10a",
+      "area": "RISK",
+      "desc": "warning 计划未 ack → RISK_REQUIRES_ACK",
+      "status": "PASS",
+      "detail": "code=RISK_REQUIRES_ACK"
+    },
+    {
+      "id": "R10b",
+      "area": "RISK",
+      "desc": "riskAck 后 → ready 且 risk_json 记 risk_ack_at/risk_ack_digest",
+      "status": "PASS",
+      "detail": "status=ready ackAt=2026-10-22T11:48:22 digest=digest-x"
+    },
+    {
+      "id": "P1",
+      "area": "PLAN",
+      "desc": "干净单包计划建立（ready）",
+      "status": "PASS",
+      "detail": "ready"
+    },
+    {
+      "id": "P2",
+      "area": "PLAN",
+      "desc": "指纹变化 → FINGERPRINT_CHANGED 且计划 blocked",
+      "status": "PASS",
+      "detail": "code=FINGERPRINT_CHANGED"
+    },
+    {
+      "id": "U1",
+      "area": "UNKNOWN",
+      "desc": "正常执行完成且只发出 1 次 ImportPackage",
+      "status": "PASS",
+      "detail": "run=partial_success importCalls=1 items=partial_success"
+    },
+    {
+      "id": "U2",
+      "area": "UNKNOWN",
+      "desc": "已执行计划不可二次执行（无第二次外部导入）",
+      "status": "PASS",
+      "detail": "code=PLAN_NOT_EXECUTABLE importCalls=1"
+    },
+    {
+      "id": "U3",
+      "area": "UNKNOWN",
+      "desc": "run_items 全部终态（无 importing 半开）",
+      "status": "PASS",
+      "detail": "failed"
+    },
+    {
+      "id": "G1",
+      "area": "STAGING",
+      "desc": "台账 path_norm 唯一（同路径重复登记 → 1 行、size 更新）",
+      "status": "PASS",
+      "detail": "id=1 size=32"
+    },
+    {
+      "id": "G2",
+      "area": "STAGING",
+      "desc": "台账状态/重试计数可更新",
+      "status": "PASS",
+      "detail": "cleanup_pending/1"
+    },
+    {
+      "id": "G3",
+      "area": "STAGING",
+      "desc": "stale 查询按 last_used_at 截止（未来 cutoff → 命中）",
+      "status": "PASS",
+      "detail": "rows=1"
+    },
+    {
+      "id": "G4",
+      "area": "STAGING",
+      "desc": "台账行可删除",
+      "status": "PASS",
+      "detail": ""
+    },
+    {
+      "id": "G5",
+      "area": "STAGING",
+      "desc": "cleanupStagingForRun(failed/unknown) 保留台账与文件（供 7 天 sweep）",
+      "status": "PASS",
+      "detail": "{\"removed\":0,\"failed\":0,\"kept\":1}"
+    },
+    {
+      "id": "G6",
+      "area": "STAGING",
+      "desc": "cleanupStagingForRun(verified/partial_success) 删文件 + 删台账",
+      "status": "PASS",
+      "detail": "{\"removed\":1,\"failed\":0,\"kept\":0}"
+    },
+    {
+      "id": "G7",
+      "area": "STAGING",
+      "desc": "执行结束无 in_use 残留（cleanupStagingForRun 已执行）",
+      "status": "PASS",
+      "detail": "run=1 status=partial_success left=[]"
+    },
+    {
+      "id": "G8",
+      "area": "STAGING",
+      "desc": "sweepStaging dryRun 只报告不删（文件/台账保留）",
+      "status": "PASS",
+      "detail": "{\"candidates\":1,\"removed\":0,\"failed\":0,\"skipped\":0,\"errors\":[]}"
+    },
+    {
+      "id": "G9",
+      "area": "STAGING",
+      "desc": "sweepStaging 过期清理（删文件 + 删台账）",
+      "status": "PASS",
+      "detail": "{\"candidates\":1,\"removed\":1,\"failed\":0,\"skipped\":0,\"errors\":[]}"
+    },
+    {
+      "id": "G10",
+      "area": "STAGING",
+      "desc": "越界路径不删（stagingDir 之外）且记 skipped/errors",
+      "status": "PASS",
+      "detail": "{\"skipped\":1,\"errors\":[\"越界路径，拒绝清理: /tmp/av-v071-6IEkQy/outside-sweep.bin\"]}"
+    },
+    {
+      "id": "G11",
+      "area": "STAGING",
+      "desc": "活跃执行中的 staging 不清理（run.status=running）",
+      "status": "PASS",
+      "detail": "{\"skipped\":2,\"removed\":0}"
+    },
+    {
+      "id": "G12",
+      "area": "STAGING",
+      "desc": "符号链接拒绝清理（lstat isSymbolicLink）",
+      "status": "PASS",
+      "detail": "[\"越界路径，拒绝清理: /tmp/av-v071-6IEkQy/outside-sweep.bin\",\"符号链接，拒绝清理: /tmp/av-v071-6IEkQy/sweep/u3/link.unitypackage\"]"
+    },
+    {
+      "id": "G13",
+      "area": "STAGING",
+      "desc": "路由 GET /api/staging 与 POST /api/staging/cleanup 存在（源码 + bundle）",
+      "status": "PASS",
+      "detail": "src=true/true bundle=true"
+    },
+    {
+      "id": "B1",
+      "area": "BUILD",
+      "desc": "bundle 与 schema.sql 产物存在",
+      "status": "PASS",
+      "detail": "/root/Code/asset-vault/apps/desktop/build/server.mjs"
+    },
+    {
+      "id": "B2",
+      "area": "BUILD",
+      "desc": "bundle 含 v0.7.x 路由标记（/api/import-plans、/api/import-runs）",
+      "status": "PASS",
+      "detail": "import-plans=true import-runs=true"
+    },
+    {
+      "id": "B3",
+      "area": "BUILD",
+      "desc": "构建产物 schema.sql 与源码 byte-equal",
+      "status": "PASS",
+      "detail": "identical"
+    },
+    {
+      "id": "B4",
+      "area": "BUILD",
+      "desc": "scripts/verify-build.mjs 通过（bundle/路由/version/sha256/schema）",
+      "status": "PASS",
+      "detail": "status=0   [PASS] B5 build-info.commit 与 HEAD 一致 — build=3e93612f0c head=3e93612f0c / BUILD OK (6 checks)"
+    },
+    {
+      "id": "M1",
+      "area": "MACHINE",
+      "desc": "importing→unknown 允许；unknown 终态（→verified 抛 INVALID_TRANSITION）",
+      "status": "PASS",
+      "detail": "code=INVALID_TRANSITION"
+    },
+    {
+      "id": "M2",
+      "area": "MACHINE",
+      "desc": "cancelled 终态（→verified 抛 INVALID_TRANSITION）",
+      "status": "PASS",
+      "detail": "code=INVALID_TRANSITION"
+    },
+    {
+      "id": "X1",
+      "area": "UNITY",
+      "desc": "真实 Unity ImportPackage 端到端（AssetDatabase 实际导入 / 控制台 / GUID 验证）",
+      "status": "BLOCKED",
+      "detail": "MCP 离线，沿用 v0.7.0 UNVERIFIED；需在 Windows + Unity Editor 跑 scripts/acceptance.sh 或 scripts/win-acceptance.cmd"
+    },
+    {
+      "id": "X2",
+      "area": "UNITY",
+      "desc": "Windows 生产卷上的 staging 磁盘峰值（F8）",
+      "status": "BLOCKED",
+      "detail": "本机 tmpfs 不能代表 NTFS 配额/磁盘压力；需在准生产环境测"
+    }
+  ]
+}

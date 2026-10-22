@@ -16,7 +16,8 @@ import type {
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   PipelineEvent, PipelineOverview, PipelineStage, PipelineTask,
-  ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, WorkbenchAvatar, WorkbenchAvatarCounts, WorkbenchItem, WorkbenchItemQuery, WorkbenchItemsResponse,
+  ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, PlanRisk, StagingCleanupResult, StagingUsage, VerificationStats,
+  WorkbenchAvatar, WorkbenchAvatarCounts, WorkbenchItem, WorkbenchItemQuery, WorkbenchItemsResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
@@ -1181,6 +1182,40 @@ function precheckOf(raw: unknown): ImportPrecheck {
   const errors = arr<unknown>(o.errors).map((x) => errOf(x)).filter((x): x is { code: string; message: string } => !!x);
   return { ok: o.ok !== false, status: typeof o.status === "string" ? o.status : "", warnings, errors };
 }
+/**
+ * 风险扫描归一化：兼容扁平 { risk_state, risk_hits, risk_scan } 与嵌套 { risk:{state,hits,scan} }。
+ * 后端还没上这条字段时返回 state=""、hits=[]，UI 据此显示「未提供风险扫描」而不是假装 clear。
+ */
+function riskOf(raw: unknown): PlanRisk {
+  const r = raw && typeof raw === "object" ? rec(raw) : {};
+  const scan = r.scan && typeof r.scan === "object" ? rec(r.scan) : {};
+  return {
+    state: typeof r.state === "string" ? r.state : "",
+    hits: arr<unknown>(r.hits).map((h) => {
+      const o = rec(h);
+      return { path: String(o.path ?? ""), type: String(o.type ?? ""), reason: String(o.reason ?? "") };
+    }),
+    scan: {
+      scope: typeof scan.scope === "string" ? scan.scope : null,
+      truncated: scan.truncated === true,
+      files: numOrNull(scan.files),
+      dirs: numOrNull(scan.dirs),
+    },
+  };
+}
+/** 校验覆盖度：{scope, checked, expected, found, missing}；没有该字段返回 null（不伪造 0/0）。 */
+function verificationOf(raw: unknown): VerificationStats | null {
+  if (!raw || typeof raw !== "object") return null;
+  const v = rec(raw);
+  const scope = typeof v.scope === "string" ? v.scope : "";
+  const checked = numOrNull(v.checked);
+  const expected = numOrNull(v.expected);
+  const found = numOrNull(v.found);
+  const missing = numOrNull(v.missing);
+  if (!scope && checked === null && expected === null && found === null && missing === null) return null;
+  return { scope: scope || "unknown", checked: checked ?? 0, expected: expected ?? 0, found: found ?? 0, missing: missing ?? 0 };
+}
+
 /** precheck 可能以 precheck_json 字符串落库（repo 里就是 TEXT）。 */
 function jsonOf(x: unknown): unknown {
   if (typeof x !== "string") return x;
@@ -1206,6 +1241,12 @@ function planOf(raw: unknown): ImportPlan {
     precheck: precheckOf(jsonOf(precheckSrc)),
     units: arr<unknown>(unitsSrc).map(planUnitOf),
     mixedWarning: strField(p, "mixedWarning", "mixed_warning"),
+    risk: riskOf(
+      (p.risk ?? outer.risk)
+      ?? { state: p.risk_state ?? outer.risk_state, hits: p.risk_hits ?? outer.risk_hits, scan: p.risk_scan ?? outer.risk_scan },
+    ),
+    verification: verificationOf(outer.verification ?? p.verification)
+      ?? verificationOf(rec(jsonOf(outer.latestRun ? rec(outer.latestRun).summary : null)).verification),
     // run 是在 import job 里建出来的：后端若在 plan 视图里暴露 run_id / latestRun.id 就能自动接上轮询
     runId: numField(p, "runId", "run_id")
       ?? (outer.latestRun && typeof outer.latestRun === "object" ? numField(rec(outer.latestRun), "id", "id") : null)
@@ -1227,6 +1268,7 @@ function runUnitOf(raw: unknown, idx: number): ImportRunUnit {
     error: errOf(o.error),
     startedAt: strField(o, "startedAt", "started_at"),
     finishedAt: strField(o, "finishedAt", "finished_at"),
+    verification: verificationOf(o.verification) ?? verificationOf(rec(jsonOf(o.detail_json)).verification),
   };
 }
 function runOf(raw: unknown): ImportRun {
@@ -1240,6 +1282,7 @@ function runOf(raw: unknown): ImportRun {
     error: errOf(o.error),
     startedAt: strField(o, "startedAt", "started_at"),
     finishedAt: strField(o, "finishedAt", "finished_at"),
+    verification: verificationOf(o.verification) ?? verificationOf(rec(jsonOf(o.summary_json)).verification),
   };
 }
 
@@ -1322,4 +1365,31 @@ export async function scanAllWorkbench(onlyMissing = true): Promise<{ jobId: num
 /** GET /api/import-runs/:id —— 执行进度（每单元 state 原样透传）。 */
 export async function getImportRun(id: number): Promise<ImportRun> {
   return runOf(await request<unknown>("GET", "/import-runs/" + id));
+}
+
+// ---------------- staging（unity-staging 缓存，设置面板） ----------------
+/** GET /api/staging —— 落地缓存用量（字节 / 文件数 / 目录数）。 */
+export async function stagingUsage(): Promise<StagingUsage> {
+  const raw = await request<unknown>("GET", "/staging");
+  const r = rec(raw);
+  const u = r.usage && typeof r.usage === "object" ? rec(r.usage) : r;
+  return { bytes: numOr(u.bytes, 0), files: numOr(u.files, 0), dirs: numOrNull(u.dirs) };
+}
+/**
+ * POST /api/staging/cleanup —— dryRun=true 只预览；false 真删（olderThanDays 天以前的）。
+ * 只动 <dataDir>/unity-staging，不碰素材；失败条目数由 failed 返回。
+ */
+export async function stagingCleanup(olderThanDays: number, dryRun: boolean): Promise<StagingCleanupResult> {
+  const raw = await request<unknown>("POST", "/staging/cleanup", {
+    dryRun, olderThanDays: Math.max(0, Math.floor(olderThanDays)),
+  }, { timeoutMs: 60000 });
+  const r = rec(raw);
+  const s = r.result && typeof r.result === "object" ? rec(r.result) : r;
+  return {
+    dryRun: dryRun && s.dryRun !== false,
+    olderThanDays: numOr(s.olderThanDays, olderThanDays),
+    files: numOr(s.files ?? s.removedFiles, 0),
+    bytes: numOr(s.bytes ?? s.removedBytes, 0),
+    failed: numOr(s.failed, 0),
+  };
 }

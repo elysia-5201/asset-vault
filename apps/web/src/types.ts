@@ -685,6 +685,36 @@ export interface ImportPrecheck {
   warnings: string[];
   errors: { code: string; message: string }[];
 }
+/** 风险扫描状态（导入可靠性）：clear 干净 / warning 需确认 / blocked 禁止执行 / unknown 无从判定 */
+export type RiskState = "clear" | "warning" | "blocked" | "unknown" | string;
+/** 命中的文件（最多展示 20 条）：路径 / 类型 / 原因 */
+export interface RiskHit { path: string; type: string; reason: string }
+/** 风险扫描的范围与是否截断 */
+export interface RiskScanScope {
+  /** 扫描范围描述（如 "工程 Assets" / "包内条目"） */
+  scope: string | null;
+  truncated: boolean;
+  files: number | null;
+  dirs: number | null;
+}
+export interface PlanRisk {
+  state: RiskState;
+  hits: RiskHit[];
+  scan: RiskScanScope;
+}
+/**
+ * 校验覆盖度：full = 全量校验（所有期望 GUID 都查了），sampled = 抽样（只查了前 N 个）。
+ * checked/expected/found/missing 是计数口径，展示时不要自己再推算。
+ */
+export type VerificationScope = "full" | "sampled" | string;
+export interface VerificationStats {
+  scope: VerificationScope;
+  checked: number;
+  expected: number;
+  found: number;
+  missing: number;
+}
+
 export interface ImportPlan {
   id: number;
   /** 计划所属条目（后端 import_plans.item_id）；跨条目建计划时后端按 item 拆成多个 PlanView。 */
@@ -703,6 +733,10 @@ export interface ImportPlan {
   jobId: number | null;
   createdAt: string | null;
   error: { code: string; message: string } | null;
+  /** 风险扫描（后端未提供时 state 为空串 / hits 空，UI 显示"未提供风险扫描"） */
+  risk: PlanRisk;
+  /** 校验覆盖度（full/sampled + 计数）；未执行为 null */
+  verification: VerificationStats | null;
 }
 
 /**
@@ -732,6 +766,8 @@ export interface ImportRunUnit {
   error: { code: string; message: string } | null;
   startedAt: string | null;
   finishedAt: string | null;
+  /** 该单元的校验覆盖度与计数（有就展示，没有不猜） */
+  verification: VerificationStats | null;
 }
 export interface ImportRun {
   id: number;
@@ -741,5 +777,22 @@ export interface ImportRun {
   error: { code: string; message: string } | null;
   startedAt: string | null;
   finishedAt: string | null;
+  verification: VerificationStats | null;
+}
+
+// ---------------- staging（unity-staging 缓存） ----------------
+export interface StagingUsage {
+  bytes: number;
+  files: number;
+  dirs: number | null;
+}
+export interface StagingCleanupResult {
+  dryRun: boolean;
+  olderThanDays: number;
+  /** 将被/已被清理的文件数与字节数 */
+  files: number;
+  bytes: number;
+  /** 清理失败（如文件被占用）的条目数 */
+  failed: number;
 }
 

@@ -482,6 +482,9 @@ CREATE TABLE IF NOT EXISTS import_plans (
   status TEXT NOT NULL DEFAULT 'ready',
   user_confirmed INTEGER NOT NULL DEFAULT 0,
   precheck_json TEXT,
+  -- v9：风险扫描摘要与状态（ok/warning/unknown/blocked；未知必须人工确认）
+  risk_json TEXT,
+  risk_state TEXT,
   created_at TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1
 );
@@ -512,7 +515,11 @@ CREATE TABLE IF NOT EXISTS import_runs (
   started_at TEXT NOT NULL,
   finished_at TEXT,
   console_errors TEXT,
-  summary_json TEXT
+  summary_json TEXT,
+  -- v9：验证覆盖（all/sampled）与 GUID 覆盖计数；verified 仅当 missing=0 且无 console error
+  verification_scope TEXT,
+  checked_count INTEGER NOT NULL DEFAULT 0,
+  expected_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_import_runs_plan ON import_runs(plan_id, id DESC);
 
@@ -529,6 +536,24 @@ CREATE TABLE IF NOT EXISTS import_run_items (
   UNIQUE(run_id, plan_item_id)
 );
 CREATE INDEX IF NOT EXISTS ix_import_run_items_run ON import_run_items(run_id, status);
+
+-- v9：Unity staging 台账（只登记本服务在 dataDir/unity-staging 下创建的文件；清理只删登记行）
+CREATE TABLE IF NOT EXISTS staging_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path_norm TEXT NOT NULL UNIQUE,
+  path TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  plan_id INTEGER,
+  run_id INTEGER,
+  job_id INTEGER,
+  state TEXT NOT NULL DEFAULT 'in_use',
+  created_at TEXT NOT NULL,
+  last_used_at TEXT NOT NULL,
+  cleanup_error TEXT,
+  cleanup_attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_staging_state ON staging_files(state, last_used_at);
+CREATE INDEX IF NOT EXISTS ix_staging_run ON staging_files(run_id);
 
 -- 全文检索：trigram 支持中日文子串（>=3 字符走 FTS，<3 字符回退 LIKE）
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(

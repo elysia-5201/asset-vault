@@ -9,11 +9,23 @@ function readVersion(): string {
   } catch { return "0.0.0"; }
 }
 
+/** task-51：CLI 启动比对 build-info.version 与 package.json，不一致只告警（不阻断开发运行）。 */
+function warnBuildMismatch(version: string): void {
+  try {
+    const info = JSON.parse(readFileSync(new URL("../../desktop/build/build-info.json", import.meta.url), "utf8")) as { version?: unknown; commit?: unknown };
+    if (info.version && String(info.version) !== version) {
+      console.warn("[assetvault] build-info version mismatch: build=" + String(info.version) + " package=" + version + " commit=" + String(info.commit ?? "unknown"));
+    }
+  } catch { /* 无 build-info（开发运行）忽略 */ }
+}
+
+const __version = readVersion();
+warnBuildMismatch(__version);
 const handle = await startAssetVault({
   port: Number(process.env.PORT ?? 7317),
   host: process.env.HOST ?? "127.0.0.1",
   dataDir: process.env.ASSETVAULT_DATA,
-  version: readVersion(),
+  version: __version,
 });
 
 const shutdown = async (sig: string) => {

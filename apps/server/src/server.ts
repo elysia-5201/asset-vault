@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
-import { createWriteStream, existsSync, mkdirSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "./db/migrate";
@@ -16,8 +16,15 @@ import { DerivedCache } from "./services/pipeline/cache";
 import { IndexPipeline } from "./services/pipeline/pipeline";
 import { resolveLimits, limitsHash } from "./services/pipeline/limits";
 import { acquirePipelineLock, type PipelineLock } from "./services/pipeline/lock";
+import { sweepStagingOnStartup } from "./services/structure";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+
+/** task-51：构建信息（apps/desktop/build/build-info.json；源码/开发运行可能不存在）。 */
+export function readBuildInfo(): any {
+  try { return JSON.parse(readFileSync(join(repoRoot, "apps", "desktop", "build", "build-info.json"), "utf8")); }
+  catch { return null; }
+}
 
 export interface StartOptions {
   port?: number;
@@ -89,6 +96,9 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   // 与 jobs 恢复解耦：scan_previews 不参与 jobs 恢复，否则会永久停在 scanning。
   const sweptPreviews = repo.expireScanPreviews();
   if (sweptPreviews) log("scan previews swept: " + sweptPreviews + " row(s) -> expired/failed");
+  // task-51：启动清理 >7 天且非活跃的 Unity staging（路径必须在本实例 unity-staging 内、拒符号链接）
+  const sweptStaging = sweepStagingOnStartup(repo, join(dataDir, "unity-staging"));
+  if (sweptStaging.candidates || sweptStaging.failed) log("unity staging swept: removed=" + sweptStaging.removed + " failed=" + sweptStaging.failed + " skipped=" + sweptStaging.skipped);
   const recovered = lock.acquired ? repo.recoverInFlight() : 0;
 
   let app: FastifyInstance | null = null;
@@ -97,7 +107,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
-    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits });
+    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits, build: readBuildInfo() });
     const distDir = opts.webDistDir ?? join(repoRoot, "apps", "web", "dist");
     if (existsSync(join(distDir, "index.html"))) {
       // wildcard 默认 true：否则 /assets/* 不注册，全部落到 SPA 兜底 → JS 以 text/html 返回导致白屏

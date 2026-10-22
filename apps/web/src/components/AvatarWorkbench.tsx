@@ -52,13 +52,14 @@ export const UNIT_STATE_LABEL: Record<string, string> = {
   partial_success: "部分成功",
   failed: "失败",
   unknown: "未知",
+  cancelled: "已取消",
   // 计划项（import_plan_items.status）也用同一张表；不新增状态，只是给后端已有值配文案
   pending: "待导入",
   suggested: "建议（待确认）",
 };
 export const UNIT_STATE_TONE: Record<string, Tone> = {
   planned: "muted", importing: "busy", import_command_completed: "busy",
-  verifying: "busy", verified: "ok", partial_success: "warn", failed: "bad", unknown: "muted",
+  verifying: "busy", verified: "ok", partial_success: "warn", failed: "bad", unknown: "warn", cancelled: "muted",
 };
 
 /** 计划状态 → 中文（后端 import_plans.status：ready / running / executed / failed / blocked）。 */
@@ -70,6 +71,27 @@ export const PLAN_STATE_TONE: Record<string, Tone> = {
 };
 /** 计划的终态（**只用于决定停止轮询**；值来自后端，不新增状态）。 */
 const PLAN_TERMINAL_STATES = ["executed", "failed", "blocked"];
+
+// ---------------- 风险/校验（v0.7.1 导入可靠性） ----------------
+/** 风险状态文案（后端 risk_state：clear/warning/blocked/unknown）。 */
+export const RISK_LABEL: Record<string, string> = {
+  clear: "风险扫描通过", warning: "有风险提示（需确认）", blocked: "禁止执行", unknown: "风险未知（需确认）",
+};
+export const RISK_TONE: Record<string, Tone> = {
+  clear: "ok", warning: "warn", blocked: "bad", unknown: "warn",
+};
+/** 最多展示多少条命中（更多只给"还有 N 条"）。 */
+export const RISK_HIT_LIMIT = 20;
+/** unknown 执行状态必须给出的警告文案（不自动重试）。 */
+export const UNKNOWN_STATE_HINT = "结果未知：可能已产生副作用，请先在 Unity 工程中核对，不要直接重试";
+export const VERIFICATION_SCOPE_LABEL: Record<string, string> = { full: "全量校验", sampled: "抽样校验" };
+/** verification_scope + checked/expected/found/missing → 一行可读文案。 */
+export function verificationText(v: { scope: string; checked: number; expected: number; found: number; missing: number } | null | undefined): string {
+  if (!v) return "";
+  return (VERIFICATION_SCOPE_LABEL[v.scope] ?? v.scope) + "：已查 " + v.checked + "/" + v.expected + "，命中 " + v.found + "，缺失 " + v.missing;
+}
+/** 只有 failed 的计划才允许重建（unknown 必须先人工核对）。 */
+export function canRebuildPlan(state: string): boolean { return state === "failed"; }
 
 /** 仍在推进的单元状态（**只用来决定要不要继续轮询**，不是状态机、不推断转移）。 */
 const IN_FLIGHT_UNIT_STATES = ["planned", "importing", "import_command_completed", "verifying"];
@@ -207,12 +229,27 @@ export function PlanPanel(props: {
   busy: boolean;
   /** 提交执行后拿到的 job 号（202 {jobId, planId}），仅展示。 */
   jobId?: number | null;
+  /** 风险提示（warning / unknown）是否已被用户显式确认 */
+  riskAck?: boolean;
+  onRiskAck?: (v: boolean) => void;
+  /** 只有 failed 的计划才允许重建（由父组件判定/传入） */
+  onRebuild?: () => void;
 }) {
   const { plan } = props;
   const units = plan.units;
   const checkedCount = units.filter((u) => props.checks[u.unitId]).length;
   const suggestedCount = units.filter((u) => u.suggested).length;
   const mixedWarning = plan.mixedWarning ?? (anyMixed(units) ? MIXED_WARNING : "");
+  // 风险扫描：blocked 禁止执行（不提供强制按钮）；warning / unknown 必须显式确认
+  const risk = plan.risk;
+  const riskState = risk?.state ?? "";
+  const riskBlocked = riskState === "blocked" || plan.state === "blocked";
+  const needsRiskAck = riskState === "warning" || riskState === "unknown";
+  const ackMissing = needsRiskAck && !props.riskAck;
+  const canConfirm = !riskBlocked && !ackMissing && checkedCount > 0;
+  const hits = (risk?.hits ?? []).slice(0, RISK_HIT_LIMIT);
+  const restHits = (risk?.hits?.length ?? 0) - hits.length;
+  const ver = plan.verification;
 
   return (
     <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
@@ -220,6 +257,7 @@ export function PlanPanel(props: {
         <b>导入计划 #{plan.id}</b>
         {plan.itemId !== null && plan.itemId !== undefined ? <span className="hint mono">条目 #{plan.itemId}</span> : null}
         {plan.state ? <Badge tone={PLAN_STATE_TONE[plan.state] ?? "muted"} title={plan.state}>{PLAN_STATE_LABEL[plan.state] ?? plan.state}</Badge> : null}
+        {riskState ? <Badge tone={RISK_TONE[riskState] ?? "muted"} title={"risk_state=" + riskState}>{RISK_LABEL[riskState] ?? riskState}</Badge> : null}
         <Badge tone={plan.precheck.ok ? "ok" : "warn"}>{plan.precheck.ok ? "预检通过" : "预检有警告"}</Badge>
         {props.jobId !== null && props.jobId !== undefined ? <span className="hint mono">job #{props.jobId}</span> : null}
         <span className="spacer" />
@@ -231,6 +269,43 @@ export function PlanPanel(props: {
       {plan.precheck.warnings.map((w, i) => (
         <div className="notice" key={"pw" + i}>{w}</div>
       ))}
+
+      {/* 风险扫描：状态 + 命中文件 + 扫描范围/截断 + 显式确认 */}
+      {riskState ? (
+        <div className={riskBlocked ? "err" : "notice"} data-risk={riskState}>
+          <div className="row" style={{ gap: "6px" }}>
+            <b>{RISK_LABEL[riskState] ?? riskState}</b>
+            <span className="hint">
+              扫描范围 {risk.scan.scope ?? "未提供"}
+              {risk.scan.truncated ? "（已截断）" : ""}
+              {risk.scan.files !== null ? " · 文件 " + risk.scan.files : ""}
+              {risk.scan.dirs !== null ? " · 目录 " + risk.scan.dirs : ""}
+            </span>
+          </div>
+          {hits.length > 0 && (
+            <div className="preview-list" style={{ maxHeight: "16vh", marginTop: "4px" }}>
+              {hits.map((h, i) => (
+                <div key={i} className="row" style={{ gap: "6px", padding: "2px 6px", fontSize: "11px" }}>
+                  <span className="mono" style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={h.path}>{shortenPath(h.path, 64)}</span>
+                  <span className="hint">{h.type}</span>
+                  <span className="hint">{h.reason}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {restHits > 0 && <div className="hint">还有 {restHits} 条命中未显示（最多列 {RISK_HIT_LIMIT} 条）</div>}
+          {riskBlocked && <div className="hint">blocked：只显示原因，不提供强制执行按钮。</div>}
+          {needsRiskAck && (
+            <label className="chk" style={{ marginTop: "4px" }}>
+              <input type="checkbox" checked={!!props.riskAck} onChange={(e) => props.onRiskAck?.(e.target.checked)} />
+              我已核对上面的风险命中（warning / unknown 必须显式确认后才能执行）
+            </label>
+          )}
+        </div>
+      ) : (
+        <div className="hint">未提供风险扫描（后端 risk_state 缺失，不当作 clear）</div>
+      )}
+
       {mixedWarning ? (
         <div className="err" data-warning="mixed">
           {mixedWarning}
@@ -253,11 +328,17 @@ export function PlanPanel(props: {
         ))}
         {!units.length && <div className="hint" style={{ padding: "8px" }}>计划里没有单元</div>}
       </div>
+      {ver ? <div className="hint mono">校验覆盖度 — {verificationText(ver)}</div> : null}
       <div className="row" style={{ gap: "6px" }}>
-        <button className="btn primary" disabled={props.busy || checkedCount === 0} onClick={props.onConfirm}>
+        <button className="btn primary" disabled={props.busy || !canConfirm} onClick={props.onConfirm}
+          title={riskBlocked ? "blocked：禁止执行" : ackMissing ? "先确认风险提示" : "confirm → execute"}>
           {props.busy ? <Spinner /> : null}确认并导入 {checkedCount} 个单元
         </button>
+        {canRebuildPlan(plan.state) && props.onRebuild ? (
+          <button className="btn" disabled={props.busy} onClick={props.onRebuild} title="failed 才允许重建；会新建计划，不覆盖旧计划">重建计划</button>
+        ) : null}
         {suggestedCount > 0 && <span className="hint">「建议」项默认不勾选，需你确认后才加入</span>}
+        {ackMissing && <span className="hint">先把上面的风险确认勾上</span>}
       </div>
     </div>
   );
@@ -280,6 +361,11 @@ export function PlansSection(props: {
   onConfirm: () => void;
   busy: boolean;
   ackedJobs: Record<number, number>;
+  /** planId → 风险提示是否已被显式确认（warning / unknown 必须勾） */
+  riskAcks?: Record<number, boolean>;
+  onRiskAck?: (planId: number, v: boolean) => void;
+  /** failed 计划的重建入口 */
+  onRebuild?: (plan: ImportPlan) => void;
 }) {
   if (!props.plans.length) return null;
   return (
@@ -298,6 +384,9 @@ export function PlansSection(props: {
           onConfirm={props.onConfirm}
           busy={props.busy}
           jobId={props.ackedJobs[p.id] ?? p.jobId}
+          riskAck={props.riskAcks ? props.riskAcks[p.id] === true : undefined}
+          onRiskAck={(v) => props.onRiskAck?.(p.id, v)}
+          onRebuild={props.onRebuild ? () => props.onRebuild!(p) : undefined}
         />
       ))}
     </>
@@ -357,6 +446,8 @@ export function AvatarWorkbench(props: {
   const [pollPlanIds, setPollPlanIds] = useState<number[]>([]);
   /** planId → 执行作业 id（仅用于展示 "job #N"）。 */
   const [ackedJobs, setAckedJobs] = useState<Record<number, number>>({});
+  /** planId → 风险提示是否已显式确认（warning / unknown 必须勾；blocked 勾了也不放行）。 */
+  const [riskAcks, setRiskAcks] = useState<Record<number, boolean>>({});
 
   // ① Avatar 列表
   const applyAvatarList = useCallback((list: WorkbenchAvatar[]) => {
@@ -518,7 +609,7 @@ export function AvatarWorkbench(props: {
     if (!picked.length) { props.onToast("bad", "导入清单还是空的"); return; }
     const path = projectPath.trim();
     if (!path) { props.onToast("bad", "先填 Unity 工程路径"); return; }
-    setPlanBusy(true); setPlanErr(""); setRuns([]); setRunErr(""); setPollPlanIds([]); setAckedJobs({});
+    setPlanBusy(true); setPlanErr(""); setRuns([]); setRunErr(""); setPollPlanIds([]); setAckedJobs({}); setRiskAcks({});
     // 后端 createImportPlan 只认 unitIds / projectPath / includeSuggested，且一次只能属于同一 item
     createImportPlans({
       projectPath: path,
@@ -582,6 +673,27 @@ export function AvatarWorkbench(props: {
       props.onToast("ok", "已确认并提交 " + targets.length + " 个计划，正在轮询执行状态");
     }
   };
+
+  /** failed 才允许重建：按该计划自己的单元重新建一个新计划（旧计划保留为 failed，便于取证）。 */
+  const rebuildPlan = useCallback((p: ImportPlan): void => {
+    if (!canRebuildPlan(p.state)) return;
+    const path = (projectPath.trim() || p.projectPath || "").trim();
+    if (!path) { props.onToast("bad", "先填 Unity 工程路径"); return; }
+    setPlanBusy(true);
+    createImportPlans({ projectPath: path, unitIds: p.units.map((u) => u.unitId), includeSuggested: false })
+      .then((list) => {
+        setPlans((prev) => [...list, ...prev]);
+        setChecks((m) => {
+          const next = { ...m };
+          for (const np of list) for (const u of np.units) next[np.id + ":" + u.unitId] = !(u.suggested || u.state === "suggested");
+          return next;
+        });
+        setRiskAcks((m) => { const next = { ...m }; for (const np of list) delete next[np.id]; return next; });
+        props.onToast("ok", "已重建 " + list.length + " 个计划（旧计划保留为 failed）");
+      })
+      .catch((e) => props.onToast("bad", "重建计划失败：" + describeError(e)))
+      .finally(() => setPlanBusy(false));
+  }, [projectPath, props]);
 
   const toggleCheck = (planId: number, unitId: string) => setChecks((m) => {
     const k = planId + ":" + unitId;
@@ -745,6 +857,9 @@ export function AvatarWorkbench(props: {
               onConfirm={() => void doConfirm()}
               busy={planBusy}
               ackedJobs={ackedJobs}
+              riskAcks={riskAcks}
+              onRiskAck={(id, v) => setRiskAcks((m) => ({ ...m, [id]: v }))}
+              onRebuild={rebuildPlan}
             />
 
             {(runs.length > 0 || runErr) && (
@@ -764,11 +879,16 @@ export function AvatarWorkbench(props: {
                       <span className="hint">{formatDate(run.startedAt)}{run.finishedAt ? " → " + formatDate(run.finishedAt) : ""}</span>
                     </div>
                     {run.error && <div className="err">{run.error.code}：{run.error.message}</div>}
+                    {run.verification ? <div className="hint mono">校验覆盖度 — {verificationText(run.verification)}</div> : null}
+                    {(run.state === "unknown" || run.units.some((u) => u.state === "unknown")) && (
+                      <div className="err">{UNKNOWN_STATE_HINT}</div>
+                    )}
                     {run.units.map((u) => (
                       <div className="row" key={u.unitId} style={{ gap: "6px", alignItems: "flex-start" }}>
                         <Badge tone={UNIT_STATE_TONE[u.state]}>{UNIT_STATE_LABEL[u.state] ?? u.state}</Badge>
                         <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.title}>{u.title}</span>
                         <span className="hint mono" style={{ flex: "0 0 auto" }}>{u.state}</span>
+                        {u.verification ? <span className="hint" style={{ flex: "0 0 auto" }} title={verificationText(u.verification)}>{VERIFICATION_SCOPE_LABEL[u.verification.scope] ?? u.verification.scope} {u.verification.found}/{u.verification.expected}</span> : null}
                         {u.error && <span className="err-text" style={{ flex: "0 0 auto" }}>{u.error.code}: {u.error.message}</span>}
                       </div>
                     ))}

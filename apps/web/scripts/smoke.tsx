@@ -11,7 +11,8 @@ import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
 import { CategoryManager } from "../src/components/CategoryManager";
 import { PipelinePanel } from "../src/components/PipelinePanel";
-import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, PlansSection, SCAN_ALL_LABEL, UNIT_STATE_LABEL, UnitsEmptyState, fallbackAvatarOf, isRunBusy, pickAvatarId, plansToastText, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
+import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, PlansSection, RISK_HIT_LIMIT, RISK_LABEL, SCAN_ALL_LABEL, UNIT_STATE_LABEL, UNKNOWN_STATE_HINT, UnitsEmptyState, canRebuildPlan, fallbackAvatarOf, isRunBusy, pickAvatarId, plansToastText, sameSlot, togglePick, verificationText } from "../src/components/AvatarWorkbench";
+import { SettingsPanel } from "../src/components/SettingsPanel";
 import { confirmImportPlan, executeImportPlan } from "../src/api";
 
 type Fail = string;
@@ -491,6 +492,60 @@ expect(planCards === 2, "工作台多计划：两个 PlanView 各渲染一个 Pl
 expect(stripSsr(plansHtml).includes("按条目分成 2 个，各自 confirm → execute"), "工作台多计划：分组说明可见");
 expect(stripSsr(plansHtml).includes("条目 #7") && stripSsr(plansHtml).includes("条目 #8"), "工作台多计划：每个计划标注所属条目");
 expect((plansHtml.match(/type="checkbox"/g) ?? []).length === 3, "工作台多计划：两个计划的复选框都渲染（2 + 1）");
+
+// ---- ⑤ task-52：风险状态 / 显式确认 / blocked 禁执行 / unknown 不重试 / verification_scope / staging ----
+const riskHits = Array.from({ length: 25 }, (_, i) => ({ path: "/proj/Assets/Avatar" + i + ".prefab", type: "prefab", reason: "引用缺失 GUID" }));
+const riskWarningPlan = {
+  ...planFixture, id: 21, state: "ready",
+  risk: { state: "warning", hits: riskHits, scan: { scope: "工程 Assets", truncated: true, files: 1200, dirs: 80 } },
+  verification: { scope: "sampled", checked: 20, expected: 100, found: 18, missing: 2 },
+} as any;
+const riskHtml = render("PlanPanel(risk=warning)", createElement(PlanPanel, {
+  plan: riskWarningPlan, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false, riskAck: false, onRiskAck: () => {},
+} as any));
+expect(riskHtml.includes(RISK_LABEL.warning), "风险：warning 状态徽章与文案可见");
+expect(riskHtml.includes("我已核对上面的风险命中"), "风险：warning 必须显式确认（出现确认复选框）");
+expect(stripSsr(riskHtml).includes("扫描范围 工程 Assets（已截断）"), "风险：显示扫描范围与是否截断");
+expect(riskHtml.includes("/proj/Assets/Avatar0.prefab"), "风险：命中文件路径可见");
+const riskHitRows = (riskHtml.match(/引用缺失 GUID/g) ?? []).length;
+expect(riskHitRows === RISK_HIT_LIMIT, "风险：命中最多列 " + RISK_HIT_LIMIT + " 条（实际 " + riskHitRows + "）");
+expect(stripSsr(riskHtml).includes("还有 5 条命中未显示"), "风险：超出上限提示还有多少条");
+expect(stripSsr(riskHtml).includes("确认并导入 1 个单元"), "风险：确认按钮仍渲染（是否可点由 riskAck 决定）");
+expect(stripSsr(riskHtml).includes("先把上面的风险确认勾上"), "风险：未勾确认时提示先确认（按钮 disabled）");
+const riskAcked = render("PlanPanel(risk=warning,acked)", createElement(PlanPanel, {
+  plan: riskWarningPlan, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false, riskAck: true, onRiskAck: () => {},
+} as any));
+expect(!riskAcked.includes("先把上面的风险确认勾上"), "风险：勾上确认后不再提示要先确认");
+
+const blockedPlan = { ...planFixture, id: 22, state: "blocked", risk: { state: "blocked", hits: [{ path: "/p/x.prefab", type: "prefab", reason: "工程里已有同名资源" }], scan: { scope: "工程 Assets", truncated: false, files: 3, dirs: 1 } } } as any;
+const blockedHtml = render("PlanPanel(risk=blocked)", createElement(PlanPanel, {
+  plan: blockedPlan, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false, riskAck: true, onRiskAck: () => {},
+} as any));
+expect(blockedHtml.includes(RISK_LABEL.blocked) && stripSsr(blockedHtml).includes("不提供强制执行按钮"), "风险：blocked 只显示原因、不提供强制按钮");
+expect((blockedHtml.match(/<button[^>]*disabled/g) ?? []).length >= 1, "风险：blocked 下确认按钮被禁用");
+
+const unknownPlan = { ...planFixture, id: 23, state: "failed", risk: { state: "unknown", hits: [], scan: { scope: null, truncated: false, files: null, dirs: null } }, verification: { scope: "full", checked: 10, expected: 10, found: 9, missing: 1 } } as any;
+const unknownPlanHtml = render("PlanPanel(risk=unknown)", createElement(PlanPanel, {
+  plan: unknownPlan, checks: { a: true, b: false }, onToggle: () => {}, onConfirm: () => {}, busy: false, riskAck: false, onRiskAck: () => {}, onRebuild: () => {},
+} as any));
+expect(unknownPlanHtml.includes(RISK_LABEL.unknown), "风险：unknown 文案可见");
+expect(unknownPlanHtml.includes("我已核对上面的风险命中"), "风险：unknown 同样必须显式确认");
+expect(unknownPlanHtml.includes("重建计划") && canRebuildPlan("failed") && !canRebuildPlan("unknown"), "风险：只有 failed 才给「重建计划」");
+expect(stripSsr(unknownPlanHtml).includes("全量校验：已查 10/10，命中 9，缺失 1"), "校验：verification_scope(full) 与 checked/expected/found/missing 展示");
+expect(verificationText({ scope: "sampled", checked: 20, expected: 100, found: 18, missing: 2 }).includes("抽样校验"), "校验：sampled 显示为「抽样校验」");
+
+// 执行状态 unknown：给警告文案，且没有普通重试按钮
+const unknownRun = { id: 5, planId: 23, state: "unknown", units: [{ unitId: "a", itemId: 7, title: "x", state: "unknown", error: null, startedAt: null, finishedAt: null, verification: null }], error: null, startedAt: null, finishedAt: null, verification: { scope: "sampled", checked: 5, expected: 20, found: 4, missing: 1 } } as any;
+expect(UNIT_STATE_LABEL.unknown === "未知" && UNIT_STATE_LABEL.cancelled === "已取消", "执行状态：unknown / cancelled 徽章文案存在");
+expect(UNKNOWN_STATE_HINT.includes("不要直接重试") && UNKNOWN_STATE_HINT.includes("可能已产生副作用"), "执行状态：unknown 警告文案禁止直接重试");
+expect(isRunBusy(unknownRun) === false, "执行状态：unknown 视为非在飞（停止轮询）");
+
+// 设置面板：staging 区块（SSR 不跑 effect，只验结构）
+const settingsHtml = render("SettingsPanel", createElement(SettingsPanel, { onClose: () => {}, onToast: () => {}, onChanged: () => {} } as any));
+for (const needle of ["导入落地缓存", "预览清理（dry-run）", "执行清理"]) {
+  expect(settingsHtml.includes(needle), "设置面板：含「" + needle + "」");
+}
+expect(settingsHtml.includes("不会动素材") || settingsHtml.includes("不碰素材"), "设置面板：staging 说明只删缓存不动素材");
 
 // ---- ② SSR 冒烟 ----
 let html = "";
