@@ -1796,6 +1796,20 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     } catch (e) { return fail(reply, e); }
   });
 
+  /** POST /api/workbench/scan-all：一键分析所有有归档资产的条目（item_id=NULL + payload.all）。 */
+  app.post("/api/workbench/scan-all", async (req, reply) => {
+    try {
+      const b = (req.body ?? {}) as any;
+      const onlyMissing = b.onlyMissing === true;
+      const inflight = repo.findInflightStructureAllJob();
+      if (inflight) {
+        return reply.status(409).send({ error: { code: "CONFLICT", message: "已有批量结构分析作业在跑", jobId: inflight.id } });
+      }
+      const job = repo.createJob("structure", null, { all: true, onlyMissing }, 15);
+      return reply.status(202).send({ jobId: job.id, onlyMissing });
+    } catch (e) { return fail(reply, e); }
+  });
+
   /** GET /api/workbench/avatars?itemId=：按头像聚合单元证据计数。 */
   app.get("/api/workbench/avatars", async (req) => {
     const q = req.query as any;

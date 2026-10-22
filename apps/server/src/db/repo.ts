@@ -2241,9 +2241,26 @@ export class Repo {
     return out;
   }
 
+  /** task-47：有归档资产的 item（structure 批量扫描目标）；onlyMissing=仅从未分析出单元的 item。 */
+  listStructureScanTargets(onlyMissing = false): number[] {
+    const base = "SELECT DISTINCT i.id FROM items i JOIN assets a ON a.item_id=i.id " +
+      "WHERE i.status<>'trashed' AND a.status<>'trashed' AND (a.kind IN ('archive','unitypackage') OR a.container IN ('zip','7z','rar','unitypackage'))";
+    if (!onlyMissing) return (this.stmt(base + " ORDER BY i.id").all() as any[]).map((r) => Number(r.id));
+    return (this.stmt(base + " AND NOT EXISTS (SELECT 1 FROM asset_units u WHERE u.item_id=i.id) ORDER BY i.id").all() as any[]).map((r) => Number(r.id));
+  }
+  /** 是否已有 scan-all 的 structure 作业在跑（item_id IS NULL + payload.all=1）。 */
+  findInflightStructureAllJob(): any {
+    return this.stmt("SELECT * FROM jobs WHERE kind='structure' AND item_id IS NULL AND json_extract(payload,'$.all')=1 AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1").get() ?? null;
+  }
+
   workbenchAvatarCounts(itemId?: number): { avatar: { id: number; name: string }; counts: { confirmed: number; probable: number; unknown: number; mixed: number } }[] {
     const units = this.listUnits({ itemId, limit: 2000 });
     const map = new Map<number, { name: string; confirmed: Set<number>; probable: Set<number>; unknown: Set<number>; mixed: Set<number> }>();
+    // task-47：左侧工作台必须列出**全部** avatar（没有单元时计数为 0），否则 units=0 时整列空白。
+    for (const av of this.listAvatars() as any[]) {
+      const id = Number(av.id);
+      if (Number.isFinite(id) && id > 0) map.set(id, { name: String(av.name ?? "#" + id), confirmed: new Set(), probable: new Set(), unknown: new Set(), mixed: new Set() });
+    }
     for (const u of units) {
       let avatars: any[] = [];
       try { avatars = JSON.parse(u.avatar_json ?? "[]"); } catch { avatars = []; }

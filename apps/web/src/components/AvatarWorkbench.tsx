@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   confirmImportPlan, createImportPlans, describeError, executeImportPlan, getImportPlan, getImportRun,
-  mediaUrl, unityStatus, workbenchAvatars, workbenchItems,
+  listJobs, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems,
 } from "../api";
 import type { ImportPlan, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
 import { formatDate, shortenPath } from "../util";
@@ -95,6 +95,50 @@ export function togglePick(plan: WorkbenchItem[], unit: WorkbenchItem): Workbenc
 /** 清单里任意一项是 mixed → 需要显示整包风险。 */
 export function anyMixed(units: { mixed: boolean }[]): boolean {
   return units.some((u) => u.mixed);
+}
+
+/** 空态按钮文案（smoke 断言用）。 */
+export const SCAN_ALL_LABEL = "扫描全部结构";
+
+/**
+ * Avatar 列表为空时的兜底：用 Unity 工程里认出的 projectAvatar 造一条伪 Avatar。
+ * 起因：/workbench/avatars 只返回「有条目单元证据」的头像；工程里已识别的头像可能还没扫过结构，
+ * 于是左侧空空、用户以为探测失败。
+ */
+export function fallbackAvatarOf(pa: { id: number; name: string }): WorkbenchAvatar {
+  return {
+    id: pa.id, name: pa.name, kind: null, owned: 0, coverPath: null,
+    counts: { total: 0, confirmed: 0, probable: 0, unknown: 0, mixed: 0 },
+  };
+}
+
+/** 选中规则：列表非空用列表第一条；列表为空但有 Unity 兜底头像就用它。 */
+export function pickAvatarId(list: { id: number }[], fallback: { id: number } | null | undefined): number | null {
+  if (list.length) return list[0].id;
+  return fallback ? fallback.id : null;
+}
+
+/** units=0 的空态：解释 + 「扫描全部结构」按钮（导出以便 SSR/单测断言）。 */
+export function UnitsEmptyState(props: {
+  scanning: boolean;
+  onScanAll: () => void;
+  avatarName?: string | null;
+  fallbackFromUnity?: boolean;
+}) {
+  return (
+    <div className="empty" style={{ display: "flex", flexDirection: "column", gap: "6px", alignItems: "center" }}>
+      <div>{props.avatarName ? "@" + props.avatarName + " 名下还没有资源单元" : "还没有资源单元"}</div>
+      <div className="hint">
+        {props.fallbackFromUnity
+          ? "这个 Avatar 是从 Unity 工程里认出来的，库里还没分析过它的素材结构。"
+          : "先对条目做一次结构分析（容器 / 单元识别），分析完这里就会出现可勾选的单元。"}
+      </div>
+      <button className="btn primary" onClick={props.onScanAll} disabled={props.scanning}>
+        {props.scanning ? "扫描中…" : SCAN_ALL_LABEL}
+      </button>
+      <div className="hint">只补还没分析过的条目（onlyMissing=true）</div>
+    </div>
+  );
 }
 
 function ItemRow(props: { item: WorkbenchItem; picked: boolean; onToggle: () => void }) {
@@ -244,6 +288,19 @@ export function AvatarWorkbench(props: {
   const [projectPath, setProjectPath] = useState("");
   const [projectName, setProjectName] = useState("");
   const [probing, setProbing] = useState(false);
+  /** Unity 工程里认出的 Avatar（/workbench/avatars 为空时兜底）。 */
+  const [projectAvatar, setProjectAvatar] = useState<{ id: number; name: string } | null>(null);
+  const [avatarFallback, setAvatarFallback] = useState(false);
+  /** scan-all 的 job id（轮询到终态后刷新 avatars/units）。 */
+  const [scanJob, setScanJob] = useState<number | null>(null);
+  const [scanAllBusy, setScanAllBusy] = useState(false);
+  const projectAvatarRef = useRef<{ id: number; name: string } | null>(null);
+  const avatarsRef = useRef<WorkbenchAvatar[]>([]);
+  avatarsRef.current = avatars;
+  /** 打开面板只自动探测一次：之后只有手点「探测」才会再发请求。 */
+  const probedRef = useRef(false);
+  const toastRef = useRef(props.onToast);
+  toastRef.current = props.onToast;
 
   /** 后端按 item 建计划，所以这里可能是多个（通常 1 个）。 */
   const [plans, setPlans] = useState<ImportPlan[]>([]);
@@ -260,33 +317,58 @@ export function AvatarWorkbench(props: {
   const [ackedJobs, setAckedJobs] = useState<Record<number, number>>({});
 
   // ① Avatar 列表
+  const applyAvatarList = useCallback((list: WorkbenchAvatar[]) => {
+    if (list.length) {
+      setAvatars(list); setAvatarFallback(false);
+      setAvatarId((cur) => (cur === null || !list.some((a) => a.id === cur) ? list[0].id : cur));
+      return;
+    }
+    // 列表为空：用 Unity 工程里认出的头像兜底并选中，别让用户面对一片空白
+    const pa = projectAvatarRef.current;
+    if (pa) { setAvatars([fallbackAvatarOf(pa)]); setAvatarFallback(true); setAvatarId(pa.id); return; }
+    setAvatars([]); setAvatarFallback(false); setAvatarId(null);
+  }, []);
+
   const loadAvatars = useCallback(() => {
     setAvatarsLoading(true); setAvatarsErr("");
     workbenchAvatars()
-      .then((list) => {
-        setAvatars(list);
-        setAvatarId((cur) => (cur === null || !list.some((a) => a.id === cur) ? (list[0]?.id ?? null) : cur));
-      })
+      .then((list) => applyAvatarList(list))
       .catch((e) => setAvatarsErr(describeError(e)))
       .finally(() => setAvatarsLoading(false));
-  }, []);
+  }, [applyAvatarList]);
 
   useEffect(() => { loadAvatars(); }, [loadAvatars]);
 
-  // ② Unity 工程：尽力自动探测，失败不影响手填
-  const probeUnity = useCallback(() => {
+  // ② Unity 工程：**打开面板只自动探测一次**（probedRef 守卫），之后只有手点「探测」才会再发请求；
+  //    成功一律静默（不 toast），失败也只在手动探测时提示。
+  const probeUnity = useCallback((manual = false): void => {
     setProbing(true);
     unityStatus()
       .then((s) => {
         const p = s.editor?.projectPath ?? "";
         if (p) { setProjectPath(p); setProjectName(s.editor?.projectName ?? ""); }
-        else props.onToast("info", "没探测到打开的 Unity 工程，可手填工程路径");
+        const pa = s.projectAvatar ?? null;
+        if (pa) {
+          projectAvatarRef.current = { id: pa.id, name: pa.name };
+          setProjectAvatar(projectAvatarRef.current);
+          // avatars 为空 → 用它兜底并选中（否则左侧一片空白，用户以为探测失败）
+          if (avatarsRef.current.length === 0) {
+            setAvatars([fallbackAvatarOf(pa)]);
+            setAvatarFallback(true);
+            setAvatarId(pa.id);
+          }
+        }
+        if (!p && manual) toastRef.current("info", "没探测到打开的 Unity 工程（可手填路径，或先打开工程再点探测）");
       })
-      .catch(() => { /* Unity 没开是常态，不弹错 */ })
+      .catch(() => { if (manual) toastRef.current("info", "Unity 探测失败：编辑器没开或 MCP 不可达"); })
       .finally(() => setProbing(false));
-  }, [props]);
+  }, []);
 
-  useEffect(() => { probeUnity(); }, [probeUnity]);
+  useEffect(() => {
+    if (probedRef.current) return;
+    probedRef.current = true;
+    probeUnity(false);
+  }, [probeUnity]);
 
   // ③ 素材单元
   const loadItems = useCallback(() => {
@@ -314,7 +396,51 @@ export function AvatarWorkbench(props: {
 
   useEffect(() => { loadItems(); }, [loadItems]);
 
-  // ④ 计划/执行轮询（只在还有在飞单元时跑；页面隐藏时跳过）
+  // ④ 一键补结构分析：提交 scan-all（onlyMissing）→ 轮询 /api/jobs 里那条 → 完成后刷新 avatars/units
+  const scanAll = useCallback((): void => {
+    if (scanAllBusy) return;
+    setScanAllBusy(true);
+    scanAllWorkbench(true)
+      .then((r) => {
+        if (!r.jobId) {
+          setScanAllBusy(false);
+          toastRef.current("bad", "后端没有返回 jobId（/api/workbench/scan-all）");
+          return;
+        }
+        setScanJob(r.jobId);
+        toastRef.current("ok", "已提交结构扫描（job #" + r.jobId + "），完成后自动刷新");
+      })
+      .catch((e) => {
+        setScanAllBusy(false);
+        toastRef.current("bad", "提交扫描失败：" + describeError(e));
+      });
+  }, [scanAllBusy]);
+
+  useEffect(() => {
+    if (scanJob === null) return;
+    const tick = (): void => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      listJobs(undefined, 50)
+        .then((r) => {
+          const j = r.jobs.find((x) => x.id === scanJob);
+          if (!j) return;
+          if (!["done", "failed", "cancelled", "abandoned"].includes(j.state)) return;
+          setScanJob(null);
+          setScanAllBusy(false);
+          toastRef.current(
+            j.state === "done" ? "ok" : "bad",
+            "结构扫描 " + j.state + (j.error ? "：" + j.error : "") + "，已刷新列表",
+          );
+          loadAvatars();
+          loadItems();
+        })
+        .catch(() => { /* 下一轮再试 */ });
+    };
+    const timer = setInterval(tick, 2000);
+    return () => clearInterval(timer);
+  }, [scanJob, loadAvatars, loadItems]);
+
+  // ⑤ 计划/执行轮询（只在还有在飞单元时跑；页面隐藏时跳过）
   const refreshRun = useCallback((id: number) => {
     getImportRun(id)
       .then((r) => {
@@ -457,6 +583,12 @@ export function AvatarWorkbench(props: {
                 </button>
               ))}
               {!avatarsLoading && !avatars.length && !avatarsErr && <div className="hint" style={{ padding: "8px" }}>没有可选的 Avatar</div>}
+              {avatarFallback && (
+                <div className="notice">
+                  Avatar 列表为空：已用 Unity 工程里认出的 <b>@{projectAvatar?.name ?? avatars[0]?.name ?? "?"}</b> 兜底并选中；
+                  点「扫描全部结构」补齐库里的证据计数。
+                </div>
+              )}
             </div>
 
             <div className="row wrap" style={{ gap: "5px" }}>
@@ -486,6 +618,14 @@ export function AvatarWorkbench(props: {
               <span className="hint">② 素材单元 {itemsTotal ? "（" + items.length + " / " + itemsTotal + "）" : ""}</span>
               <span className="spacer" />
               {itemsLoading && <Spinner />}
+              <button
+                className="btn tiny"
+                onClick={scanAll}
+                disabled={scanAllBusy || scanJob !== null}
+                title="POST /api/workbench/scan-all {onlyMissing:true} —— 只给还没分析过的条目补结构分析"
+              >
+                {scanJob !== null ? "扫描中…" : SCAN_ALL_LABEL}
+              </button>
               <button className="btn tiny" onClick={loadItems} disabled={avatarId === null}>刷新</button>
             </div>
             {itemsErr && <div className="err">素材接口不可用：{itemsErr}</div>}
@@ -499,9 +639,14 @@ export function AvatarWorkbench(props: {
                 />
               ))}
               {!itemsLoading && !items.length && !itemsErr && (
-                <div className="hint" style={{ padding: "10px" }}>
-                  {avatarId === null ? "先选一个 Avatar" : "这个 Avatar 下没有匹配的素材单元"}
-                </div>
+                avatarId === null
+                  ? <div className="hint" style={{ padding: "10px" }}>先选一个 Avatar</div>
+                  : <UnitsEmptyState
+                      scanning={scanAllBusy || scanJob !== null}
+                      onScanAll={scanAll}
+                      avatarName={currentAvatar?.name ?? null}
+                      fallbackFromUnity={avatarFallback}
+                    />
               )}
             </div>
           </div>
@@ -534,7 +679,7 @@ export function AvatarWorkbench(props: {
                 {probing && <Spinner />}
                 {projectName && <span className="hint">已探测：{projectName}</span>}
                 <span className="spacer" />
-                <button className="btn tiny" onClick={probeUnity} disabled={probing}>探测</button>
+                <button className="btn tiny" onClick={() => probeUnity(true)} disabled={probing}>{probing ? "探测中…" : "探测"}</button>
               </div>
               <input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} placeholder="工程路径，如 E:/unity/MyAvatarProject" />
               <div className="row" style={{ gap: "6px" }}>

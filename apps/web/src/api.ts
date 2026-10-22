@@ -1308,6 +1308,16 @@ export async function executeImportPlan(id: number): Promise<ImportExecuteAck> {
     runId: numField(r, "runId", "run_id"),
   };
 }
+
+/**
+ * POST /api/workbench/scan-all —— 批量结构分析（默认只补缺单元），返回 **202 {jobId, state}**。
+ * 完成后需要重新拉 avatars/units；调用方用 GET /api/jobs 轮询该 job（不依赖 /jobs/:id）。
+ */
+export async function scanAllWorkbench(onlyMissing = true): Promise<{ jobId: number; state: string }> {
+  const raw = await request<unknown>("POST", "/workbench/scan-all", { onlyMissing }, { timeoutMs: 30000 });
+  const r = rec(raw);
+  return { jobId: numOr(r.jobId ?? r.job_id, 0), state: String(r.state ?? "") };
+}
 /** GET /api/import-runs/:id —— 执行进度（每单元 state 原样透传）。 */
 export async function getImportRun(id: number): Promise<ImportRun> {
   return runOf(await request<unknown>("GET", "/import-runs/" + id));

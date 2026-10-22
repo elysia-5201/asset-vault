@@ -372,16 +372,51 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           (scanGate && !scanGate.allowed ? ` INCOMPLETE(${scanGate.reasons.join(",")})` : "");
       }
     } else if (job().kind === "structure") {
-      // task-38：容器/资源单元识别。失败只影响本次作业与诊断事件，不改 assets 索引状态。
-      const itemId = Number(payload.itemId ?? job().item_id ?? 0);
-      if (!itemId) throw new Error("structure 需要 itemId");
-      const analyzed = await analyzeItemStructure(repo, itemId, deps.log);
-      ensureLease();
-      repo.logJobEvent(jobId, null, job().state, "structure_analyzed", JSON.stringify({
-        itemId, assets: analyzed.assets, units: analyzed.units, relations: analyzed.relations,
-        errors: analyzed.errors.slice(0, 10), errorCount: analyzed.errors.length,
-      }), lease);
-      scratch.note = `structure: item=${itemId} assets=${analyzed.assets} units=${analyzed.units} relations=${analyzed.relations} errors=${analyzed.errors.length}`;
+      // task-38/47：容器/资源单元识别。失败只影响本次作业与诊断事件，不改 assets 索引状态。
+      if (payload.all === true) {
+        const onlyMissing = payload.onlyMissing === true;
+        const targets = repo.listStructureScanTargets(onlyMissing);
+        const deadline = Date.now() + 10 * 60 * 1000;
+        let done = 0; let failedItems = 0; let units = 0;
+        const failures: { itemId: number; message: string }[] = [];
+        let truncated = false;
+        for (const itemId of targets) {
+          if (Date.now() > deadline) {
+            truncated = true;
+            repo.logJobEvent(jobId, null, job().state, "structure_all_deadline", JSON.stringify({ done, total: targets.length }), lease);
+            break;
+          }
+          ensureLease();
+          try {
+            const analyzed = await analyzeItemStructure(repo, itemId, deps.log);
+            done++; units += analyzed.units;
+          } catch (e) {
+            // 单项失败不中断整轮
+            failedItems++;
+            const message = (e as Error)?.message ?? String(e);
+            failures.push({ itemId, message });
+            deps.log("structure_all item " + itemId + " failed: " + message);
+          }
+          repo.logJobEvent(jobId, null, job().state, "structure_progress", JSON.stringify({
+            itemId, done, failed: failedItems, units, total: targets.length,
+          }), lease);
+          await new Promise<void>((r) => setImmediate(r));
+        }
+        repo.logJobEvent(jobId, null, job().state, "structure_analyzed", JSON.stringify({
+          all: true, onlyMissing, total: targets.length, done, failed: failedItems, units, truncated, failures: failures.slice(0, 10),
+        }), lease);
+        scratch.note = `structure_all: total=${targets.length} done=${done} failed=${failedItems} units=${units}` + (truncated ? " (deadline)" : "");
+      } else {
+        const itemId = Number(payload.itemId ?? job().item_id ?? 0);
+        if (!itemId) throw new Error("structure 需要 itemId");
+        const analyzed = await analyzeItemStructure(repo, itemId, deps.log);
+        ensureLease();
+        repo.logJobEvent(jobId, null, job().state, "structure_analyzed", JSON.stringify({
+          itemId, assets: analyzed.assets, units: analyzed.units, relations: analyzed.relations,
+          errors: analyzed.errors.slice(0, 10), errorCount: analyzed.errors.length,
+        }), lease);
+        scratch.note = `structure: item=${itemId} assets=${analyzed.assets} units=${analyzed.units} relations=${analyzed.relations} errors=${analyzed.errors.length}`;
+      }
     } else if (job().kind === "import") {
       // task-42：导入执行走 Job。外部副作用绝不自动重试：失败/中断把 run 标 interrupted、计划标 failed。
       const planId = Number(payload.planId ?? 0);

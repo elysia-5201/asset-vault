@@ -11,7 +11,7 @@ import { SearchBar } from "../src/components/SearchBar";
 import { CategoryEditor } from "../src/components/CategoryEditor";
 import { CategoryManager } from "../src/components/CategoryManager";
 import { PipelinePanel } from "../src/components/PipelinePanel";
-import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, UNIT_STATE_LABEL, isRunBusy, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
+import { AvatarWorkbench, MIXED_WARNING, PLAN_STATE_LABEL, PlanPanel, SCAN_ALL_LABEL, UNIT_STATE_LABEL, UnitsEmptyState, fallbackAvatarOf, isRunBusy, pickAvatarId, sameSlot, togglePick } from "../src/components/AvatarWorkbench";
 import { confirmImportPlan, executeImportPlan } from "../src/api";
 
 type Fail = string;
@@ -426,7 +426,23 @@ const mkRun = (states: string[]) => ({
 expect(isRunBusy(mkRun(["planned", "verified"])) === true, "工作台：还有 planned 单元 → 继续轮询");
 expect(isRunBusy(mkRun(["verified", "failed"])) === false, "工作台：全部终态 → 停止轮询");
 
+// task-48：Avatar 列表为空 → 用 Unity 工程里认出的 projectAvatar 兜底并选中
+expect(pickAvatarId([], { id: 5, name: "MANUKA" }) === 5, "工作台：avatars 为空时用 unityStatus.projectAvatar 兜底并选中");
+expect(pickAvatarId([{ id: 7 }, { id: 8 }], { id: 5, name: "x" }) === 7, "工作台：有列表时优先列表第一条（不被兜底抢走）");
+expect(pickAvatarId([], null) === null, "工作台：既没列表也没工程头像时保持未选中");
+const fbAvatar = fallbackAvatarOf({ id: 5, name: "MANUKA" });
+expect(fbAvatar.id === 5 && fbAvatar.name === "MANUKA" && fbAvatar.counts.total === 0, "工作台：兜底 Avatar 形状正确（计数全 0）");
+
+// task-48：units=0 空态 + 「扫描全部结构」按钮
+const emptyHtml = render("UnitsEmptyState", createElement(UnitsEmptyState, { scanning: false, onScanAll: () => {}, avatarName: "MANUKA", fallbackFromUnity: true } as any));
+expect(emptyHtml.includes(SCAN_ALL_LABEL), "工作台空态：有「" + SCAN_ALL_LABEL + "」按钮");
+expect(stripSsr(emptyHtml).includes("@MANUKA 名下还没有资源单元"), "工作台空态：点名当前 Avatar 没有单元");
+expect(emptyHtml.includes("onlyMissing=true") && emptyHtml.includes("Unity 工程里认出来的"), "工作台空态：说明只补缺失 + 兜底来源");
+const emptyScanning = render("UnitsEmptyState(scanning)", createElement(UnitsEmptyState, { scanning: true, onScanAll: () => {} } as any));
+expect(emptyScanning.includes("扫描中…"), "工作台空态：扫描中按钮显示进度且禁用");
+
 const wbHtml = render("AvatarWorkbench", createElement(AvatarWorkbench, { onClose: () => {}, onToast: () => {} } as any));
+expect(wbHtml.includes(SCAN_ALL_LABEL), "工作台：工具栏有「" + SCAN_ALL_LABEL + "」入口");
 for (const needle of ["Avatar 素材工作台", "选择 Avatar", "生成导入计划", "导入清单", "Unity 工程"]) {
   expect(wbHtml.includes(needle), "工作台面板 SSR 含「" + needle + "」");
 }
