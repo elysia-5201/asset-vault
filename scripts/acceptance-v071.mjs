@@ -193,8 +193,8 @@ function mockUnity() {
 
 function riskState(planView) { return planView && planView.plan ? planView.plan.risk_state ?? null : null; }
 function riskText(planView) { return JSON.stringify(planView && planView.plan ? planView.plan.risk_json ?? "" : "").toLowerCase(); }
-function tryPlan(repo, unitId) {
-  try { return { view: structure.createImportPlan(repo, { unitIds: [Number(unitId)], projectPath: PROJECT }), error: null }; }
+async function tryPlan(repo, unitId) {
+  try { return { view: await structure.createImportPlan(repo, { unitIds: [Number(unitId)], projectPath: PROJECT }), error: null }; }
   catch (e) { return { view: null, error: e }; }
 }
 
@@ -229,7 +229,7 @@ async function main() {
       const u = importableUnit(env, "risky");
       check("R0a", "RISK", "风险夹具解析出可导入单元（前置）", !!u, env.units.map((x) => x.name + ":" + x.policy + ":imp=" + x.importable).join(" | "));
       if (!u) throw new Error("no importable unit for risky fixture");
-      const view0 = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
+      const view0 = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
       const applied = typeof structure.applyPlanRisk === "function" ? await structure.applyPlanRisk(env.repo, view0.plan.id) : null;
       const view = applied ?? view0;
       const risks = view.risks;
@@ -259,7 +259,7 @@ async function main() {
       if (!u) fail("R5", "RISK", "大小写夹具无可导入单元", env.units.map((x) => x.name + ":" + x.importable).join(" | "));
       else if (typeof structure.applyPlanRisk !== "function") skip("R5", "RISK", "大小写/反斜杠（ASSETS\\\\EDITOR\\\\Bad.CS、.DLL）必须识别", "接口未就绪（同 R0b）");
       else {
-        const v0 = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
+        const v0 = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
         const v = (await structure.applyPlanRisk(env.repo, v0.plan.id)) ?? v0;
         const types = new Set((v.risks && v.risks.hits ? v.risks.hits : []).map((h) => String(h.type)));
         check("R5", "RISK", "大小写/反斜杠（ASSETS\\\\EDITOR\\\\Bad.CS、.DLL）→ editor_code + assembly",
@@ -317,7 +317,7 @@ async function main() {
       check("R7", "RISK", "损坏包 → 无可导入单元（unknown/limited，不伪造成功）", importables.length === 0 && limited.length >= 1,
         env.units.map((u) => u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
       if (limited[0]) {
-        const r = tryPlan(env.repo, limited[0].id);
+        const r = await tryPlan(env.repo, limited[0].id);
         check("R8", "RISK", "unknown/limited 单元建计划被拒（INVALID_INPUT）", errCode(r.error) === "INVALID_INPUT", "code=" + errCode(r.error));
       } else skip("R8", "RISK", "unknown 单元建计划门禁", "没有 limited 单元可测");
     } finally { env.t.close(); }
@@ -356,7 +356,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = importableUnit(env, "ok_single");
-      const view = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
+      const view = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
       check("P1", "PLAN", "干净单包计划建立（ready）", view.plan.status === "ready", view.plan.status);
       appendFileSync(single, Buffer.alloc(64, 0x41));
       env.t.db.prepare("UPDATE assets SET size=?, mtime=? WHERE id=?").run(statSync(single).size, new Date(statSync(single).mtimeMs).toISOString(), env.assets.s);
@@ -373,7 +373,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = importableUnit(env, "ok_single");
-      const v0 = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
+      const v0 = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
       let view = (typeof structure.applyPlanRisk === "function" ? await structure.applyPlanRisk(env.repo, v0.plan.id) : null) ?? v0;
       if (["needs_confirmation", "blocked"].includes(String(view.plan.status))) {
         let confirmed = null;
@@ -443,7 +443,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = importableUnit(env, "ok_single");
-      const v0 = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
+      const v0 = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
       let view = (typeof structure.applyPlanRisk === "function" ? await structure.applyPlanRisk(env.repo, v0.plan.id) : null) ?? v0;
       if (["needs_confirmation", "blocked"].includes(String(view.plan.status))) {
         try { view = structure.confirmImportPlan(env.repo, view.plan.id, { riskAck: true }); } catch { /* blocked 留给 R9 */ }
@@ -542,7 +542,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = importableUnit(env, "ok_single");
-      const planId = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT }).plan.id;
+      const planId = (await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT })).plan.id;
       const pi = env.repo.listImportPlanItems(planId)[0];
       const run = env.repo.createImportRun({ planId });
       const ri = env.repo.addImportRunItem({ runId: run.id, planItemId: pi.id, unitId: pi.unit_id });
@@ -552,7 +552,7 @@ async function main() {
       try { structure.transitionRunItem(env.repo, ri.id, "verified"); } catch (e) { code = errCode(e); }
       check("M1", "MACHINE", "importing→unknown 允许；unknown 终态（→verified 抛 INVALID_TRANSITION）", code === "INVALID_TRANSITION", "code=" + code);
       // 第二个终端状态样本必须用独立 plan（UNIQUE(plan_id,unit_id) / UNIQUE(run_id,plan_item_id)）
-      const planId2 = structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT }).plan.id;
+      const planId2 = (await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT })).plan.id;
       const pi2 = env.repo.listImportPlanItems(planId2)[0];
       const run2 = env.repo.createImportRun({ planId: planId2 });
       const ri2 = env.repo.addImportRunItem({ runId: run2.id, planItemId: pi2.id, unitId: pi2.unit_id });

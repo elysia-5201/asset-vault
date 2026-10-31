@@ -311,17 +311,17 @@ async function main() {
       const byName = (n) => importables.find((u) => String(u.name).includes(n));
       const model = byName("MANUKA_model"), material = byName("MANUKA_material"), texture = byName("MANUKA_texture");
       check("B-1a", "PLAN", "D 分析出 3 个可导入单元（model/material/texture）", !!model && !!material && !!texture, env.units.map((u) => u.name + ":" + u.policy).join(" | "));
-      const p1 = createImportPlan(env.repo, { unitIds: [Number(model.id), Number(material.id)], projectPath: project, includeSuggested: false });
+      const p1 = await createImportPlan(env.repo, { unitIds: [Number(model.id), Number(material.id)], projectPath: project, includeSuggested: false });
       check("B-1b", "PLAN", "includeSuggested=false：计划只含 2 个选中单元、不含 suggested", p1.items.length === 2 && p1.items.every((it) => it.status !== "suggested"), JSON.stringify(p1.items.map((it) => it.unit_name + ":" + it.status)));
       check("B-1d", "PLAN", "计划内容 = 恰好 2 个选中单元，无无关单元", new Set(p1.items.map((it) => Number(it.unit_id))).size === 2 && [model, material].every((u) => p1.items.some((it) => Number(it.unit_id) === Number(u.id))), "planId=" + p1.plan.id);
       // 真实链路：analyze 生成的关系 → includeSuggested=true 自动加入伴生（选 模型+材质 → 建议贴图）
-      const p2 = createImportPlan(env.repo, { unitIds: [Number(model.id), Number(material.id)], projectPath: project, includeSuggested: true });
+      const p2 = await createImportPlan(env.repo, { unitIds: [Number(model.id), Number(material.id)], projectPath: project, includeSuggested: true });
       const sug = p2.items.filter((it) => it.status === "suggested");
       const rels = env.repo.listUnitRelations([Number(model.id), Number(material.id)]);
       check("B-1c", "PLAN", "includeSuggested=true（真实 analyze 关系）：加入伴生单元且标 suggested", p2.items.length === 3 && sug.length === 1 && p2.plan.status === "needs_confirmation" && Number(sug[0].unit_id) === Number(texture.id), "items=" + JSON.stringify(p2.items.map((it) => it.unit_name + ":" + it.status)) + " relations=" + rels.length);
       // 正例对照：人工关系（与后端单测同法）时 includeSuggested 必须生效（不依赖 analyze 方向）
       env.repo.replaceUnitRelations([Number(texture.id)], [{ fromUnitId: Number(texture.id), toUnitId: Number(material.id), type: "suggested_companion", evidence: "manual control", confidence: "probable" }]);
-      const p3 = createImportPlan(env.repo, { unitIds: [Number(texture.id)], projectPath: project, includeSuggested: true });
+      const p3 = await createImportPlan(env.repo, { unitIds: [Number(texture.id)], projectPath: project, includeSuggested: true });
       const sug3 = p3.items.filter((it) => it.status === "suggested");
       check("B-1e", "PLAN", "正例对照：有关系时 includeSuggested 加入且仅标 suggested", p3.items.length === 2 && sug3.length === 1 && p3.plan.status === "needs_confirmation", JSON.stringify(p3.items.map((it) => it.unit_name + ":" + it.status)));
     } finally { env.t.close(); }
@@ -335,7 +335,7 @@ async function main() {
       const u = unitOf(env, env.assets.b);
       check("B-2a", "PLAN", "B 单元 policy=mixed_unitypackage 且可导入", u && u.policy === "mixed_unitypackage" && Number(u.importable) === 1, u && u.policy);
       const before = readdirSync(e2e).sort().join(",");
-      const view = createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
+      const view = await createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
       const item = view.items[0];
       check("B-2b", "PLAN", "mixed plan_item.path === 原始整包路径", item && item.path === mixedPath, item && item.path);
       check("B-2c", "PLAN", "计划阶段不产生暂存/筛选包（目录未新增文件）", readdirSync(e2e).sort().join(",") === before && !String(item.path).includes("filtered"), "dirs=" + readdirSync(e2e).join(","));
@@ -350,7 +350,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = unitOf(env, env.assets.s);
-      const view = createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
+      const view = await createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
       check("B-3a", "PLAN", "单包计划建立（ready）", view.plan.status === "ready" && view.items.length === 1, view.plan.status);
       appendFileSync(single, Buffer.alloc(64, 0x41));
       // 模拟重扫描：真实流程由 scan/watcher 更新 assets.size/mtime；precheck 比较的是 DB 行与单元指纹
@@ -371,7 +371,7 @@ async function main() {
     const env = await seedEnv([{ key: "s", path: single, container: "unitypackage", kind: "unitypackage" }]);
     try {
       const u = unitOf(env, env.assets.s);
-      const view = createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
+      const view = await createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
       const h0 = await sha256File(single);
       let code = null;
       try { await executeImportPlan({ repo: env.repo, unity: unavailableUnity, stagingDir: staging, waitMs: 0 }, view.plan.id); } catch (e) { code = errCode(e); }
@@ -399,7 +399,7 @@ async function main() {
       const nested = importable.find((u) => String(u.rel_path || "").includes("::"));
       check("E5-2a", "E", "depth=3 嵌套 → 服务展开出可导入单元（rel_path 含 ::）", importable.length >= 1 && !!nested, env3.units.map((u) => (u.rel_path || "(container)") + ":" + u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
       let planItems = -1;
-      try { planItems = createImportPlan(env3.repo, { unitIds: [Number(nested.id)], projectPath: project }).items.length; } catch { planItems = -1; }
+      try { planItems = (await createImportPlan(env3.repo, { unitIds: [Number(nested.id)], projectPath: project })).items.length; } catch { planItems = -1; }
       check("E5-2b", "E", "depth=3 单元可建计划（单条）", planItems === 1, "planItems=" + planItems);
     } finally { env3.t.close(); }
   } catch (e) { fail("E5-2a", "E", "E5-2 depth3 执行异常", String((e && e.stack) || e)); }
@@ -410,7 +410,7 @@ async function main() {
       const importable = env4.units.filter((u) => Number(u.importable) === 1);
       check("E5-2c", "E", "depth=4 超过上限 → limited 单元、无可导入单元", limited.length >= 1 && importable.length === 0, env4.units.map((u) => (u.rel_path || "(container)") + ":" + u.policy + ":" + u.parse_state + ":imp=" + u.importable).join(" | "));
       let code = null;
-      try { createImportPlan(env4.repo, { unitIds: [Number(limited[0].id)], projectPath: project }); } catch (e) { code = errCode(e); }
+      try { await createImportPlan(env4.repo, { unitIds: [Number(limited[0].id)], projectPath: project }); } catch (e) { code = errCode(e); }
       check("E5-2d", "E", "超限单元建计划 → INVALID_INPUT（不伪造可执行计划）", code === "INVALID_INPUT", "code=" + code);
     } finally { env4.t.close(); }
   } catch (e) { fail("E5-2c", "E", "E5-2 depth4 执行异常", String((e && e.stack) || e)); }
