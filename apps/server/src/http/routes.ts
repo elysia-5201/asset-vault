@@ -13,7 +13,7 @@ import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
 import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlanWithRisk, applyPlanRisk, getRunView, cancelImportRun, sweepStaging } from "../services/structure";
-import { unityMcpBoundary } from "../services/unity";
+import { unityMcpBoundary, unityEndpointPlan, validateUnityMcpUrl, publicMcpUrl, sanitizeMcpUrl, isLoopbackMcpUrl } from "../services/unity";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 import { parseProtocolUrl, downloadBoothFile, isAllowedBoothUrl } from "../services/download";
 import { importBoothUrl } from "../services/booth";
-import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, importPackagesIntoUnity, readUnityConsole, clearUnityConsole, matchAvatarByText, setUnityLogger, baseName, sleep } from "../services/unity";
+import { UnityMcp, UNITY_MCP_URLS, unityEditorInfo, listUnityPackageCandidates, stageUnityPackage, matchAvatarByText, setUnityLogger, baseName } from "../services/unity";
 import { findDuplicatesForItem, listDuplicateGroups, recomputeSignatures } from "../services/dedupe";
 import { itemUsage, projectUsage, scanProjectUsage } from "../services/projectusage";
 import { relateItems } from "../../../../packages/core/src/related";
@@ -231,24 +231,24 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   /** 工程目录名 → avatar（E:\\game\\vrchatcache\\manuka → Manuka）。 */
   const projectAvatarOf = (projectPath?: string | null) => (projectPath ? matchAvatarByText(avatarLite(), String(projectPath)) : null);
 
-  /** Unity 桥端点：settings.unity_mcp_url 优先，否则探测本机两个已知端口。 */
-  const unityUrls = (): string[] => {
-    const saved = (repo.getSetting("unity_mcp_url") ?? "").trim();
-    return saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
-  };
-  let unityCache: { key: string; client: UnityMcp } | null = null;
-  const unity = (): UnityMcp => {
-    const urls = unityUrls();
-    const key = urls.join(",");
-    if (!unityCache || unityCache.key !== key) unityCache = { key, client: new UnityMcp(urls) };
-    return unityCache.client;
+  /**
+   * Unity 桥端点：settings.unity_mcp_url 优先，否则探测本机两个已知端口。
+   * **统一走 services/unity 的边界**（task-1）：旧 routes 自己拼 URL 的路径会绕过 loopback 拒远端，
+   * 这里起就只能拿到边界过滤后的 urls，前端候选也只用已脱敏的 candidates。
+   */
+  const unityEndpoints = () => unityEndpointPlan(repo);
+  /** 健康/诊断用：边界结论的对外形态（不含可连接 raw URL）。 */
+  const publicMcpPlan = (r: typeof repo) => {
+    const p = unityEndpointPlan(r);
+    return { allowRemote: p.allowRemote, candidates: p.candidates, dropped: p.dropped };
   };
 
   // ---------- health ----------
   app.get("/api/health", async () => ({
     ok: true, version: deps.version, dbPath: deps.dbPath,
     roots: repo.listRoots(), counts: repo.stats(),
-    unity_mcp: unityMcpBoundary(repo),
+    // 只暴露脱敏候选与丢弃计数：raw URL 可能内嵌凭据/token，健康接口不该回显
+    unity_mcp: publicMcpPlan(repo),
     build: deps.build ?? null,
   }));
 
@@ -1170,15 +1170,17 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
 
   // ---------- Unity 编辑器（mcp-for-unity）：把素材真正导入"当前打开的那个工程" ----------
   app.get("/api/unity/status", async () => {
+    const plan = unityEndpoints();
     // 状态探测用短超时的独立客户端：Unity 没开时不能把请求吊住。
-    const u = new UnityMcp(unityUrls(), 8000);
-    const candidates = unityUrls();
+    const u = new UnityMcp(plan.urls, 8000);
+    const base = { endpoint: sanitizeMcpUrl(u.endpoint), candidates: plan.candidates, dropped: plan.dropped.length, allowRemote: plan.allowRemote };
     try {
       const editor = await unityEditorInfo(u);
       const proj = (repo.listProjects() as any[]).find((p) => p.path_norm === normalizePath(editor.projectPath));
-      return { ok: true, endpoint: u.endpoint, serverName: u.serverName, editor, projectAvatar: projectAvatarOf(editor.projectPath), projectId: proj?.id ?? null, registered: !!proj, candidates };
+      return { ok: true, ...base, serverName: u.serverName, editor, projectAvatar: projectAvatarOf(editor.projectPath), projectId: proj?.id ?? null, registered: !!proj };
     } catch (e) {
-      return { ok: false, endpoint: u.endpoint, serverName: "", error: String((e as Error)?.message ?? e), projectAvatar: null, candidates };
+      // 连不上是常态（Unity 没开）；但被丢弃的远端地址只报数量，不回显主机/凭据。
+      return { ok: false, ...base, serverName: "", error: String((e as Error)?.message ?? e), projectAvatar: null };
     }
   });
 
@@ -1203,56 +1205,24 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     } catch (e) { return fail(reply, e); }
   });
 
-  /** 真正导入：解出包 → AssetDatabase.ImportPackage(path,false) → 登记 project_imports。 */
-  app.post("/api/unity/import", async (req, reply) => {
-    try {
-      const b = (req.body ?? {}) as any;
-      const itemId = toInt(b.itemId, 0);
-      if (!itemId) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 必填" } });
-      if (!repo.getItem(itemId)) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "条目不存在" } });
-
-      const u = unity();
-      const editor = await unityEditorInfo(u);
-      const projectAvatar = projectAvatarOf(editor.projectPath);
-      const all = (await listUnityPackageCandidates(repo, itemId, { avatars: avatarLite(), projectAvatarId: projectAvatar?.id ?? null })).packages;
-      const keys: string[] = Array.isArray(b.keys) ? b.keys.map((k: any) => String(k)) : [];
-      // 没显式指定要哪些包时：优先只导"当前工程那个 avatar"的包（存在的话），否则全导
-      const auto = projectAvatar ? all.filter((c) => c.matched) : [];
-      const picked = (keys.length ? all.filter((c) => keys.includes(c.key)) : (auto.length ? auto : all)).slice(0, 20);
-      if (!picked.length) {
-        return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "这个条目里没有可导入的 .unitypackage（压缩包还没索引的话，先在资产上重建索引）" } });
-      }
-
-      // 先清控制台：导入后读到的 error 才是这次导入产生的（否则会把编辑器里的历史报错算成导入报错）。
-      const consoleCleared = await clearUnityConsole(u);
-      const stagingDir = join(deps.dataDir, "unity-staging");
-      const staged: { key: string; label: string; assetId: number; stagedPath: string; bytes: number }[] = [];
-      for (const c of picked) {
-        const s = await stageUnityPackage(c, stagingDir);
-        staged.push({ key: c.key, label: c.label, assetId: c.assetId, stagedPath: s.path, bytes: s.bytes });
-      }
-
-      const r = await importPackagesIntoUnity(u, staged.map((s) => s.stagedPath));
-      const projectId = repo.ensureProject(editor.projectName || basename(editor.projectPath), editor.projectPath);
-      repo.setProjectUnityVersion(projectId, editor.unityVersion || null);
-      for (const s of staged) {
-        repo.addProjectImport(projectId, itemId, s.assetId, "unity:" + s.label + " (" + Math.round(s.bytes / 1048576) + "MB)");
-      }
-
-      // Unity 的导入是异步的：等一拍再读控制台里的 error，方便前端直接显示"导完有没有报错"。
-      let consoleErrors: string[] = [];
-      if (r.queued.length) { await sleep(1800); consoleErrors = await readUnityConsole(u, ["error"], 20); }
-      deps.log("unity import: item " + itemId + " -> " + editor.projectName + " queued=" + r.queued.length + " failed=" + r.failed.length + " errors=" + consoleErrors.length);
-
-      return {
-        ok: r.failed.length === 0, endpoint: u.endpoint,
-        project: { id: projectId, name: editor.projectName, path: editor.projectPath, unityVersion: editor.unityVersion, avatar: projectAvatar },
-        autoMatched: keys.length === 0 && auto.length > 0,
-        imported: staged.map((s) => ({ key: s.key, label: s.label, stagedPath: s.stagedPath, bytes: s.bytes })),
-        consoleCleared, queued: r.queued, failed: r.failed, consoleErrors, raw: r.raw,
-      };
-    } catch (e) { return fail(reply, e); }
-  });
+  /**
+   * **已弃用**的旧直导接口：从前它自己解包 → AssetDatabase.ImportPackage → 写 project_imports，
+   * 完全绕过 计划快照 → 风险确认 → Job 验证（新链路在 /api/import-plans）。
+   * task-1：不再执行任何动作（不连 Unity、不落 staging、不写台账），只回可操作的迁移错误。
+   */
+  const UNITY_IMPORT_MIGRATION = {
+    plan: "POST /api/import-plans {unitIds, projectPath}",
+    confirm: "POST /api/import-plans/:id/confirm {riskAck:true}",
+    execute: "POST /api/import-plans/:id/execute → 202 {jobId, planId}",
+    workbench: "前端「头像工作台」：按单元勾选 → 看风险 → 确认 → 执行",
+  };
+  app.post("/api/unity/import", async (_req, reply) => reply.status(409).send({
+    error: {
+      code: "UNITY_IMPORT_REQUIRES_PLAN",
+      message: "直接导入接口已弃用：它跳过计划快照、风险确认与作业验证。请改用 /api/import-plans（建计划 → confirm → execute），或从前端「头像工作台」导入。",
+      migration: UNITY_IMPORT_MIGRATION,
+    },
+  }));
 
   // ---------- 套装 / 合集（collection）与条目合并 ----------
   app.get("/api/collections", async () => ({ collections: repo.listCollections() }));
@@ -1639,7 +1609,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     dataDir: deps.dataDir,
     dbPath: deps.dbPath,
     watchPaths: listWatches(repo),
-    unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
+    unityMcpUrl: publicMcpUrl((repo.getSetting("unity_mcp_url") ?? "").trim()),
+    /** 是否显式允许非回环 MCP 端点（默认 false：本工具只驱动本机 Unity） */
+    unityMcpAllowRemote: String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1",
     unityMcpCandidates: UNITY_MCP_URLS,
     /** 检查更新的仓库覆盖（owner/repo）；空 = 用内置默认仓库 */
     updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
@@ -1653,7 +1625,21 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         mkdirSync(b.downloadRoot.trim(), { recursive: true });
         repo.setSetting("download_root", b.downloadRoot.trim());
       }
-      if (typeof b.unityMcpUrl === "string") repo.setSetting("unity_mcp_url", b.unityMcpUrl.trim());
+      // Unity MCP 地址：形状/协议/回环边界都在写库前校验（非法值不落库，也不会出现在日志里）。
+      if (typeof b.unityMcpUrl === "string") {
+        const allowRemote = b.unityMcpAllowRemote === true || String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1";
+        const check = validateUnityMcpUrl(b.unityMcpUrl, { allowRemote });
+        if (!check.ok) return reply.status(400).send({ error: { code: check.code, message: check.message } });
+        repo.setSetting("unity_mcp_url", check.url);
+      }
+      // 显式开关：关掉时，已保存的远程地址必须一起清掉（否则关网关却没关端点）
+      if (typeof b.unityMcpAllowRemote === "boolean") {
+        repo.setSetting("unity_mcp_allow_remote", b.unityMcpAllowRemote ? "1" : "");
+        if (!b.unityMcpAllowRemote) {
+          const saved = (repo.getSetting("unity_mcp_url") ?? "").trim();
+          if (saved && !isLoopbackMcpUrl(saved)) repo.setSetting("unity_mcp_url", "");
+        }
+      }
       // 检查更新的仓库覆盖：空串 = 清掉（回到内置默认）；形状非法直接 400，别让脏值悄悄留库
       if (typeof b.updateRepo === "string") {
         const v = b.updateRepo.trim();
@@ -1664,7 +1650,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (typeof b.updateToken === "string") repo.setSetting(UPDATE_TOKEN_KEY, b.updateToken.trim());
       return {
         downloadRoot: downloadRootOf(repo, deps.dataDir),
-        unityMcpUrl: (repo.getSetting("unity_mcp_url") ?? "").trim(),
+        unityMcpUrl: publicMcpUrl((repo.getSetting("unity_mcp_url") ?? "").trim()),
+        unityMcpAllowRemote: String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1",
         updateRepo: (repo.getSetting(UPDATE_REPO_KEY) ?? "").trim(),
         updateTokenSet: !!(repo.getSetting(UPDATE_TOKEN_KEY) ?? "").trim(),
       };

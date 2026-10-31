@@ -36,6 +36,42 @@ export function sanitizeMcpUrl(raw: string): string {
   catch { return "<invalid-url>"; }
 }
 
+const ALLOWED_MCP_PROTOCOLS = new Set(["http:", "https:"]);
+
+export type UnityMcpUrlCheck = { ok: true; url: string } | { ok: false; code: string; message: string };
+
+/**
+ * settings 校验：URL 形状 + 协议 + 回环边界。**不做网络探测**（纯函数，可测）。
+ * 空串合法（= 用默认候选）。内嵌用户名/密码一律拒绝：日志/健康/状态接口不该有机会泄露凭据。
+ */
+export function validateUnityMcpUrl(raw: string, opts: { allowRemote?: boolean } = {}): UnityMcpUrlCheck {
+  const text = String(raw ?? "").trim();
+  if (!text) return { ok: true, url: "" };
+  let u: URL;
+  try { u = new URL(text); } catch { return { ok: false, code: "INVALID_URL", message: "Unity MCP 地址不是合法 URL（需要 http:// 或 https:// 开头）" }; }
+  if (!ALLOWED_MCP_PROTOCOLS.has(u.protocol)) {
+    return { ok: false, code: "INVALID_PROTOCOL", message: "Unity MCP 地址只接受 http/https（收到 " + u.protocol + "）" };
+  }
+  if (!u.hostname) return { ok: false, code: "INVALID_URL", message: "Unity MCP 地址缺少主机名" };
+  if (u.username || u.password) {
+    return { ok: false, code: "URL_CREDENTIALS", message: "Unity MCP 地址不得内嵌用户名/密码（凭据会出现在日志/状态里）：" + sanitizeMcpUrl(text) };
+  }
+  if (!opts.allowRemote && !isLoopbackMcpUrl(text)) {
+    return {
+      ok: false, code: "REMOTE_NOT_ALLOWED",
+      message: "拒绝把 Unity MCP 地址指到非回环主机（" + sanitizeMcpUrl(text) + "）：本工具只驱动本机 Unity。"
+        + "确需远程请显式设置 unity_mcp_allow_remote='1'。",
+    };
+  }
+  return { ok: true, url: text };
+}
+
+/** 对外回显用：内嵌凭据的 URL 降级成协议+主机+路径；其余原样（查询串可能是 MCP token，不在日志里回显）。 */
+export function publicMcpUrl(raw: string): string {
+  const text = String(raw ?? "").trim();
+  return text.includes("@") ? sanitizeMcpUrl(text) : text;
+}
+
 export interface McpBoundary { allowRemote: boolean; urls: string[]; dropped: string[] }
 export function unityMcpBoundary(repo: Pick<Repo, "getSetting">): McpBoundary {
   const saved = String(repo.getSetting("unity_mcp_url") ?? "").trim();
@@ -50,6 +86,13 @@ export function unityMcpBoundary(repo: Pick<Repo, "getSetting">): McpBoundary {
     console.warn("[assetvault] unity MCP non-loopback endpoint(s) ignored: " + dropped.join(", ") + " (set settings.unity_mcp_allow_remote='1' to permit)");
   }
   return { allowRemote, urls: urls.length ? urls : UNITY_MCP_URLS.slice(), dropped };
+}
+
+/** routes 用的完整端点计划：可连接 URL + 已脱敏候选（前端/日志只拿 candidates，绝不拿内嵌凭据的原始串）。 */
+export interface UnityEndpointPlan extends McpBoundary { candidates: string[] }
+export function unityEndpointPlan(repo: Pick<Repo, "getSetting">): UnityEndpointPlan {
+  const b = unityMcpBoundary(repo);
+  return { ...b, candidates: b.urls.map(sanitizeMcpUrl) };
 }
 
 export function unityClientFor(repo: Pick<Repo, "getSetting">): UnityMcp {

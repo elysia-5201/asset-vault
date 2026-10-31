@@ -17,6 +17,7 @@ import { IndexPipeline } from "./services/pipeline/pipeline";
 import { resolveLimits, limitsHash } from "./services/pipeline/limits";
 import { acquirePipelineLock, type PipelineLock } from "./services/pipeline/lock";
 import { adoptLegacyStaging, sweepStagingOnStartup } from "./services/structure";
+import { assertLocalListenHost } from "./listen-host";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -128,7 +129,10 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
       });
     }
     const port = opts.port ?? Number(process.env.PORT ?? 7317);
-    const host = opts.host ?? process.env.HOST ?? "127.0.0.1";
+    // task-1 C：本机工具没有账号/token 体系 → 非回环监听默认拒绝（显式 ASSETVAULT_ALLOW_REMOTE_LISTEN=1 才放行）。
+    const host = assertLocalListenHost(opts.host ?? process.env.HOST ?? "127.0.0.1", {
+      allowRemote: process.env.ASSETVAULT_ALLOW_REMOTE_LISTEN === "1",
+    });
     await fastify.listen({ port, host });
     app = fastify;
     // v6 租约：只有取得单写入者锁的实例才跑 jobs。未取得锁的实例只提供 HTTP 接口，

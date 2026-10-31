@@ -108,7 +108,7 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | GET | `/update-check?force=1` | 检查应用更新（见「检查更新」） |
 | GET | `/unity/status` | Unity 桥探测（连不上也是 200） |
 | GET | `/unity/packages?itemId=` | 可导入的 .unitypackage 清单 |
-| POST | `/unity/import` `{itemId, keys?}` | **真导入**到当前打开的 Unity 工程 |
+| POST | `/unity/import` | **已弃用（409）**：直导绕过计划/风险确认/作业验证，改用 `/import-plans` |
 
 ## 检查更新
 
@@ -132,12 +132,13 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/unity/status` | 探测当前编辑器。**连不上也返回 200**：`{ok:false, error, candidates[]}`；成功时带 `editor:{projectPath, projectName, unityVersion, isPlaying, isCompiling, scenePath}` |
+| GET | `/unity/status` | 探测当前编辑器。**连不上也返回 200**：`{ok:false, error, candidates[], dropped, allowRemote}`；成功时带 `editor:{projectPath, projectName, unityVersion, isPlaying, isCompiling, scenePath}`。`candidates` 是**边界过滤且已脱敏**的地址（非回环默认被丢弃，只在 `dropped` 里计数，不回显主机/凭据） |
 | GET | `/unity/packages?itemId=` | 这个条目里可导入的 `.unitypackage`（压缩包内的、含一层 zip 套 zip 的也列）：`{itemId, packages:[{key, label, assetId, container, sourcePath, entryPath, innerEntryPath, size, note?}]}` |
-| POST | `/unity/import` `{itemId, keys?}` | `keys` 省略=全部（上限 20）。返回 `{ok, endpoint, project:{id,name,path,unityVersion}, imported[], queued[], failed[], consoleErrors[], consoleCleared}` |
+| POST | `/unity/import` | **已弃用**：永远 `409 {error:{code:"UNITY_IMPORT_REQUIRES_PLAN", message, migration:{plan,confirm,execute,workbench}}}`，**无任何副作用**（不连 Unity、不落 staging、不写 `project_imports`）。导入请走 `/import-plans`（见「头像工作台」） |
 
 行为要点：
-- 导入前**清空 Unity 控制台**，导入后隔 1.8s 回读 `read_console` 的 error —— 所以 `consoleErrors` 一定是这次导入产生的。
+- **MCP 端点边界**（task-1）：`settings.unity_mcp_url` 写库前校验形状/协议（只 http/https、不得内嵌用户名密码），非回环主机默认拒绝（`REMOTE_NOT_ALLOWED`），需显式 `PUT /settings {unityMcpAllowRemote:true}`（底层键 `unity_mcp_allow_remote=1`）才放行；日志/健康/状态只出现脱敏地址。
+- 导入前**清空 Unity 控制台**，导入后回读 `read_console` 的 error —— 计划执行链路按单元做，逐项状态可追溯（`import_runs` / `run_items`）。
 - 压缩包内的包会先"落地"到 `<dataDir>/unity-staging/<assetId>/`，再交给 Unity（`AssetDatabase.ImportPackage` 只吃磁盘上的文件）。
 - 当前工程会自动登记进 `projects`（`unity_version` 由编辑器上报）并写 `project_imports`。
 - WSL 里跑服务也能用：路径会自动翻译成 `/mnt/c/...`→`C:\...`、其余→`\\wsl.localhost\<distro>\...`。

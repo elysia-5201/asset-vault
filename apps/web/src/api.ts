@@ -497,7 +497,13 @@ export interface UnityEditorInfoWeb {
 export interface UnityAvatarHintWeb { id: number; name: string; via: string }
 export interface UnityStatusWeb {
   ok: boolean; endpoint: string; serverName?: string; error?: string; editor?: UnityEditorInfoWeb;
-  projectAvatar?: UnityAvatarHintWeb | null; projectId?: number | null; registered?: boolean; candidates: string[];
+  projectAvatar?: UnityAvatarHintWeb | null; projectId?: number | null; registered?: boolean;
+  /** 边界过滤后**可连接**的候选（已脱敏：回环，或显式 allow_remote 放行的远端） */
+  candidates: string[];
+  /** 因非回环被丢弃的端点数（>0 时前端提示"已忽略"） */
+  dropped?: number;
+  /** 是否显式允许非回环端点 */
+  allowRemote?: boolean;
 }
 export interface UnityPackageWeb {
   key: string; label: string; assetId: number; container: string; sourcePath: string;
@@ -507,22 +513,17 @@ export interface UnityPackageWeb {
   /** 是否匹配"当前打开那个工程"的 avatar */
   matched?: boolean;
 }
-export interface UnityImportWeb {
-  ok: boolean; endpoint: string; autoMatched?: boolean;
-  project: { id: number; name: string; path: string; unityVersion: string; avatar?: UnityAvatarHintWeb | null };
-  imported: { key: string; label: string; stagedPath: string; bytes: number }[];
-  queued: string[]; failed: string[]; consoleErrors: string[]; consoleCleared?: boolean; raw: string;
-}
 /** 探测当前打开的 Unity 编辑器（MCP for Unity）。Unity 没开时返回 {ok:false}，不抛错。 */
 export function unityStatus(): Promise<UnityStatusWeb> { return request("GET", "/unity/status", undefined, { timeoutMs: 12000 }); }
 /** 这个条目里能导入 Unity 的 .unitypackage（压缩包内的、zip 套 zip 的都列）。传 projectPath 时会标出"哪些是当前工程那个 avatar 的"。 */
 export function unityPackages(itemId: number, projectPath?: string | null, refresh = false): Promise<{ itemId: number; projectAvatar: UnityAvatarHintWeb | null; scanErrors?: number; packages: UnityPackageWeb[] }> {
   return request("GET", "/unity/packages" + queryString({ itemId, project: projectPath ?? undefined, refresh: refresh ? 1 : undefined }), undefined, { timeoutMs: 150000 });
 }
-/** 真正导入到当前打开的 Unity 工程；keys 省略 = 全部导入。 */
-export function unityImport(itemId: number, keys?: string[]): Promise<UnityImportWeb> {
-  return request("POST", "/unity/import", { itemId, keys }, { timeoutMs: 180000 });
-}
+/*
+ * task-1：旧 `POST /unity/import` 直导接口已弃用（后端 409 UNITY_IMPORT_REQUIRES_PLAN）——
+ * 它绕过 计划快照 → 风险确认 → 作业验证。导入统一走 /import-plans（createImportPlans →
+ * confirmImportPlan → executeImportPlan，即「头像工作台」链路）。
+ */
 export function linkBooth(id: number, url: string, merge = false): Promise<unknown> {
   return request("POST", "/items/" + id + "/link-booth", { url, merge });
 }

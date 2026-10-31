@@ -4,7 +4,7 @@ import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
   deleteCollection, getCollection, getItem, getItemDuplicates, getRelatedItems, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
-  itemUsage, scanProjectUsage, unityImport, unityPackages, unityStatus,
+  itemUsage, scanProjectUsage, unityPackages, unityStatus,
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
 import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
@@ -50,6 +50,8 @@ export function ItemDetail(props: {
   onMarkImported: (itemId: number, projectId: number) => void;
   /** 打开另一个条目的详情（「疑似重复」里点「打开 #id」用）。 */
   onOpenItem: (itemId: number) => void;
+  /** 打开「头像工作台」——唯一合法的导入入口（计划 → 风险确认 → 作业）。 */
+  onOpenWorkbench?: () => void;
 }) {
   const { itemId } = props;
   const [detail, setDetail] = useState<ItemDetailWeb | null>(null);
@@ -361,22 +363,16 @@ export function ItemDetail(props: {
     return () => { alive = false; };
   }, [collIds]);
 
-  const doUnityImport = () => {
-    if (!unityPicked.size || unityBusy) return;
-    setUnityBusy(true); setUnityNote(""); setUnityErrors([]);
-    unityImport(itemId, [...unityPicked])
-      .then((r) => {
-        const name = r.project?.name ?? "Unity";
-        setUnityNote("已把 " + r.queued.length + " 个包交给 " + name + "（" + (r.project?.unityVersion ?? "") + "）导入"
-          + (r.failed.length ? "；失败 " + r.failed.length + " 个：" + r.failed.join(" / ") : "")
-          + (r.imported.length ? "；落地：" + r.imported.map((x) => x.label + " " + formatBytes(x.bytes)).join(", ") : ""));
-        setUnityErrors(r.consoleErrors ?? []);
-        props.onToast("ok", "已导入到 " + name + (r.consoleErrors?.length ? "（控制台有 " + r.consoleErrors.length + " 条报错）" : "（控制台无报错）"));
-        props.onChanged();
-        load();
-      })
-      .catch((e) => { setUnityNote("导入失败：" + describeError(e)); props.onToast("bad", describeError(e)); })
-      .finally(() => setUnityBusy(false));
+  /**
+   * task-1：详情页不再直接导入。旧 `POST /api/unity/import` 绕过 计划快照 → 风险确认 → 作业验证，
+   * 后端已 409 拒绝；这里把用户交给「头像工作台」的既有链路（按单元勾选 → 风险 → confirm → execute）。
+   * 保留上面的包列表/勾选，只用于"这次要装哪几个包"的对照，不再产生外部副作用。
+   */
+  const openPlanImport = () => {
+    if (unityPicked.size) setUnityPickNote("要装这 " + unityPicked.size + " 个包：在工作台里对应勾选单元后确认风险即可。");
+    props.onToast("info", "导入改走「头像工作台」：按单元勾选 → 看风险 → 确认 → 执行");
+    if (props.onOpenWorkbench) props.onOpenWorkbench();
+    else setUnityNote("请从顶部「头像工作台」按计划导入：按单元勾选 → 看风险 → 确认 → 执行。");
   };
 
   /** 没有可用商品链接时：把「关联 BOOTH 商品」输入框滚进视野并聚焦。 */
@@ -647,7 +643,8 @@ export function ItemDetail(props: {
                   {unityPkgs.length > 0 && (
                     <>
                       <div className="hint" style={{ marginTop: "6px" }}>
-                        找到 {unityPkgs.length} 个包{unityPkgs.some((p) => p.matched) ? "（★ 是当前工程那个 avatar 的）" : ""}。导入前会清空 Unity 控制台，导入后回读报错。
+                        找到 {unityPkgs.length} 个包{unityPkgs.some((p) => p.matched) ? "（★ 是当前工程那个 avatar 的）" : ""}。
+                        详情页只做发现与对照；导入走「头像工作台」的计划 → 风险确认 → 作业（不再直接导入）。
                       </div>
                       <div className="unity-pkgs">
                         {unityPkgs.map((p) => (
@@ -664,8 +661,8 @@ export function ItemDetail(props: {
                         ))}
                       </div>
                       <div className="row wrap" style={{ marginTop: "6px", gap: "6px" }}>
-                        <button className="btn" disabled={unityBusy || !unityPicked.size} onClick={doUnityImport}>
-                          {unityBusy ? "导入中…" : "导入到 " + unity.editor.projectName + "（" + unityPicked.size + "）"}
+                        <button className="btn" disabled={!unityPicked.size} onClick={openPlanImport} title="打开头像工作台：按单元勾选 → 看风险 → 确认 → 执行（有作业与验证，可追溯）">
+                          到头像工作台按计划导入（已选 {unityPicked.size}）
                         </button>
                         {unity.projectAvatar && unityPkgs.some((p) => p.matched) && (
                           <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.filter((p) => p.matched).map((p) => p.key)))}>只选 @{unity.projectAvatar.name}</button>
@@ -675,6 +672,11 @@ export function ItemDetail(props: {
                       </div>
                       {unityPickNote && <div className="hint" style={{ marginTop: "4px" }}>{unityPickNote}</div>}
                     </>
+                  )}
+                  {!!unity?.dropped && (
+                    <div className="notice" style={{ marginTop: "6px" }}>
+                      已忽略 {(unity.dropped)} 个非回环 Unity MCP 地址（本工具只驱动本机 Unity；确需远程请显式打开 unity_mcp_allow_remote）。
+                    </div>
                   )}
                   {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}
                   {unityErrors.length > 0 && (

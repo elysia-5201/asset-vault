@@ -497,6 +497,7 @@ export default function App() {
           itemId={selectedItemId} avatars={avatars} projects={projects} onClose={() => setSelectedItemId(null)}
           onChanged={loadItems} onToast={toast} importedIds={importedIds} onMarkImported={markImported}
           onOpenItem={setSelectedItemId}
+          onOpenWorkbench={() => setWorkbenchOpen(true)}
         />
       )}
 
