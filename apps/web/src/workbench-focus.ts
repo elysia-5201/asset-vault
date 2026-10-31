@@ -105,6 +105,21 @@ export function mapFocusToUnits(focus: WorkbenchFocus | null | undefined, units:
 }
 
 /**
+ * 同一个 focus 只带入一次，但"工作台还没有这个条目的单元"不算带入完成：
+ * 用户按提示扫描出单元后要能再精确预选一次（修复轮 2 N1）。
+ * 一旦带入过（appliedKey 命中）就不再置位 —— reload / 再次扫描不得覆盖用户手动选择、也不反复 toggle。
+ */
+export function focusApplyAllowed(
+  focus: WorkbenchFocus | null | undefined,
+  units: WorkbenchItem[],
+  appliedKey: string,
+): boolean {
+  if (!focus || !focus.itemId) return false;
+  if (appliedKey === "focus:" + focus.itemId) return false;
+  return units.length > 0;
+}
+
+/**
  * 人读提示：说明带入/预选/未对应各多少，并明确「仍要人工生成计划 → 看风险 → 确认 → 执行」。
  * 不承诺自动导入/自动执行（避免"已选 N"式的误导）。
  */

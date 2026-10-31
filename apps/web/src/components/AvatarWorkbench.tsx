@@ -4,7 +4,7 @@ import {
   listJobs, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems,
 } from "../api";
 import type { ImportPlan, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
-import { focusNotice, mapFocusToUnits, sameSlot, type FocusMap, type WorkbenchFocus } from "../workbench-focus";
+import { focusApplyAllowed, focusNotice, mapFocusToUnits, sameSlot, type FocusMap, type WorkbenchFocus } from "../workbench-focus";
 import { formatDate, shortenPath } from "../util";
 import { Badge, Spinner, useDebounced } from "./ui";
 
@@ -547,6 +547,8 @@ export function AvatarWorkbench(props: {
     if (itemsLoadedFor !== key || focusAppliedRef.current === key) return;
     const map = mapFocusToUnits(focus, items);
     setFocusMap(map);
+    // 该条目还没有单元（未做结构分析）：先不置位，扫描完成加载 units 后可再精确预选一次。
+    if (!focusApplyAllowed(focus, items, focusAppliedRef.current)) return;
     if (map.preselected.length) {
       const byId = new Map(items.map((u) => [u.unitId, u]));
       setPicked(map.preselected.map((id) => byId.get(id)).filter((u): u is WorkbenchItem => !!u));
@@ -827,7 +829,7 @@ export function AvatarWorkbench(props: {
               >
                 {scanJob !== null ? "扫描中…" : SCAN_ALL_LABEL}
               </button>
-              <button className="btn tiny" onClick={loadItems} disabled={avatarId === null}>刷新</button>
+              <button className="btn tiny" onClick={loadItems} disabled={avatarId === null && !(focusOnly && focus)}>刷新</button>
             </div>
             {itemsErr && <div className="err">素材接口不可用：{itemsErr}</div>}
             <div style={{ display: "flex", flexDirection: "column", gap: "5px", overflow: "auto", minHeight: 0 }}>

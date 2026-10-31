@@ -65,7 +65,7 @@ export function validateUnityMcpUrl(raw: string, opts: { allowRemote?: boolean }
     return {
       ok: false, code: "REMOTE_NOT_ALLOWED",
       message: "拒绝把 Unity MCP 地址指到非回环主机（" + sanitizeMcpUrl(text) + "）：本工具只驱动本机 Unity。"
-        + "确需远程请显式设置 unity_mcp_allow_remote='1'。",
+        + "确需远程请在设置面板勾选「允许非回环 Unity MCP 端点」后重试。",
     };
   }
   return { ok: true, url: text };
@@ -309,7 +309,8 @@ export async function unityEditorInfo(u: UnityMcp): Promise<UnityEditorInfo> {
   );
   const [dataPath = "", projectPath = "", unityVersion = "", playing = "0", compiling = "0", scenePath = ""] = String(raw).split("|");
   return {
-    endpoint: u.endpoint, serverName: u.serverName, dataPath, projectPath,
+    // 公开字段一律脱敏：成功路径也不能回显 URL 里的 ?token（真实连接用 UnityMcp 内部的原始 session.url）。
+    endpoint: sanitizeMcpUrl(u.endpoint), serverName: u.serverName, dataPath, projectPath,
     projectName: baseName(projectPath), unityVersion,
     isPlaying: playing === "1", isCompiling: compiling === "1", scenePath,
   };
