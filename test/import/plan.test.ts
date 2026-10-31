@@ -45,7 +45,7 @@ describe("createImportPlan", () => {
     await analyzeItemStructure(repo, itemId);
     const unit = unitOfAsset(a);
     assert.equal(unit.policy, "mixed_unitypackage");
-    const view = createImportPlan(repo, { unitIds: [unit.id], projectPath: join(dir, "UnityProject") });
+    const view = await createImportPlan(repo, { unitIds: [unit.id], projectPath: join(dir, "UnityProject") });
     assert.equal(view.items.length, 1);
     assert.equal(view.items[0].path, p, "计划必须指向原始整包");
     assert.equal(view.items[0].policy, "mixed_unitypackage");
@@ -64,7 +64,7 @@ describe("createImportPlan", () => {
     await analyzeItemStructure(repo, itemId);
     const unit = repo.listUnits({ itemId }).find((u) => Number(u.asset_id) === a && u.importable)!;
     assert.equal(unit.size, 33, "单元 size 用内层条目大小");
-    const view = createImportPlan(repo, { unitIds: [Number(unit.id)], projectPath: join(dir, "UnityProject") });
+    const view = await createImportPlan(repo, { unitIds: [Number(unit.id)], projectPath: join(dir, "UnityProject") });
     assert.equal(view.plan.status, "ready", "条目不变化时不得误报 blocked：" + JSON.stringify(view.precheck));
     assert.equal(view.items[0].fingerprint, unit.fingerprint);
   });
@@ -72,11 +72,11 @@ describe("createImportPlan", () => {
   test("指纹变化 → plan blocked，且只有变化的条目 blocked（条目独立状态）", async () => {
     const { a1, u1, u2 } = await twoUnits();
     assert.ok(u1 && u2);
-    const t0 = createImportPlan(repo, { unitIds: [u1.id, u2.id], projectPath: dir });
+    const t0 = await createImportPlan(repo, { unitIds: [u1.id, u2.id], projectPath: dir });
     assert.equal(t0.plan.status, "ready");
     // 只改 a1 的 mtime → 单元指纹（analyze 时写入）与当前不一致
     t.db.prepare("UPDATE assets SET mtime='2026-10-09T00:00:00.000Z' WHERE id=?").run(a1);
-    const t1 = createImportPlan(repo, { unitIds: [u1.id, u2.id], projectPath: dir });
+    const t1 = await createImportPlan(repo, { unitIds: [u1.id, u2.id], projectPath: dir });
     assert.equal(t1.plan.status, "blocked");
     const blocked = t1.items.filter((i: any) => i.status === "blocked");
     assert.equal(blocked.length, 1);
@@ -91,10 +91,10 @@ describe("createImportPlan", () => {
     const { a1, a2, u1, u2 } = await twoUnits();
     // 人工造一条 suggested_companion：u1 → u2
     repo.replaceUnitRelations([Number(u1.id)], [{ fromUnitId: Number(u1.id), toUnitId: Number(u2.id), type: "suggested_companion", evidence: "同名伴生", confidence: "probable" }]);
-    const plain = createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: dir });
+    const plain = await createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: dir });
     assert.equal(plain.items.length, 1, "不勾选 includeSuggested 时不加建议项");
     assert.ok(plain.items.every((i: any) => i.status !== "suggested"));
-    const withSug = createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: dir, includeSuggested: true });
+    const withSug = await createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: dir, includeSuggested: true });
     assert.equal(withSug.items.length, 2);
     const sug = withSug.items.find((i: any) => i.status === "suggested");
     assert.ok(sug, "建议项必须显式标 suggested");
@@ -111,9 +111,9 @@ describe("createImportPlan", () => {
     await analyzeItemStructure(repo, itemId);
     const bad = repo.listUnits({ itemId }).find((u) => Number(u.asset_id) === a)!;
     assert.equal(bad.importable, 0);
-    assert.throws(() => createImportPlan(repo, { unitIds: [Number(bad.id)], projectPath: dir }), /不可导入/);
-    assert.throws(() => createImportPlan(repo, { unitIds: [], projectPath: dir }), /unitIds/);
+    await assert.rejects(createImportPlan(repo, { unitIds: [Number(bad.id)], projectPath: dir }), /不可导入/);
+    await assert.rejects(createImportPlan(repo, { unitIds: [], projectPath: dir }), /unitIds/);
     const { u1 } = await twoUnits();
-    assert.throws(() => createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: "" }), /projectPath/);
+    await assert.rejects(createImportPlan(repo, { unitIds: [Number(u1.id)], projectPath: "" }), /projectPath/);
   });
 });

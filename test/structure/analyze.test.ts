@@ -123,7 +123,7 @@ describe("analyzeItemStructure", () => {
     assert.ok(container);
     assert.equal(container.policy, "multi_package_container");
     // 计划仍指向原始外层整包，单元用 outer::inner 约定定位内层包
-    const view = createImportPlan(repo, { unitIds: units.filter((u) => u.importable === 1).map((u) => Number(u.id)), projectPath: join(dir, "UnityProject") });
+    const view = await createImportPlan(repo, { unitIds: units.filter((u) => u.importable === 1).map((u) => Number(u.id)), projectPath: join(dir, "UnityProject") });
     assert.equal(view.items.length, 2);
     assert.ok(view.items.every((i: any) => i.path === outer), "plan.path 必须是原始外层整包");
     assert.ok(view.items.every((i: any) => String(i.rel_path).includes("::")));
@@ -150,7 +150,7 @@ describe("analyzeItemStructure", () => {
     const ev = JSON.parse(pkg.avatar_json);
     assert.ok(ev.some((x: any) => x.level === "probable"));
     // 计划仍指向原始外层整包
-    const view = createImportPlan(repo, { unitIds: [Number(pkg.id)], projectPath: join(dir, "UnityProject") });
+    const view = await createImportPlan(repo, { unitIds: [Number(pkg.id)], projectPath: join(dir, "UnityProject") });
     assert.equal(view.items[0].path, outer);
   });
 

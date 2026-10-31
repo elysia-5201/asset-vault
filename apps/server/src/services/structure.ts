@@ -111,30 +111,7 @@ function failedContainer(path: string, error: string): SourceContainerSnapshot {
   return { path, size: 0, mtimeMs: 0, sha256: null, ok: false, error: String(error).slice(0, 200) };
 }
 
-/** 同步全内容哈希（1 MiB 块流式读，常量内存）。仅建计划路径使用（见 buildSourceSnapshotSync 说明）。 */
-function hashContainerSync(path: string): SourceContainerSnapshot {
-  try {
-    const st = statSync(path);
-    if (!st.isFile()) throw new Error("不是普通文件");
-    const hash = createHash("sha256");
-    const fd = openSync(path, "r");
-    const buf = Buffer.alloc(SNAPSHOT_CHUNK_BYTES);
-    let size = 0;
-    try {
-      for (;;) {
-        const n = readSync(fd, buf, 0, buf.length, null);
-        if (n <= 0) break;
-        hash.update(buf.subarray(0, n));
-        size += n;
-      }
-    } finally { closeSync(fd); }
-    return { path, size, mtimeMs: st.mtimeMs, sha256: hash.digest("hex"), ok: true, error: null };
-  } catch (e) {
-    return failedContainer(path, (e as Error)?.message ?? String(e));
-  }
-}
-
-/** 异步流式全内容哈希（core sha256FileWithSize，1 MiB 读块），预检/作业入口使用。 */
+/** 异步流式全内容哈希（core sha256FileWithSize，1 MiB 读块）：建计划、预检、作业入口共用。 */
 async function hashContainer(path: string): Promise<SourceContainerSnapshot> {
   try {
     const st = statSync(path);
@@ -147,29 +124,25 @@ async function hashContainer(path: string): Promise<SourceContainerSnapshot> {
 }
 
 /**
- * 建计划用快照（同步签名，保持既有调用方与测试兼容）：哈希本身按 1 MiB 块流式读取（常量内存），
- * 但仍会占用事件循环——建计划是用户主动动作且每容器只一次；预检/执行路径走异步 buildSourceSnapshot。
+ * 行 → 物理快照（异步流式，按容器去重，每容器只哈希一次）。建计划与预检/执行共用同一条实现，
+ * 建计划路径因此不再有同步大文件读循环（不阻塞事件循环）。
  */
-export function buildSourceSnapshotSync(rows: SourceRow[], opts: SourceSnapshotOptions = {}): SourceSnapshot {
+export async function buildSourceSnapshotForRows(rows: SourceRow[], opts: SourceSnapshotOptions = {}): Promise<SourceSnapshot> {
   const { tasks, units, problems } = collectSourceTasks(rows);
   const containers: SourceContainerSnapshot[] = [];
-  for (const t of tasks) { opts.onContainerHash?.(t.key); containers.push(hashContainerSync(t.path)); }
+  for (const t of tasks) { opts.onContainerHash?.(t.key); containers.push(await hashContainer(t.path)); }
   for (const [unitId, message] of problems) containers.push(failedContainer("", message + "（unit " + unitId + "）"));
   return { ...snapshotHeader(), containers, units };
 }
 
-/** 执行前用快照（异步流式；按物理容器去重，每容器只哈希一次）。 */
+/** 执行前用快照（异步流式；从计划条目取行，按物理容器去重）。 */
 export async function buildSourceSnapshot(repo: Repo, planId: number, opts: SourceSnapshotOptions = {}): Promise<SourceSnapshot> {
   const items = repo.listImportPlanItems(planId);
   const rows: SourceRow[] = items.map((it: any) => ({
     unitId: Number(it.unit_id), assetId: Number(it.asset_id),
     relPath: String(it.rel_path ?? ""), path: String(it.path ?? ""),
   }));
-  const { tasks, units, problems } = collectSourceTasks(rows);
-  const containers: SourceContainerSnapshot[] = [];
-  for (const t of tasks) { opts.onContainerHash?.(t.key); containers.push(await hashContainer(t.path)); }
-  for (const [unitId, message] of problems) containers.push(failedContainer("", message + "（unit " + unitId + "）"));
-  return { ...snapshotHeader(), containers, units };
+  return buildSourceSnapshotForRows(rows, opts);
 }
 
 export interface SourceSnapshotVerdict {
@@ -233,9 +206,13 @@ export function compareSourceSnapshots(stored: SourceSnapshot, current: SourceSn
 }
 
 function blockPlanOnSourceSnapshot(repo: Repo, planId: number, detail: unknown): void {
+  // 质量项：保留建计划时写入的 units 诊断，只合并 sourceSnapshot（不整列覆写 precheck_json）。
+  const plan = repo.getImportPlan(planId);
+  const prev = plan ? safeJson(plan.precheck_json) : null;
+  const base = prev && typeof prev === "object" && !Array.isArray(prev) ? (prev as Record<string, unknown>) : {};
   repo.updateImportPlan(planId, {
     status: "blocked",
-    precheck_json: JSON.stringify({ checkedAt: nowIso(), sourceSnapshot: detail }),
+    precheck_json: JSON.stringify({ ...base, checkedAt: nowIso(), sourceSnapshot: detail }),
   });
 }
 
@@ -659,7 +636,7 @@ function suggestedUnitRows(repo: Repo, selected: any[]): any[] {
  * 建计划：只保存"原始资产路径 + 指纹 + 单元引用"。
  * mixed 单元 path 仍是 asset.path（原始整包），不会出现任何筛选/拆分产物。
  */
-export function createImportPlan(repo: Repo, input: { unitIds: number[]; projectPath: string; includeSuggested?: boolean }): PlanView {
+export async function createImportPlan(repo: Repo, input: { unitIds: number[]; projectPath: string; includeSuggested?: boolean }): Promise<PlanView> {
   const unitIds = [...new Set((input.unitIds ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0))];
   if (unitIds.length === 0) throw appErr("INVALID_INPUT", "unitIds 不能为空", 400);
   const projectPath = String(input.projectPath ?? "").trim();
@@ -678,8 +655,11 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
   const checkedAt = nowIso();
   const projectExists = existsSync(projectPath);
   const relPaths = new Map<number, string>();
+  // 必修 2：建计划期与"可信索引"比对需要资产行（sha256/sha256_state/size）。
+  const assetById = new Map<number, { sha256?: unknown; sha256_state?: unknown; size?: unknown }>();
   const precheckUnits: PrecheckUnit[] = all.map((u) => {
     const asset = repo.getAsset(Number(u.asset_id));
+    if (asset) assetById.set(Number(u.asset_id), asset);
     const fpNow = asset ? fingerprintOf(asset, Number(u.size) || undefined) : null;
     const changed = !asset || String(fpNow) !== String(u.fingerprint);
     const exists = !!asset && existsSync(String(asset.path));
@@ -697,7 +677,8 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
     };
   });
   // Task 2：计划绑定**实际物理源字节**（每物理容器一次全内容 sha256；建后不可改写）。
-  const sourceSnapshot = buildSourceSnapshotSync(precheckUnits.map((u) => ({
+  // 必修 1：建计划路径必须异步（无同步大文件读循环），与预检/执行共用 buildSourceSnapshotForRows。
+  const sourceSnapshot = await buildSourceSnapshotForRows(precheckUnits.map((u) => ({
     unitId: u.unitId, assetId: u.assetId, relPath: relPaths.get(u.unitId) ?? "", path: u.path,
   })));
   const containerByKey = new Map(sourceSnapshot.containers.map((c) => [normalizePath(c.path), c]));
@@ -710,12 +691,37 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
     u.status = "blocked";
     u.error = "源文件物理快照不可读（" + (c?.error ?? "源文件不可读") + "）：" + u.path;
   }
+  // 必修 2：索引之后、建计划之前磁盘可能已被替换（DB 未动、size/mtime 可能保持）。
+  // 索引摘要可信（sha256_state=ok + 完整 64 hex + size）时必须与当前磁盘字节一致；不一致则
+  // SOURCE_INDEX_STALE 阻断，绝不把当前磁盘的新字节绑定到旧索引元数据后返回 ready。
+  const staleUnitIds = new Set<number>();
+  const stalePaths: string[] = [];
+  const untrustedPaths: string[] = [];
+  for (const u of precheckUnits) {
+    const c = containerByKey.get(normalizePath(u.path));
+    if (!c || !c.ok) continue;
+    const asset = assetById.get(u.assetId);
+    const idxSha = String(asset?.sha256 ?? "").toLowerCase();
+    const trusted = !!asset && String(asset.sha256_state ?? "") === "ok"
+      && /^[0-9a-f]{64}$/.test(idxSha) && Number(asset.size) > 0;
+    if (!trusted) { if (!untrustedPaths.includes(u.path)) untrustedPaths.push(u.path); continue; }
+    if (Number(asset.size) === c.size && idxSha === c.sha256) continue;
+    staleUnitIds.add(u.unitId);
+    stalePaths.push(u.path);
+    u.status = "blocked";
+    u.error = "SOURCE_INDEX_STALE：建计划前磁盘内容已与索引摘要不一致（索引 size=" + Number(asset.size)
+      + " sha=" + idxSha.slice(0, 12) + "…，磁盘 size=" + c.size
+      + "）；拒绝把当前磁盘字节绑定到旧索引元数据，请重新扫描该条目后再建计划。";
+  }
   const warnings: string[] = [];
   if (precheckUnits.some((u) => u.mixed)) warnings.push("包含混合 .unitypackage：将导入整个原始包（不拆分、不生成筛选包）");
   if (extras.length) warnings.push("已按建议加入 " + extras.length + " 个伴生单元（status=suggested，确认后可执行）");
   if (!projectExists) warnings.push("Unity 工程路径当前不存在或不可访问：" + projectPath);
   if (snapshotFailed) warnings.push("源文件物理快照不可读：计划已阻断（不会在无快照的情况下继续）");
-  const blocked = snapshotFailed || precheckUnits.some((u) => u.changed || !u.fileExists);
+  if (stalePaths.length) warnings.push("建计划前磁盘已变化（SOURCE_INDEX_STALE）：" + shortPaths(stalePaths) + "；计划已阻断，不会把当前磁盘字节绑定到旧索引元数据");
+  // brief 要求：无可信索引时必须显式 warnings 登记残余，不得伪称"已证明与索引一致"。
+  if (untrustedPaths.length) warnings.push("以下源文件没有完整可信索引摘要（sha256_state=ok 且 64 位 sha256），建计划只记录当前磁盘哈希，无法证明与索引一致，属已知残余：" + shortPaths(untrustedPaths));
+  const blocked = snapshotFailed || staleUnitIds.size > 0 || precheckUnits.some((u) => u.changed || !u.fileExists);
   const needsConfirm = blocked || extras.length > 0 || precheckUnits.some((u) => u.mixed) || precheckUnits.some((u) => u.status === "suggested");
   const status = blocked ? "blocked" : needsConfirm ? "needs_confirmation" : "ready";
   const precheck = { checkedAt, projectPath, projectExists, units: precheckUnits, warnings };
@@ -730,10 +736,10 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
  * task-49：跨 item 选择 → 按 item 分组各建一个计划；单 item 保持原 PlanView 形状。
  * 组内失败隔离：某组建计划失败只返回该组 error，不影响其它组。
  */
-export function createImportPlanBatch(
+export async function createImportPlanBatch(
   repo: Repo,
   input: { unitIds: number[]; projectPath: string; includeSuggested?: boolean },
-): { single: true; view: PlanView } | { single: false; plans: any[] } {
+): Promise<{ single: true; view: PlanView } | { single: false; plans: any[] }> {
   const ids = [...new Set((input.unitIds ?? []).map(Number).filter((n) => Number.isFinite(n) && n > 0))];
   if (ids.length === 0) throw appErr("INVALID_INPUT", "unitIds 不能为空", 400);
   const units = repo.getUnitsByIds(ids);
@@ -749,12 +755,12 @@ export function createImportPlanBatch(
   const known = new Set(units.map((u) => Number(u.id)));
   const unknown = ids.filter((id) => !known.has(id));
   if (byItem.size <= 1 && unknown.length === 0) {
-    return { single: true, view: createImportPlan(repo, { ...input, unitIds: ids }) };
+    return { single: true, view: await createImportPlan(repo, { ...input, unitIds: ids }) };
   }
   const plans: any[] = [];
   for (const [itemId, groupIds] of byItem) {
     try {
-      const view = createImportPlan(repo, { ...input, unitIds: groupIds });
+      const view = await createImportPlan(repo, { ...input, unitIds: groupIds });
       plans.push({ itemId, ...view });
     } catch (e) {
       plans.push({ itemId, error: { code: String((e as any)?.code ?? "ERROR"), message: String((e as any)?.message ?? e) } });

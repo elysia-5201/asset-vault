@@ -1849,7 +1849,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const b = (req.body ?? {}) as any;
       const unitIds = Array.isArray(b.unitIds) ? b.unitIds.map((n: any) => toInt(n, 0)).filter((n: number) => n > 0) : [];
-      const batch = createImportPlanBatch(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
+      // 必修 1：建计划路径异步（全内容哈希流式且不阻塞事件循环）。
+      const batch = await createImportPlanBatch(repo, { unitIds, projectPath: String(b.projectPath ?? ""), includeSuggested: b.includeSuggested === true });
       // task-51：建计划即写入风险；warning/unknown → needs_confirmation，blocked → blocked
       if (batch.single) {
         const withRisk = (await applyPlanRisk(repo, batch.view.plan.id)) ?? batch.view;

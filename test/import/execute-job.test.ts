@@ -30,7 +30,7 @@ async function readyPlan(guid = GUID_HEX, pkgName = "pkg.unitypackage") {
   t.db.prepare("UPDATE assets SET index_state='done' WHERE id=?").run(a);
   await analyzeItemStructure(repo, itemId);
   const unit = repo.listUnits({ itemId }).find((u) => Number(u.asset_id) === a && u.importable)!;
-  const view = createImportPlan(repo, { unitIds: [Number(unit.id)], projectPath: project });
+  const view = await createImportPlan(repo, { unitIds: [Number(unit.id)], projectPath: project });
   assert.equal(view.plan.status, "ready");
   return { plan: view.plan, unit };
 }
