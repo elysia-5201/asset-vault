@@ -370,7 +370,7 @@ describe("F1 deadline 覆盖写/收尾/发布：超期不得成功，清理不�
       openedFd = o?.fd ?? null;
       return new Writable({
         write(_c: any, _e: any, cb: any) { cb(); },
-        final() { /* 永不完成：模拟 fsync/close 卡死 */ },
+        final() { /* 永不完成：模拟 flush/close 卡死（收尾不含 fsync） */ },
         destroy(err: any, cb: any) { try { if (openedFd !== null) cjsFs.closeSync(openedFd); } catch { /* ignore */ } cb(err); },
       });
     };
@@ -440,5 +440,119 @@ describe("F4 诊断不泄漏签名 / 凭据 / URL", () => {
     assert.equal(e.code, "UPSTREAM_ERROR");
     assert.ok(!String(e.message).includes(TOKEN), "上游文本里的签名参数也不得外泄: " + e.message);
     assert.deepEqual(listing(), []);
+  });
+});
+
+describe("F6 取消等待有界：cancel 永不 settle 也必须有限收尾并继续 unlink tmp", () => {
+  /**
+   * 把被测调用与硬上限竞速，RED 时得到明确的失败而不是让 runner 永久挂住；
+   * finally 清掉守卫定时器，测试本身不留悬挂 handle。
+   */
+  async function boundedOutcome<T>(p: Promise<T>, ms: number): Promise<{ value?: T; error?: any; hung?: boolean }> {
+    const box: { stop: (() => void) | null } = { stop: null };
+    const guard = new Promise<{ hung: true }>((res) => {
+      const t = setTimeout(() => res({ hung: true }), ms);
+      box.stop = () => clearTimeout(t);
+    });
+    try {
+      return await Promise.race([p.then((value) => ({ value }), (error) => ({ error })), guard]);
+    } finally {
+      if (box.stop) box.stop();
+    }
+  }
+
+  /** body.cancel 永不 settle：模拟 undici/自定义流的 cancel 永不回调。 */
+  function neverCancel(status = 200): Response {
+    const body = new ReadableStream<Uint8Array>({
+      pull() { return new Promise<void>(() => {}); },
+      cancel() { return new Promise<void>(() => {}); },
+    });
+    return new Response(body, { status });
+  }
+
+  /** 先给一块数据（触发写回调）再 stall，且 cancel 永不 settle。 */
+  function chunkThenNeverCancel(): Response {
+    let sent = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) { if (!sent) { sent = true; c.enqueue(new Uint8Array(bytes(128, 1))); } else { return new Promise<void>(() => {}); } },
+      cancel() { return new Promise<void>(() => {}); },
+    });
+    return new Response(body, { status: 200 });
+  }
+
+  test("body.cancel 永不 settle + deadline=120ms：约 3s 内报 UPSTREAM_TIMEOUT 且目录为空", { timeout: 9000 }, async () => {
+    mockFetch(() => neverCancel(200));
+    const t0 = Date.now();
+    const out = await boundedOutcome(
+      downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "cancel.zip", maxBytes: 1024 * 1024, timeoutMs: 120 }),
+      3500,
+    );
+    const elapsed = Date.now() - t0;
+    assert.equal(out.hung, undefined, "取消永不 settle 时收尾必须有界（RED：超 3500ms 仍 pending）");
+    assert.equal(out.error?.code, "UPSTREAM_TIMEOUT", "超时错误码必须保留，而不是被清理挂起吞掉");
+    assert.ok(elapsed < 3000, "必须在约 3s 内收尾（实测 " + elapsed + "ms）");
+    assert.deepEqual(listing(), [], "取消失败也必须继续 unlink tmp：目录必须为空");
+  });
+
+  test("早期 HTTP 401 分支的 body.cancel 永不 settle：经公共 cancelBody 也有界结束", { timeout: 9000 }, async () => {
+    mockFetch(() => neverCancel(401));
+    const t0 = Date.now();
+    const out = await boundedOutcome(
+      downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "early.zip", maxBytes: 1024 * 1024, timeoutMs: 5000 }),
+      3500,
+    );
+    const elapsed = Date.now() - t0;
+    assert.equal(out.hung, undefined, "早期分支的 cancelBody 必须有界（RED：仍 pending）");
+    assert.equal(out.error?.code, "LOGIN_REQUIRED", "401 诊断语义不得因清理改动而改变");
+    assert.ok(elapsed < 3000, "早期分支清理也必须有限（实测 " + elapsed + "ms）");
+    assert.equal(fetchCalls.length, 1);
+    assert.deepEqual(listing(), []);
+  });
+
+  test("写回调/收尾/取消同时永不返回：清理共享一份预算（不 2s+2s 累加）且删 tmp", { timeout: 9000 }, async () => {
+    mockFetch(() => chunkThenNeverCancel());
+    const original = cjsFs.createWriteStream;
+    let openedFd: number | null = null;
+    (cjsFs as any).createWriteStream = (_p: string, o: any) => {
+      openedFd = o?.fd ?? null;
+      return new Writable({
+        write() { /* 永不回调：写卡死 */ },
+        final() { /* 永不完成：收尾卡死 */ },
+        destroy() { try { if (openedFd !== null) cjsFs.closeSync(openedFd); } catch { /* ignore */ } /* 故意不回调：finished 永不 settle */ },
+      });
+    };
+    const t0 = Date.now();
+    let out: any;
+    try {
+      out = await boundedOutcome(
+        downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "triple.zip", maxBytes: 1024 * 1024, timeoutMs: 120 }),
+        4500,
+      );
+    } finally {
+      (cjsFs as any).createWriteStream = original;
+    }
+    const elapsed = Date.now() - t0;
+    assert.equal(out.hung, undefined, "写/收尾/取消都卡死时收尾必须有界");
+    assert.equal(out.error?.code, "UPSTREAM_TIMEOUT");
+    assert.ok(elapsed < 3500, "收尾与取消必须共用同一份有限预算（各 2s 会到 4s+），实测 " + elapsed + "ms");
+    assert.deepEqual(listing(), [], "即使 finished/cancel 都不回调，tmp 也必须被删除");
+  });
+});
+
+describe("F8 读流错误诊断脱敏（与 fetch 错误同一套 redact）", () => {
+  test("中途读流错误含独特 URL/token：错误文本不得外泄凭据", { timeout: 5000 }, async () => {
+    const t = "READSTREAM_SECRET_7d21";
+    mockFetch(() => {
+      const body = new ReadableStream<Uint8Array>({
+        pull(c) { c.error(new Error("read aborted for https://s6.booth.pm/dl?token=" + t)); },
+      });
+      return new Response(body, { status: 200 });
+    });
+    const e = await rejection(downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "readerr.zip", maxBytes: 1024 * 1024, timeoutMs: 5000 }));
+    assert.equal(e.code, "UPSTREAM_ERROR", "读流错误仍归类为上游错误");
+    assert.ok(String(e.message).includes("读取下载流失败"), "保留可诊断的上下文: " + e.message);
+    assert.ok(!String(e.message).includes(t), "读流错误文本里的 token 不得外泄: " + e.message);
+    assert.ok(!/https?:\/\//.test(String(e.message)), "读流错误文本里的 URL 同样不得外泄: " + e.message);
+    assert.deepEqual(listing(), [], "读流错误后不得留下 tmp 或半成品");
   });
 });

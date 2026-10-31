@@ -53,7 +53,10 @@ export const DEFAULT_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024 * 1024;
  * 无进展挂起（stall），不是任何真实带宽/大文件场景下的吞吐保证，也未在真实 BOOTH 上实测。
  */
 export const DEFAULT_DOWNLOAD_DEADLINE_MS = 30 * 60 * 1000;
-/** 错误路径清理单个句柄的上限：即使流/close 再也不回调，清理本身也不能永挂。 */
+/**
+ * 错误路径清理的**共享**预算上限：一次失败里的 finished(close) 与 reader/body cancel 一起花这份时间，
+ * 而不是各自拿一份（否则 2s + 2s 累加）。即使取消/close 再也不回调，清理本身也不能永挂。
+ */
 const CLEANUP_WAIT_MS = 2000;
 
 export interface DownloadResult { path: string; bytes: number; fileName: string; finalUrl: string }
@@ -109,8 +112,10 @@ function waitBounded(p: Promise<unknown>, ms: number): Promise<void> {
  * - 先进唯一临时文件（destDir 内，同卷），完成后只用 link 语义独占发布：绝不覆盖既有同名文件，
  *   竞争者在发布窗口抢先建成时自动改用带序号的新名字。硬链接不可用（EPERM/ENOTSUP/EXDEV…）时
  *   **fail-closed**：明确报错，不复制、不 rename、不产生任何终名。
- * - 超限/断流/超时/HTTP 失败/HTML 登录页/写盘失败都会关闭句柄、取消 body、删除临时文件；
- *   清理等待自身也有上限（CLEANUP_WAIT_MS），不会因为句柄永不 close 而永挂。
+ * - 超限/断流/超时/HTTP 失败/HTML 登录页/写盘失败都会关闭句柄、取消 body（redirect/HTTP 失败等早期分支同样走
+ *   公共 cancelBody）、删除临时文件；所有清理等待共享一份有限预算（CLEANUP_WAIT_MS），句柄永不 close 或
+ *   cancel 永不 settle 也不会永挂，且仍然会继续 unlink 临时文件。
+ * - 收尾只做 flush + close，**不执行 fsync**：不宣称也不提供掉电持久化保证（进程崩溃/断电可能丢已写数据）。
  */
 export async function downloadBoothFile(opts: DownloadOptions): Promise<DownloadResult> {
   const { dlUrl, destDir } = opts;
@@ -130,8 +135,27 @@ export async function downloadBoothFile(opts: DownloadOptions): Promise<Download
   const remainingMs = () => deadlineAt - Date.now();
   const timer = setTimeout(() => ac.abort(), deadlineMs);
 
+  // 清理共享预算：从第一次清理等待开始计时，后续等待只能用剩下的时间。
+  // 不用 unref 定时器：清理定时器必须在没有任何其它 handle 时也能让 Promise 结算，
+  // 否则调用方会看到一个永远 pending 的 rejection。
+  let cleanupDeadlineAt: number | null = null;
+  const cleanupBudgetMs = () => {
+    if (cleanupDeadlineAt === null) cleanupDeadlineAt = Date.now() + CLEANUP_WAIT_MS;
+    return Math.max(0, cleanupDeadlineAt - Date.now());
+  };
+  /** 任何清理等待都用剩余预算包一层：底层永不 settle 也一定在有限时间内返回（不抛错）。 */
+  const boundedCleanup = (p: Promise<unknown>) => waitBounded(p, cleanupBudgetMs());
+
+  /**
+   * 取消响应体：redirect/HTTP 失败/长度预拒/流内异常等所有路径共用。
+   * body.cancel() 在 undici 或自定义流上可能永不 settle，因此必须走同一份有限预算；
+   * 取消失败也不影响后续清理（unlink tmp）。
+   */
   const cancelBody = async (r: Response | null) => {
-    try { await r?.body?.cancel(); } catch { /* 已关闭/已消费，忽略 */ }
+    try {
+      const body = r?.body;
+      if (body) await boundedCleanup(body.cancel());
+    } catch { /* 已关闭/已消费/取消失败，忽略 */ }
   };
 
   /** 把任意等待（读/写回调/收尾）与同一个全局 deadline 竞速；abort 一到立即结束，且不残留监听器。 */
@@ -213,7 +237,7 @@ export async function downloadBoothFile(opts: DownloadOptions): Promise<Download
     try {
       fd = fs.openSync(tmp, "wx");
     } catch (e) {
-      try { await reader.cancel(); } catch { /* 忽略 */ }
+      try { await boundedCleanup(reader.cancel()); } catch { /* 忽略 */ }
       throw err("创建临时文件失败（" + String((e as NodeJS.ErrnoException)?.code ?? "") + "）", "UPSTREAM_ERROR", 502);
     }
     const ws = fs.createWriteStream(tmp, { fd, autoClose: true });
@@ -260,14 +284,20 @@ export async function downloadBoothFile(opts: DownloadOptions): Promise<Download
       if (written === 0) throw err("下载内容为空", "UPSTREAM_ERROR", 502);
       if (remainingMs() <= 0) throw timedOut(deadlineMs);
       ws.end();
-      // 收尾（fsync/close 等）同样受 deadline 约束：正常回调即返回，卡死则被 abort 打断。
+      // 收尾（flush/close）同样受 deadline 约束：正常回调即返回，卡死则被 abort 打断。
+      // 注意：这里**没有 fsync**，只是把数据 flush 给内核并关闭句柄；因此不提供掉电持久化保证。
       await raceDeadline(finished(ws));
     } catch (e) {
       try { ws.destroy(); } catch { /* 忽略 */ }
-      // 清理等待有上限：句柄 close 永不回调时，错误路径也不能永挂。
-      await waitBounded(finished(ws).catch(() => { /* 关句柄后再删文件（Windows 上打开的文件不能删） */ }), CLEANUP_WAIT_MS);
-      try { await reader.cancel(); } catch { /* 已结束，忽略 */ }
-      try { fs.unlinkSync(tmp); } catch { /* 还没建出来/已删除 */ }
+      try {
+        // 关闭句柄与取消读流共用同一份有限预算：close 永不回调、cancel 永不 settle 都不会永挂。
+        // finished 的 rejection 在此消化（关句柄失败不影响后面删文件；Windows 上打开的文件不能删）。
+        await waitBounded(finished(ws).catch(() => { /* 关句柄后再删文件（Windows 上打开的文件不能删） */ }), cleanupBudgetMs());
+        try { await boundedCleanup(reader.cancel()); } catch { /* 已结束，忽略 */ }
+      } finally {
+        // 无论取消/close 是否成功，都继续清理临时文件。
+        try { fs.unlinkSync(tmp); } catch { /* 还没建出来/已删除 */ }
+      }
       throw e;
     }
 
