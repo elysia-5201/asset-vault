@@ -25,7 +25,7 @@ export function SettingsPanel(props: {
   const [err, setErr] = useState("");
   const [newRoot, setNewRoot] = useState("");
   const [newWatch, setNewWatch] = useState("");
-  const [draft, setDraft] = useState({ downloadRoot: "", unityMcpUrl: "", updateRepo: "", updateToken: "" });
+  const [draft, setDraft] = useState({ downloadRoot: "", unityMcpUrl: "", unityMcpAllowRemote: false, updateRepo: "", updateToken: "" });
   // staging（导入落地包缓存）用量与清理
   const [staging, setStaging] = useState<StagingUsage | null>(null);
   const [stagingErr, setStagingErr] = useState("");
@@ -36,7 +36,10 @@ export function SettingsPanel(props: {
   const reload = () => Promise.all([listRoots(), listWatches(), getSettings()])
     .then(([r, w, s]) => {
       setRoots(r.roots); setWatches(w.watches); setSettings(s);
-      setDraft({ downloadRoot: s.downloadRoot ?? "", unityMcpUrl: s.unityMcpUrl ?? "", updateRepo: s.updateRepo ?? "", updateToken: "" });
+      setDraft({
+        downloadRoot: s.downloadRoot ?? "", unityMcpUrl: s.unityMcpUrl ?? "",
+        unityMcpAllowRemote: s.unityMcpAllowRemote === true, updateRepo: s.updateRepo ?? "", updateToken: "",
+      });
     })
     .catch((e) => setErr(describeError(e)));
 
@@ -113,6 +116,7 @@ export function SettingsPanel(props: {
     const patch: any = {};
     if (draft.downloadRoot.trim() && draft.downloadRoot.trim() !== settings?.downloadRoot) patch.downloadRoot = draft.downloadRoot.trim();
     if (draft.unityMcpUrl.trim() !== (settings?.unityMcpUrl ?? "")) patch.unityMcpUrl = draft.unityMcpUrl.trim();
+    if (draft.unityMcpAllowRemote !== (settings?.unityMcpAllowRemote === true)) patch.unityMcpAllowRemote = draft.unityMcpAllowRemote;
     if (draft.updateRepo.trim() !== (settings?.updateRepo ?? "")) patch.updateRepo = draft.updateRepo.trim();
     if (draft.updateToken.trim()) patch.updateToken = draft.updateToken.trim();
     if (Object.keys(patch).length === 0) { props.onToast("info", "没有需要保存的改动"); return; }
@@ -223,6 +227,18 @@ export function SettingsPanel(props: {
             <input style={{ width: "100%" }} value={draft.downloadRoot} onChange={(e) => setDraft((d) => ({ ...d, downloadRoot: e.target.value }))} placeholder="留空 = 数据目录下 downloads/" />
             <label className="hint" style={{ display: "block", marginTop: "6px" }}>Unity MCP 地址（可选，留空自动探测）</label>
             <input style={{ width: "100%" }} value={draft.unityMcpUrl} onChange={(e) => setDraft((d) => ({ ...d, unityMcpUrl: e.target.value }))} placeholder={settings?.unityMcpCandidates?.join(" → ") ?? "http://127.0.0.1:8080/mcp"} />
+            <label className="chk" style={{ marginTop: "6px" }}>
+              <input
+                type="checkbox"
+                checked={draft.unityMcpAllowRemote}
+                onChange={(e) => setDraft((d) => ({ ...d, unityMcpAllowRemote: e.target.checked }))}
+              />
+              允许非回环 Unity MCP 端点（默认关闭）
+            </label>
+            <div className="hint" style={{ marginTop: "2px" }}>
+              风险：HTTP 端点没有账号/token 保护，内网里任何能访问该端口的程序都能驱动你的 Unity 执行 C#、导入素材。
+              只在确实需要时打开；打开后仍会拒绝 file://、内嵌用户名/密码等非法地址，关掉时已保存的远程地址会一起清除。
+            </div>
             <label className="hint" style={{ display: "block", marginTop: "6px" }}>检查更新用的仓库（owner/repo，留空用内置默认）</label>
             <input style={{ width: "100%" }} value={draft.updateRepo} onChange={(e) => setDraft((d) => ({ ...d, updateRepo: e.target.value }))} placeholder="elysia-5201/asset-vault" />
             <label className="hint" style={{ display: "block", marginTop: "6px" }}>

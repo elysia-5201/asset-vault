@@ -100,6 +100,8 @@ export interface SettingsResponse {
   dbPath: string;
   watchPaths: WatchEntry[];
   unityMcpUrl: string;
+  /** 是否显式允许非回环 Unity MCP 端点（默认 false：本工具只驱动本机 Unity） */
+  unityMcpAllowRemote: boolean;
   unityMcpCandidates: string[];
   updateRepo: string;
   updateTokenSet: boolean;

@@ -8,6 +8,7 @@ import {
   type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
 } from "../api";
 import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
+import { unityPackageRelPath, type WorkbenchFocus } from "../workbench-focus";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
 import { CategoryEditor } from "./CategoryEditor";
@@ -50,8 +51,8 @@ export function ItemDetail(props: {
   onMarkImported: (itemId: number, projectId: number) => void;
   /** 打开另一个条目的详情（「疑似重复」里点「打开 #id」用）。 */
   onOpenItem: (itemId: number) => void;
-  /** 打开「头像工作台」——唯一合法的导入入口（计划 → 风险确认 → 作业）。 */
-  onOpenWorkbench?: () => void;
+  /** 打开「头像工作台」——唯一合法的导入入口（计划 → 风险确认 → 作业）；带上本页勾选的包作为上下文。 */
+  onOpenWorkbench?: (focus: WorkbenchFocus) => void;
 }) {
   const { itemId } = props;
   const [detail, setDetail] = useState<ItemDetailWeb | null>(null);
@@ -93,7 +94,6 @@ export function ItemDetail(props: {
   const [unityBusy, setUnityBusy] = useState(false);
   const [unityNote, setUnityNote] = useState("");
   const [unityPickNote, setUnityPickNote] = useState("");
-  const [unityErrors, setUnityErrors] = useState<string[]>([]);
   /** 这个条目在各工程里"真的被用到"的文件（GUID 求交；未扫描/旧后端 → 空数组，静默不报错） */
   const [usage, setUsage] = useState<ProjectRefUsage[] | null>(null);
   const [usageOpen, setUsageOpen] = useState<number | null>(null);
@@ -292,7 +292,7 @@ export function ItemDetail(props: {
    * 认得出"当前工程是哪个 avatar"时，只预选那个 avatar 的包（其余仍列出来，手动可勾）。
    */
   const loadUnity = useCallback(async (refresh = false) => {
-    setUnityBusy(true); setUnityNote(""); setUnityPickNote(""); setUnityErrors([]);
+    setUnityBusy(true); setUnityNote(""); setUnityPickNote("");
     try {
       let st: UnityStatusWeb;
       try { st = await unityStatus(); }
@@ -369,9 +369,24 @@ export function ItemDetail(props: {
    * 保留上面的包列表/勾选，只用于"这次要装哪几个包"的对照，不再产生外部副作用。
    */
   const openPlanImport = () => {
-    if (unityPicked.size) setUnityPickNote("要装这 " + unityPicked.size + " 个包：在工作台里对应勾选单元后确认风险即可。");
-    props.onToast("info", "导入改走「头像工作台」：按单元勾选 → 看风险 → 确认 → 执行");
-    if (props.onOpenWorkbench) props.onOpenWorkbench();
+    const picked = unityPkgs.filter((p) => unityPicked.has(p.key));
+    // 详情页的包（assetId + entryPath/innerEntryPath）与工作台单元（assetId + rel_path）能精确对上；
+    // 工作台只做"精确映射才预选"，对不上会在那边显式提示，不会自动生成/执行计划。
+    const units = picked.map((p) => ({ assetId: p.assetId, relPath: unityPackageRelPath(p) }));
+    const focus: WorkbenchFocus = {
+      itemId,
+      title: detail?.item?.title ?? ("条目 #" + itemId),
+      assetIds: [...new Set(units.map((u) => u.assetId))],
+      units,
+    };
+    if (units.length) {
+      setUnityPickNote("已把 " + units.length + " 个包带入工作台清单（按 assetId + relPath 对应单元）；"
+        + "在工作台核对清单 → 生成计划 → 看风险 → 确认 → 执行。");
+    }
+    props.onToast("info", units.length
+      ? "已打开「头像工作台」并带入 " + units.length + " 个包：核对清单 → 生成计划 → 确认 → 执行"
+      : "已打开「头像工作台」：请按单元勾选 → 生成计划 → 确认 → 执行");
+    if (props.onOpenWorkbench) props.onOpenWorkbench(focus);
     else setUnityNote("请从顶部「头像工作台」按计划导入：按单元勾选 → 看风险 → 确认 → 执行。");
   };
 
@@ -644,7 +659,7 @@ export function ItemDetail(props: {
                     <>
                       <div className="hint" style={{ marginTop: "6px" }}>
                         找到 {unityPkgs.length} 个包{unityPkgs.some((p) => p.matched) ? "（★ 是当前工程那个 avatar 的）" : ""}。
-                        详情页只做发现与对照；导入走「头像工作台」的计划 → 风险确认 → 作业（不再直接导入）。
+                        勾选只用于「带入工作台清单」（按 assetId + relPath 对应单元）；导入仍走「头像工作台」的计划 → 风险确认 → 作业。
                       </div>
                       <div className="unity-pkgs">
                         {unityPkgs.map((p) => (
@@ -661,8 +676,8 @@ export function ItemDetail(props: {
                         ))}
                       </div>
                       <div className="row wrap" style={{ marginTop: "6px", gap: "6px" }}>
-                        <button className="btn" disabled={!unityPicked.size} onClick={openPlanImport} title="打开头像工作台：按单元勾选 → 看风险 → 确认 → 执行（有作业与验证，可追溯）">
-                          到头像工作台按计划导入（已选 {unityPicked.size}）
+                        <button className="btn" onClick={openPlanImport} title="打开头像工作台并带入上面勾选的包：按单元核对 → 生成计划 → 看风险 → 确认 → 执行（有作业与验证，可追溯）">
+                          到头像工作台导入（{unityPicked.size ? "带入 " + unityPicked.size + " 个包" : "未勾选，打开后按单元选"}）
                         </button>
                         {unity.projectAvatar && unityPkgs.some((p) => p.matched) && (
                           <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.filter((p) => p.matched).map((p) => p.key)))}>只选 @{unity.projectAvatar.name}</button>
@@ -673,17 +688,6 @@ export function ItemDetail(props: {
                       {unityPickNote && <div className="hint" style={{ marginTop: "4px" }}>{unityPickNote}</div>}
                     </>
                   )}
-                  {!!unity?.dropped && (
-                    <div className="notice" style={{ marginTop: "6px" }}>
-                      已忽略 {(unity.dropped)} 个非回环 Unity MCP 地址（本工具只驱动本机 Unity；确需远程请显式打开 unity_mcp_allow_remote）。
-                    </div>
-                  )}
-                  {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}
-                  {unityErrors.length > 0 && (
-                    <div className="notice bad" style={{ marginTop: "6px" }}>
-                      Unity 控制台报错 {unityErrors.length} 条：{unityErrors.slice(0, 3).join(" ｜ ")}
-                    </div>
-                  )}
                 </>
               ) : (
                 <div className="hint">
@@ -691,6 +695,13 @@ export function ItemDetail(props: {
                   {unity?.candidates?.length ? <> 本机探测：<span className="mono">{unity.candidates.join(" / ")}</span></> : null}
                 </div>
               )}
+              {/* P3-7：排障场景（没连上）也要能看到被丢弃的非法/非回环端点 */}
+              {!!unity?.dropped && (
+                <div className="notice" style={{ marginTop: "6px" }}>
+                  已忽略 {unity.dropped} 个非回环或非法的 Unity MCP 地址（本工具只驱动本机 Unity；确需远程请到「设置」里显式打开「允许非回环端点」）。
+                </div>
+              )}
+              {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}
               <div className="hr" />
               <div className="row wrap">
                 {props.projects.map((p) => {

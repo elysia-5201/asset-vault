@@ -17,6 +17,7 @@ import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { AvatarWorkbench } from "./components/AvatarWorkbench";
+import type { WorkbenchFocus } from "./workbench-focus";
 import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { CategoryBatchBar } from "./components/CategoryBatchBar";
@@ -74,6 +75,8 @@ export default function App() {
   const [previewPanel, setPreviewPanel] = useState(false);
   /** Avatar 素材工作台：选 Avatar → 素材清单 → 导入计划 → 执行状态（task-39）。 */
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  /** 从条目详情打开时的选包上下文（null = 顶部按钮打开，不预选）。 */
+  const [workbenchFocus, setWorkbenchFocus] = useState<WorkbenchFocus | null>(null);
   /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
   const [settingsPanel, setSettingsPanel] = useState(false);
   /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
@@ -335,7 +338,7 @@ export default function App() {
           <button
             className="btn tiny"
             title="Avatar 素材工作台：按 Avatar 看素材证据与打包策略，勾选进导入清单，生成导入计划并跟踪每单元状态"
-            onClick={() => setWorkbenchOpen(true)}
+            onClick={() => { setWorkbenchFocus(null); setWorkbenchOpen(true); }}
           >素材工作台</button>
           <button
             className="btn tiny"
@@ -488,16 +491,21 @@ export default function App() {
       {dupPanel && (
         <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
       )}
-      {workbenchOpen && (
-        <AvatarWorkbench onClose={() => setWorkbenchOpen(false)} onToast={toast} />
-      )}
-
       {selectedItemId !== null && (
         <ItemDetail
           itemId={selectedItemId} avatars={avatars} projects={projects} onClose={() => setSelectedItemId(null)}
           onChanged={loadItems} onToast={toast} importedIds={importedIds} onMarkImported={markImported}
           onOpenItem={setSelectedItemId}
-          onOpenWorkbench={() => setWorkbenchOpen(true)}
+          onOpenWorkbench={(focus) => { setWorkbenchFocus(focus); setWorkbenchOpen(true); }}
+        />
+      )}
+
+      {/* 工作台必须**后于**详情渲染：两者同 z-index(.backdrop)，后渲染的在上面；否则详情会盖住工作台 */}
+      {workbenchOpen && (
+        <AvatarWorkbench
+          focus={workbenchFocus}
+          onClose={() => { setWorkbenchOpen(false); setWorkbenchFocus(null); }}
+          onToast={toast}
         />
       )}
 

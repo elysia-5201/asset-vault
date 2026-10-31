@@ -4,8 +4,12 @@ import {
   listJobs, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems,
 } from "../api";
 import type { ImportPlan, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
+import { focusNotice, mapFocusToUnits, sameSlot, type FocusMap, type WorkbenchFocus } from "../workbench-focus";
 import { formatDate, shortenPath } from "../util";
 import { Badge, Spinner, useDebounced } from "./ui";
+
+/** 互斥槽位规则在 workbench-focus（纯函数，可单测）里；这里原样再导出，保持既有调用方/smoke 不变。 */
+export { sameSlot } from "../workbench-focus";
 
 /**
  * Avatar 素材工作台（task-39）。
@@ -97,13 +101,6 @@ export function canRebuildPlan(state: string): boolean { return state === "faile
 const IN_FLIGHT_UNIT_STATES = ["planned", "importing", "import_command_completed", "verifying"];
 export function isRunBusy(run: ImportRun | null): boolean {
   return !!run && run.units.some((u) => IN_FLIGHT_UNIT_STATES.includes(u.state));
-}
-
-/** 两个单元是否占同一个「槽位」：同一资产 / 同一容器（压缩包）/ 同一条目的同一个包。 */
-export function sameSlot(a: WorkbenchItem, b: WorkbenchItem): boolean {
-  if (a.assetId !== null && b.assetId !== null && a.assetId === b.assetId) return true;
-  if (a.containerPath && b.containerPath && a.containerPath === b.containerPath) return true;
-  return a.itemId === b.itemId && (a.packageName ?? "") === (b.packageName ?? "");
 }
 
 /** 勾选/取消勾选（互斥在「勾选新项」时生效：同槽位的旧项会被替换掉；不可导入的单元一律拒绝）。 */
@@ -396,7 +393,10 @@ export function PlansSection(props: {
 export function AvatarWorkbench(props: {
   onClose: () => void;
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
+  /** 从条目详情「带入清单」打开的上下文：定位条目 + 按 assetId/relPath 精确映射已勾选的包。 */
+  focus?: WorkbenchFocus | null;
 }) {
+  const focus = props.focus ?? null;
   const [avatars, setAvatars] = useState<WorkbenchAvatar[]>([]);
   const [avatarId, setAvatarId] = useState<number | null>(null);
   const [avatarsLoading, setAvatarsLoading] = useState(true);
@@ -414,6 +414,14 @@ export function AvatarWorkbench(props: {
   const [itemsTotal, setItemsTotal] = useState(0);
   const [itemsLoading, setItemsLoading] = useState(false);
   const [itemsErr, setItemsErr] = useState("");
+  /** 从详情页打开时只看该条目的单元（可切回当前 Avatar 的单元）。 */
+  const [focusOnly, setFocusOnly] = useState(!!focus);
+  /** 当前 items 对应哪个查询范围（focus:123 / avatar:5），用来判断"该范围已加载完"。 */
+  const [itemsLoadedFor, setItemsLoadedFor] = useState("");
+  /** 详情页上下文 → 单元的映射结论（预选多少、哪些没对上）。 */
+  const [focusMap, setFocusMap] = useState<FocusMap | null>(null);
+  /** 同一个 focus 只带入一次：用户之后自己勾选/取消不被覆盖。 */
+  const focusAppliedRef = useRef("");
 
   const [picked, setPicked] = useState<WorkbenchItem[]>([]);
   const [projectPath, setProjectPath] = useState("");
@@ -503,12 +511,15 @@ export function AvatarWorkbench(props: {
     probeUnity(false);
   }, [probeUnity]);
 
-  // ③ 素材单元
+  // ③ 素材单元（有详情页上下文时默认只看该条目；?itemId= 走后端过滤）
   const loadItems = useCallback(() => {
-    if (avatarId === null) { setItems([]); setItemsTotal(0); return; }
+    const focused = focusOnly && focus !== null;
+    const scopeKey = focused ? "focus:" + focus.itemId : "avatar:" + String(avatarId ?? "none");
+    if (!focused && avatarId === null) { setItems([]); setItemsTotal(0); setItemsLoadedFor(scopeKey); return; }
     setItemsLoading(true); setItemsErr("");
     workbenchItems({
-      avatarId,
+      avatarId: focused ? undefined : avatarId ?? undefined,
+      itemId: focused ? focus.itemId : undefined,
       level: (confirmedOnly ? "confirmed" : level) || undefined,
       policy: policy || undefined,
       itemStatus: itemStatus || undefined,
@@ -524,10 +535,24 @@ export function AvatarWorkbench(props: {
         setItems(list); setItemsTotal(list.length);
       })
       .catch((e) => { setItems([]); setItemsTotal(0); setItemsErr(describeError(e)); })
-      .finally(() => setItemsLoading(false));
-  }, [avatarId, debouncedQ, itemStatus, level, policy, confirmedOnly]);
+      .finally(() => { setItemsLoading(false); setItemsLoadedFor(scopeKey); });
+  }, [avatarId, debouncedQ, itemStatus, level, policy, confirmedOnly, focusOnly, focus]);
 
   useEffect(() => { loadItems(); }, [loadItems]);
+
+  // 详情页带入的包 → 工作台单元：**精确映射才预选**；不明确时只给提示，不替用户做取舍。
+  useEffect(() => {
+    if (!focus) return;
+    const key = "focus:" + focus.itemId;
+    if (itemsLoadedFor !== key || focusAppliedRef.current === key) return;
+    const map = mapFocusToUnits(focus, items);
+    setFocusMap(map);
+    if (map.preselected.length) {
+      const byId = new Map(items.map((u) => [u.unitId, u]));
+      setPicked(map.preselected.map((id) => byId.get(id)).filter((u): u is WorkbenchItem => !!u));
+    }
+    focusAppliedRef.current = key;
+  }, [focus, items, itemsLoadedFor]);
 
   // ④ 一键补结构分析：提交 scan-all（onlyMissing）→ 轮询 /api/jobs 里那条 → 完成后刷新 avatars/units
   const scanAll = useCallback((): void => {
@@ -720,6 +745,22 @@ export function AvatarWorkbench(props: {
         <div className="drawer-body">
           {/* 左：Avatar + 筛选 + 素材卡片 */}
           <div className="left">
+            {focus && (
+              <div className="notice" data-workbench-focus="1">
+                <div className="row" style={{ gap: "6px", alignItems: "flex-start" }}>
+                  <b style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    来自条目「{focus.title?.trim() || "#" + focus.itemId}」
+                  </b>
+                  <span className="spacer" />
+                  <button className="btn tiny" onClick={() => setFocusOnly((v) => !v)}>
+                    {focusOnly ? "看全部 Avatar 的单元" : "只看这个条目"}
+                  </button>
+                </div>
+                <div className="hint" style={{ marginTop: "4px" }}>
+                  {focusMap ? focusNotice(focus, focusMap) : "正在按 assetId + relPath 把详情页勾选的包对应到单元…"}
+                </div>
+              </div>
+            )}
             <div className="hint">① 选择 Avatar（括号内是工作台计数）</div>
             {avatarsErr && <div className="err">工作台接口不可用：{avatarsErr}</div>}
             {avatarsLoading && !avatars.length && <div className="hint"><Spinner /> 载入 Avatar…</div>}
@@ -728,7 +769,8 @@ export function AvatarWorkbench(props: {
                 <button
                   key={a.id}
                   className={"preview-row" + (a.id === avatarId ? " on" : "")}
-                  onClick={() => setAvatarId(a.id)}
+                  onClick={() => { setAvatarId(a.id); setFocusOnly(false); }}
+                  title={focusOnly ? "选中这个 Avatar 并切回它的单元列表" : undefined}
                 >
                   <span className="row" style={{ gap: "6px" }}>
                     <b>{a.name}</b>
@@ -798,7 +840,11 @@ export function AvatarWorkbench(props: {
                 />
               ))}
               {!itemsLoading && !items.length && !itemsErr && (
-                avatarId === null
+                focusOnly && focus
+                  ? <div className="hint" style={{ padding: "10px" }}>
+                      条目「{focus.title?.trim() || "#" + focus.itemId}」还没有已分析的素材单元；可点上面「扫描全部结构」补齐（只补没分析过的条目），或切回「看全部 Avatar 的单元」。
+                    </div>
+                  : avatarId === null
                   ? <div className="hint" style={{ padding: "10px" }}>先选一个 Avatar</div>
                   : <UnitsEmptyState
                       scanning={scanAllBusy || scanJob !== null}

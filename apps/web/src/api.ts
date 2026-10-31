@@ -888,7 +888,7 @@ export async function addRoot(path: string, mode?: string): Promise<LibraryRootR
 }
 export async function removeRoot(id: number): Promise<{ ok: boolean }> { return request<{ ok: boolean }>("DELETE", "/roots/" + id); }
 export async function getSettings(): Promise<SettingsResponse> { return request<SettingsResponse>("GET", "/settings"); }
-export async function updateSettings(patch: Partial<{ downloadRoot: string; unityMcpUrl: string; updateRepo: string; updateToken: string }>) {
+export async function updateSettings(patch: Partial<{ downloadRoot: string; unityMcpUrl: string; unityMcpAllowRemote: boolean; updateRepo: string; updateToken: string }>) {
   return request<Partial<SettingsResponse>>("PUT", "/settings", patch, { timeoutMs: 30000 });
 }
 export async function listWatches(): Promise<{ watches: WatchEntry[] }> { return request<{ watches: WatchEntry[] }>("GET", "/watch"); }
