@@ -2291,9 +2291,11 @@ export class Repo {
     ).all(...p as any[]) as any[];
   }
 
-  createImportPlan(input: { itemId: number; projectPath: string; policy?: string | null; status: string; precheck: unknown }): any {
-    const info = this.stmt("INSERT INTO import_plans(item_id,project_path,policy,status,user_confirmed,precheck_json,created_at,version) VALUES (?,?,?,?,0,?,?,1)")
-      .run(input.itemId, input.projectPath, input.policy ?? null, input.status, JSON.stringify(input.precheck ?? null), now());
+  createImportPlan(input: { itemId: number; projectPath: string; policy?: string | null; status: string; precheck: unknown; sourceSnapshot?: unknown }): any {
+    // task-2：source_snapshot_json 只在建计划时写入（updateImportPlan 的 allowed 列表不含它 → 不可改写）。
+    const info = this.stmt("INSERT INTO import_plans(item_id,project_path,policy,status,user_confirmed,precheck_json,source_snapshot_json,created_at,version) VALUES (?,?,?,?,0,?,?,?,1)")
+      .run(input.itemId, input.projectPath, input.policy ?? null, input.status, JSON.stringify(input.precheck ?? null),
+        input.sourceSnapshot === undefined ? null : JSON.stringify(input.sourceSnapshot), now());
     return this.getImportPlan(Number(info.lastInsertRowid));
   }
   getImportPlan(id: number): any { return this.stmt("SELECT * FROM import_plans WHERE id=?").get(id) ?? null; }

@@ -51,6 +51,8 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   // v9：导入风险/验证覆盖（老库补列；新库由 schema.sql 建）
   { table: "import_plans", column: "risk_json", ddl: "TEXT" },
   { table: "import_plans", column: "risk_state", ddl: "TEXT" },
+  // task-2：源文件物理快照（可加列；旧库补列后为 NULL → 旧计划显式阻断并要求重建，不静默补信任）
+  { table: "import_plans", column: "source_snapshot_json", ddl: "TEXT" },
   { table: "import_runs", column: "verification_scope", ddl: "TEXT" },
   { table: "import_runs", column: "checked_count", ddl: "INTEGER NOT NULL DEFAULT 0" },
   { table: "import_runs", column: "expected_count", ddl: "INTEGER NOT NULL DEFAULT 0" },

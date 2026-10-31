@@ -19,6 +19,7 @@ import {
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
 import { scanPaths, RISK_SCANNER_VERSION, type RiskHit, type RiskState, type RiskScanResult } from "../../../../packages/core/src/risk";
+import { sha256FileWithSize } from "../../../../packages/core/src/hash";
 import type { Repo } from "../db/repo";
 import {
   UnityMcp, unityEditorInfo, importPackagesIntoUnity,
@@ -47,6 +48,222 @@ interface UnitRowInput {
 
 function fingerprintOf(asset: { size?: number | null; mtime?: string | null; sha256?: string | null }, size?: number): string {
   return `${Number(size ?? asset.size ?? 0)}:${String(asset.mtime ?? "")}:${String(asset.sha256 ?? "").slice(0, 8)}`;
+}
+
+// ---------------------------------------------------------------- 源文件物理快照（Task 2）
+
+/**
+ * 计划必须绑定"实际物理源字节"：创建时对每个物理容器做**全内容** sha256（流式、常量内存），
+ * 执行前（HTTP 预检与作业真实入口共用同一条 precheck）重新计算并与不可变快照比较。
+ * - 同 size + 恢复 mtime 的内部字节变化也会被全内容摘要发现（不依赖 size/mtime/DB sha 前缀）。
+ * - 每个 operation 内每个物理容器只哈希一次（容器级去重；嵌套单元共享外层容器文件）。
+ * - 快照只在建计划时写入；precheck 永不更新旧快照（缺失/不匹配一律阻断并要求重建计划）。
+ * 残余窗口见 task-2-report.md：预检哈希与 Unity 实际读取之间仍有 TOCTOU 窗口。
+ */
+export const SOURCE_SNAPSHOT_VERSION = 1;
+/** 读块大小：1 MiB（常量内存；哈希值与块大小无关）。 */
+export const SNAPSHOT_CHUNK_BYTES = 1 << 20;
+
+export interface SourceContainerSnapshot {
+  /** 物理容器路径（最外层原始资产文件；嵌套条目字节由该文件内容决定）。 */
+  path: string;
+  size: number;
+  mtimeMs: number;
+  sha256: string | null;
+  ok: boolean;
+  error: string | null;
+}
+export interface SourceUnitBinding { unitId: number; assetId: number; containerPath: string; relPath: string }
+export interface SourceSnapshot {
+  version: number; algorithm: "sha256-full"; createdAt: string;
+  containers: SourceContainerSnapshot[]; units: SourceUnitBinding[];
+}
+/** onContainerHash 只用于测试的确定性计数（每次实际哈希一个物理容器回调一次），不是性能基准。 */
+export interface SourceSnapshotOptions { onContainerHash?: (containerPath: string) => void }
+
+interface SourceRow { unitId: number; assetId: number; relPath: string; path: string }
+
+/** 行 → 去重后的容器任务 + 单元绑定（同一物理容器只出现一次）。 */
+function collectSourceTasks(rows: SourceRow[]): { tasks: { key: string; path: string }[]; units: SourceUnitBinding[]; problems: Map<number, string> } {
+  const tasks: { key: string; path: string }[] = [];
+  const seen = new Set<string>();
+  const units: SourceUnitBinding[] = [];
+  const problems = new Map<number, string>();
+  for (const row of rows) {
+    const path = String(row.path ?? "");
+    if (!path) {
+      problems.set(row.unitId, "原始文件路径为空");
+      units.push({ unitId: row.unitId, assetId: row.assetId, containerPath: "", relPath: String(row.relPath ?? "") });
+      continue;
+    }
+    const key = normalizePath(path);
+    if (!seen.has(key)) { seen.add(key); tasks.push({ key, path }); }
+    units.push({ unitId: row.unitId, assetId: row.assetId, containerPath: key, relPath: String(row.relPath ?? "") });
+  }
+  return { tasks, units, problems };
+}
+
+function snapshotHeader(): Pick<SourceSnapshot, "version" | "algorithm" | "createdAt"> {
+  return { version: SOURCE_SNAPSHOT_VERSION, algorithm: "sha256-full", createdAt: nowIso() };
+}
+
+function failedContainer(path: string, error: string): SourceContainerSnapshot {
+  return { path, size: 0, mtimeMs: 0, sha256: null, ok: false, error: String(error).slice(0, 200) };
+}
+
+/** 同步全内容哈希（1 MiB 块流式读，常量内存）。仅建计划路径使用（见 buildSourceSnapshotSync 说明）。 */
+function hashContainerSync(path: string): SourceContainerSnapshot {
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) throw new Error("不是普通文件");
+    const hash = createHash("sha256");
+    const fd = openSync(path, "r");
+    const buf = Buffer.alloc(SNAPSHOT_CHUNK_BYTES);
+    let size = 0;
+    try {
+      for (;;) {
+        const n = readSync(fd, buf, 0, buf.length, null);
+        if (n <= 0) break;
+        hash.update(buf.subarray(0, n));
+        size += n;
+      }
+    } finally { closeSync(fd); }
+    return { path, size, mtimeMs: st.mtimeMs, sha256: hash.digest("hex"), ok: true, error: null };
+  } catch (e) {
+    return failedContainer(path, (e as Error)?.message ?? String(e));
+  }
+}
+
+/** 异步流式全内容哈希（core sha256FileWithSize，1 MiB 读块），预检/作业入口使用。 */
+async function hashContainer(path: string): Promise<SourceContainerSnapshot> {
+  try {
+    const st = statSync(path);
+    if (!st.isFile()) throw new Error("不是普通文件");
+    const res = await sha256FileWithSize(path);
+    return { path, size: res.bytes, mtimeMs: st.mtimeMs, sha256: res.sha256, ok: true, error: null };
+  } catch (e) {
+    return failedContainer(path, (e as Error)?.message ?? String(e));
+  }
+}
+
+/**
+ * 建计划用快照（同步签名，保持既有调用方与测试兼容）：哈希本身按 1 MiB 块流式读取（常量内存），
+ * 但仍会占用事件循环——建计划是用户主动动作且每容器只一次；预检/执行路径走异步 buildSourceSnapshot。
+ */
+export function buildSourceSnapshotSync(rows: SourceRow[], opts: SourceSnapshotOptions = {}): SourceSnapshot {
+  const { tasks, units, problems } = collectSourceTasks(rows);
+  const containers: SourceContainerSnapshot[] = [];
+  for (const t of tasks) { opts.onContainerHash?.(t.key); containers.push(hashContainerSync(t.path)); }
+  for (const [unitId, message] of problems) containers.push(failedContainer("", message + "（unit " + unitId + "）"));
+  return { ...snapshotHeader(), containers, units };
+}
+
+/** 执行前用快照（异步流式；按物理容器去重，每容器只哈希一次）。 */
+export async function buildSourceSnapshot(repo: Repo, planId: number, opts: SourceSnapshotOptions = {}): Promise<SourceSnapshot> {
+  const items = repo.listImportPlanItems(planId);
+  const rows: SourceRow[] = items.map((it: any) => ({
+    unitId: Number(it.unit_id), assetId: Number(it.asset_id),
+    relPath: String(it.rel_path ?? ""), path: String(it.path ?? ""),
+  }));
+  const { tasks, units, problems } = collectSourceTasks(rows);
+  const containers: SourceContainerSnapshot[] = [];
+  for (const t of tasks) { opts.onContainerHash?.(t.key); containers.push(await hashContainer(t.path)); }
+  for (const [unitId, message] of problems) containers.push(failedContainer("", message + "（unit " + unitId + "）"));
+  return { ...snapshotHeader(), containers, units };
+}
+
+export interface SourceSnapshotVerdict {
+  ok: boolean;
+  code: "SOURCE_CHANGED" | "SOURCE_UNAVAILABLE" | null;
+  message: string;
+  changedUnits: number[];
+  changedPaths: string[];
+  unavailablePaths: string[];
+}
+
+function shortPaths(paths: string[], max = 3): string {
+  const list = [...new Set(paths.filter(Boolean))];
+  if (list.length === 0) return "(未知路径)";
+  return list.slice(0, max).join("；") + (list.length > max ? " 等 " + list.length + " 个文件" : "");
+}
+
+/** 计划快照 vs 当前磁盘快照：内容摘要（含 size）不一致 → 变化；容器不可读 → 不可用。 */
+export function compareSourceSnapshots(stored: SourceSnapshot, current: SourceSnapshot): SourceSnapshotVerdict {
+  const curUnits = new Map(current.units.map((u) => [u.unitId, u]));
+  const storedUnits = new Map(stored.units.map((u) => [u.unitId, u]));
+  const curContainers = new Map<string, SourceContainerSnapshot>();
+  for (const c of current.containers) curContainers.set(normalizePath(c.path), c);
+  const storedContainers = new Map<string, SourceContainerSnapshot>();
+  for (const c of stored.containers) storedContainers.set(normalizePath(c.path), c);
+  const changedUnits: number[] = [];
+  const changedPaths: string[] = [];
+  const unavailablePaths: string[] = [];
+  const check = (binding: SourceUnitBinding) => {
+    const cur = curUnits.get(binding.unitId);
+    if (!cur || cur.relPath !== binding.relPath) { changedUnits.push(binding.unitId); changedPaths.push(binding.containerPath); return; }
+    if (!binding.containerPath) { unavailablePaths.push("(空路径)"); return; }
+    const sc = storedContainers.get(binding.containerPath);
+    const cc = curContainers.get(binding.containerPath);
+    if (!sc || !sc.ok || !cc || !cc.ok) { unavailablePaths.push(binding.containerPath); return; }
+    if (sc.size !== cc.size || sc.sha256 === null || sc.sha256 !== cc.sha256) { changedUnits.push(binding.unitId); changedPaths.push(binding.containerPath); }
+  };
+  for (const b of stored.units) check(b);
+  for (const b of current.units) if (!storedUnits.has(b.unitId)) { changedUnits.push(b.unitId); changedPaths.push(b.containerPath); }
+  const uniq = [...new Set(changedUnits)];
+  const changed = [...new Set(changedPaths)];
+  const unavailable = [...new Set(unavailablePaths)];
+  if (unavailable.length) {
+    return {
+      ok: false, code: "SOURCE_UNAVAILABLE",
+      message: "源文件不可读（无法校验物理快照）：" + shortPaths(unavailable)
+        + (uniq.length ? "；另有 " + uniq.length + " 个单元内容不再一致" : "")
+        + "。已在任何 Unity/导入副作用前阻断；请恢复源文件后重新创建计划（不会自动补写或更新旧快照）。",
+      changedUnits: uniq, changedPaths: changed, unavailablePaths: unavailable,
+    };
+  }
+  if (uniq.length) {
+    return {
+      ok: false, code: "SOURCE_CHANGED",
+      message: "源文件内容已变化（物理快照不一致）：" + shortPaths(changed)
+        + "（单元 " + uniq.slice(0, 8).join(",") + "）。计划已阻断；不会更新旧快照，请重新创建计划以绑定当前磁盘内容。",
+      changedUnits: uniq, changedPaths: changed, unavailablePaths: unavailable,
+    };
+  }
+  return { ok: true, code: null, message: "源文件物理快照一致", changedUnits: [], changedPaths: [], unavailablePaths: [] };
+}
+
+function blockPlanOnSourceSnapshot(repo: Repo, planId: number, detail: unknown): void {
+  repo.updateImportPlan(planId, {
+    status: "blocked",
+    precheck_json: JSON.stringify({ checkedAt: nowIso(), sourceSnapshot: detail }),
+  });
+}
+
+/**
+ * 执行前置：实际磁盘字节 vs 计划不可变快照。
+ * 缺失快照（旧计划）→ SNAPSHOT_MISSING；内容变化 → SOURCE_CHANGED；不可读 → SOURCE_UNAVAILABLE；
+ * 一律先把计划置 blocked（保留原因），绝不重写快照。HTTP 预检与作业执行入口都调用它。
+ */
+export async function assertPlanSourcesIntact(repo: Repo, planId: number, opts: SourceSnapshotOptions = {}): Promise<{ units: number; containers: number }> {
+  const plan = repo.getImportPlan(planId);
+  if (!plan) throw appErr("NOT_FOUND", "计划不存在", 404);
+  const stored = safeJson(plan.source_snapshot_json) as SourceSnapshot | null;
+  if (!stored || Number(stored.version) !== SOURCE_SNAPSHOT_VERSION || !Array.isArray(stored.containers) || !Array.isArray(stored.units)) {
+    blockPlanOnSourceSnapshot(repo, planId, { state: "missing" });
+    throw appErr("SNAPSHOT_MISSING", "计划缺少源文件物理快照（旧计划或字段缺失），已阻断；不会自动补写快照。请重新创建计划以绑定当前磁盘内容。", 409);
+  }
+  const current = await buildSourceSnapshot(repo, planId, opts);
+  const verdict = compareSourceSnapshots(stored, current);
+  if (!verdict.ok) {
+    blockPlanOnSourceSnapshot(repo, planId, {
+      state: verdict.code,
+      changedUnits: verdict.changedUnits.slice(0, 50),
+      changedPaths: verdict.changedPaths.slice(0, 20),
+      unavailablePaths: verdict.unavailablePaths.slice(0, 20),
+    });
+    throw appErr(String(verdict.code), verdict.message, 409);
+  }
+  return { units: current.units.length, containers: current.containers.length };
 }
 
 function parseStateOf(asset: { index_state?: string | null }): "ok" | "partial" | "failed" {
@@ -460,6 +677,7 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
   const selectedIds = new Set(units.map((u) => Number(u.id)));
   const checkedAt = nowIso();
   const projectExists = existsSync(projectPath);
+  const relPaths = new Map<number, string>();
   const precheckUnits: PrecheckUnit[] = all.map((u) => {
     const asset = repo.getAsset(Number(u.asset_id));
     const fpNow = asset ? fingerprintOf(asset, Number(u.size) || undefined) : null;
@@ -471,21 +689,37 @@ export function createImportPlan(repo: Repo, input: { unitIds: number[]; project
     const error = changed ? "指纹已变化（单元=" + u.fingerprint + "，当前=" + fpNow + "）"
       : !exists ? "原始文件不存在：" + String(asset?.path ?? "")
       : null;
+    relPaths.set(Number(u.id), String(u.rel_path ?? ""));
     return {
       unitId: Number(u.id), assetId: Number(u.asset_id), path: String(asset?.path ?? ""), name: String(u.name),
       policy: String(u.policy), fingerprint: u.fingerprint ?? null, fingerprintNow: fpNow, changed, fileExists: exists,
       mixed, importable: !!u.importable, status: error ? "blocked" : status, error,
     };
   });
+  // Task 2：计划绑定**实际物理源字节**（每物理容器一次全内容 sha256；建后不可改写）。
+  const sourceSnapshot = buildSourceSnapshotSync(precheckUnits.map((u) => ({
+    unitId: u.unitId, assetId: u.assetId, relPath: relPaths.get(u.unitId) ?? "", path: u.path,
+  })));
+  const containerByKey = new Map(sourceSnapshot.containers.map((c) => [normalizePath(c.path), c]));
+  let snapshotFailed = false;
+  for (const u of precheckUnits) {
+    const c = containerByKey.get(normalizePath(u.path));
+    if (c && c.ok) continue;
+    snapshotFailed = true;
+    if (u.error) continue; // 保留更具体的原始错误（指纹变化/文件不存在）
+    u.status = "blocked";
+    u.error = "源文件物理快照不可读（" + (c?.error ?? "源文件不可读") + "）：" + u.path;
+  }
   const warnings: string[] = [];
   if (precheckUnits.some((u) => u.mixed)) warnings.push("包含混合 .unitypackage：将导入整个原始包（不拆分、不生成筛选包）");
   if (extras.length) warnings.push("已按建议加入 " + extras.length + " 个伴生单元（status=suggested，确认后可执行）");
   if (!projectExists) warnings.push("Unity 工程路径当前不存在或不可访问：" + projectPath);
-  const blocked = precheckUnits.some((u) => u.changed || !u.fileExists);
+  if (snapshotFailed) warnings.push("源文件物理快照不可读：计划已阻断（不会在无快照的情况下继续）");
+  const blocked = snapshotFailed || precheckUnits.some((u) => u.changed || !u.fileExists);
   const needsConfirm = blocked || extras.length > 0 || precheckUnits.some((u) => u.mixed) || precheckUnits.some((u) => u.status === "suggested");
   const status = blocked ? "blocked" : needsConfirm ? "needs_confirmation" : "ready";
   const precheck = { checkedAt, projectPath, projectExists, units: precheckUnits, warnings };
-  const plan = repo.createImportPlan({ itemId, projectPath, policy: precheckUnits.some((u) => u.mixed) ? "mixed_unitypackage" : "single_unitypackage", status, precheck });
+  const plan = repo.createImportPlan({ itemId, projectPath, policy: precheckUnits.some((u) => u.mixed) ? "mixed_unitypackage" : "single_unitypackage", status, precheck, sourceSnapshot });
   for (const u of precheckUnits) {
     repo.addImportPlanItem({ planId: plan.id, unitId: u.unitId, assetId: u.assetId, path: u.path, policy: u.policy, fingerprint: u.fingerprint, status: u.status, error: u.error ?? null });
   }
@@ -713,6 +947,9 @@ export async function applyPlanRisk(repo: Repo, planId: number): Promise<PlanVie
  */
 export async function precheckImportPlanWithRisk(repo: Repo, planId: number): Promise<{ plan: any; items: any[]; changed: any[]; risks: PlanRiskSummary }> {
   const checked = precheckImportPlan(repo, planId);
+  // Task 2：先校验**实际磁盘字节**与计划不可变快照一致（HTTP 预检与作业真实入口共用此路径）。
+  // 失败即在任何风险重扫/Unity/暂存/导入副作用之前阻断（计划置 blocked，旧快照永不更新）。
+  await assertPlanSourcesIntact(repo, planId);
   const current = await computePlanRisk(repo, planId);
   const stored = safeJson(checked.plan.risk_json) as PlanRiskSummary | null;
   if (!stored) {

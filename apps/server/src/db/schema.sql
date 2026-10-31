@@ -485,6 +485,8 @@ CREATE TABLE IF NOT EXISTS import_plans (
   -- v9：风险扫描摘要与状态（ok/warning/unknown/blocked；未知必须人工确认）
   risk_json TEXT,
   risk_state TEXT,
+  -- task-2（可加列，不改 schema 版本）：建计划时的源文件物理快照（全内容 sha256；建后只读，执行前比对）
+  source_snapshot_json TEXT,
   created_at TEXT NOT NULL,
   version INTEGER NOT NULL DEFAULT 1
 );
