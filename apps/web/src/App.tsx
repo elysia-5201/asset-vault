@@ -10,7 +10,8 @@ import type { AvatarCard, CategoryCounts, CategoryStats, HealthResponse, ItemCar
 import { formatBytes, formatDate, parseAtQuery, resolveAvatarNames } from "./util";
 import { AvatarRail } from "./components/AvatarRail";
 import { CategoryManager } from "./components/CategoryManager";
-import { EMPTY_FILTERS, SearchBar, type FilterState } from "./components/SearchBar";
+import { SearchBar } from "./components/SearchBar";
+import { EMPTY_FILTERS, clearFilters, pushEscLayer, dropEscLayer, isTopEscLayer, type FilterState } from "./ui-state";
 import { ItemCardView } from "./components/ItemCardView";
 import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
@@ -79,6 +80,16 @@ export default function App() {
   const [workbenchFocus, setWorkbenchFocus] = useState<WorkbenchFocus | null>(null);
   /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
   const [settingsPanel, setSettingsPanel] = useState(false);
+  /** 右侧导入/作业侧栏：默认收起，按需打开；打开/关闭不丢筛选与头像选择。 */
+  const [sideOpen, setSideOpen] = useState(false);
+  const sideToggleRef = useRef<HTMLButtonElement | null>(null);
+  /** 左栏「更多工具」菜单（原生 details，点菜单项后自动收起）。 */
+  const moreToolsRef = useRef<HTMLDetailsElement | null>(null);
+  const [moreToolsOpen, setMoreToolsOpen] = useState(false);
+  const closeMoreTools = useCallback(() => { setMoreToolsOpen(false); moreToolsRef.current?.removeAttribute("open"); }, []);
+  /** 中栏顶条实测高度：侧栏从这里向下展开，不写死像素。 */
+  const mainHeadRef = useRef<HTMLDivElement | null>(null);
+  const [sideTop, setSideTop] = useState(47);
   /** 检查更新：正在请求 / 有更新时的面板数据（无更新只 toast，不弹面板）。 */
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
@@ -313,6 +324,72 @@ export default function App() {
       .catch((e) => toast("bad", describeError(e)));
   };
 
+  // 顶条高度变化（换行/缩放）时侧栏顶边跟随。
+  useEffect(() => {
+    const el = mainHeadRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => setSideTop(el.getBoundingClientRect().bottom);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // 「更多工具」菜单：外点 / Escape 收起，Escape 焦点回入口。
+  useEffect(() => {
+    if (!moreToolsOpen) return;
+    pushEscLayer("more-tools");
+    const onDown = (e: MouseEvent) => { if (!moreToolsRef.current?.contains(e.target as Node)) setMoreToolsOpen(false); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // 只关最上层：侧栏/分类弹层后打开时先让它们关，Esc 不连锁关掉下面的层。
+      if (!isTopEscLayer("more-tools")) return;
+      setMoreToolsOpen(false);
+      (moreToolsRef.current?.querySelector("summary") as HTMLElement | null)?.focus();
+      e.stopImmediatePropagation();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      dropEscLayer("more-tools");
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [moreToolsOpen]);
+  const closeSide = useCallback(() => { setSideOpen(false); sideToggleRef.current?.focus(); }, []);
+  // Esc 收起侧栏并把焦点还给入口按钮（打开时不抢焦点，避免打断浏览）。
+  useEffect(() => {
+    if (!sideOpen) return;
+    pushEscLayer("side-panel");
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // 只关最上层：其上有菜单/弹层时先关那一层。
+      if (!isTopEscLayer("side-panel")) return;
+      closeSide();
+      e.stopImmediatePropagation();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => { dropEscLayer("side-panel"); document.removeEventListener("keydown", onKey); };
+  }, [sideOpen, closeSide]);
+  /**
+   * 前景模态（条目详情 / 素材工作台）打开时登记为 Esc 栈顶：
+   * 背景的侧栏、「更多工具」与「更多分类」弹层都不再响应 Escape，也不会把焦点抢回背景。
+   * 这两个模态自身不处理 Escape（保持原行为：只能点「关闭」按钮或 backdrop 关闭），
+   * 因此登记后按 Esc 等价于无操作；模态关闭即出栈，原来的 Esc 层级照常工作
+   * （关掉详情后按 Esc 仍会关侧栏/分类弹层并把焦点还给对应入口）。
+   */
+  const modalOpen = selectedItemId !== null || workbenchOpen;
+  useEffect(() => {
+    if (!modalOpen) return;
+    pushEscLayer("foreground-modal");
+    return () => { dropEscLayer("foreground-modal"); };
+  }, [modalOpen]);
+  // 「清空全部」：搜索词 + 头像选择 + 全部筛选条件一起清；与只清筛选的按钮语义分开。
+  const clearAll = useCallback(() => {
+    setFilters(clearFilters(filters));
+    setText("");
+    setSelectedAvatarIds([]);
+  }, [filters]);
+
   const counts = health?.counts;
   const inFlight = jobs.filter((j) => ["queued", "resolving", "fetching", "materializing", "indexing", "matching", "releasing", "releasing_done"].includes(j.state)).length;
 
@@ -329,34 +406,31 @@ export default function App() {
             </div>
           </span>
           <span className="spacer" />
-          <button className="btn tiny" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => setDupPanel(true)}>查重</button>
-          <button
-            className="btn tiny"
-            title="分类管理：一级/二级分类的新增、改名、排序、移动、启停、删除、合并，以及标签管理"
-            onClick={() => setManagerOpen(true)}
-          >分类管理</button>
-          <button
-            className="btn tiny"
-            title="Avatar 素材工作台：按 Avatar 看素材证据与打包策略，勾选进导入清单，生成导入计划并跟踪每单元状态"
-            onClick={() => { setWorkbenchFocus(null); setWorkbenchOpen(true); }}
-          >素材工作台</button>
-          <button
-            className="btn tiny"
-            title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）"
-            onClick={() => setPreviewPanel(true)}
-          >扫描预览</button>
-          <button
-            className="btn tiny"
-            title="批量分类：在列表卡片上加复选框，可批量设置主/子分类、移除子分类、重新生成建议"
-            onClick={() => { setSelectMode((v) => !v); setSelectedIds([]); }}
-          >{selectMode ? "退出选择" : "批量分类"}</button>
-          <button className="btn tiny" disabled={updateBusy} title="检查应用更新（GET /api/update-check?force=1，查 GitHub Releases）" onClick={doCheckUpdate}>
-            {updateBusy ? "检查中…" : "检查更新"}
-          </button>
-          {mode === "mock" && (
-            <button className="btn tiny" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
-          )}
           <span className={"mode-pill " + mode}>{mode === "live" ? "LIVE" : "MOCK"}</span>
+          <div className="brand-tools">
+            <button
+              className="btn tiny"
+              title="Avatar 素材工作台：按 Avatar 看素材证据与打包策略，勾选进导入清单，生成导入计划并跟踪每单元状态"
+              onClick={() => { setWorkbenchFocus(null); setWorkbenchOpen(true); }}
+            >素材工作台</button>
+            <details className="more-tools" ref={moreToolsRef} open={moreToolsOpen} onToggle={(e) => setMoreToolsOpen(e.currentTarget.open)}>
+              <summary className="btn tiny" aria-haspopup="menu" title="低频工具与设置">更多工具 ▾</summary>
+              <div className="more-menu" role="menu">
+                <button role="menuitem" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => { closeMoreTools(); setDupPanel(true); }}>库级查重</button>
+                <button role="menuitem" title="分类管理：一级/二级分类与标签的增改、排序、启停、合并" onClick={() => { closeMoreTools(); setManagerOpen(true); }}>分类管理</button>
+                <button role="menuitem" title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）" onClick={() => { closeMoreTools(); setPreviewPanel(true); }}>扫描预览</button>
+                <button role="menuitem" title="批量分类：在列表卡片上加复选框，批量设置主/子分类" onClick={() => { closeMoreTools(); setSelectMode((v) => !v); setSelectedIds([]); }}>{selectMode ? "退出批量选择" : "批量分类"}</button>
+                <div className="more-sep" />
+                <button role="menuitem" title="设置：库根 / 收件箱监听 / 下载与集成" onClick={() => { closeMoreTools(); setSettingsPanel(true); }}>设置</button>
+                <button role="menuitem" disabled={updateBusy} title="检查应用更新（GET /api/update-check?force=1，查 GitHub Releases）" onClick={() => { closeMoreTools(); doCheckUpdate(); }}>{updateBusy ? "检查中…" : "检查更新"}</button>
+                {mode === "mock" && (
+                  <button role="menuitem" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { closeMoreTools(); void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
+                )}
+                <div className="more-sep" />
+                <button role="menuitem" onClick={() => { closeMoreTools(); loadItems(); loadJobs(); loadMeta(); }}>全部刷新</button>
+              </div>
+            </details>
+          </div>
         </div>
         <AvatarRail
           avatars={avatars} loading={avatarsLoading} selected={effAvatarIds} onToggle={toggleAvatar}
@@ -366,12 +440,30 @@ export default function App() {
       </div>
 
       <div className="col">
+        <div className="main-head" ref={mainHeadRef}>
+          <h1>素材库</h1>
+          <span className="hint main-head-sub">浏览为主 · 素材总览</span>
+          <span className="spacer" />
+          <button
+            ref={sideToggleRef}
+            type="button"
+            className={"btn side-toggle" + (sideOpen ? " on" : "")}
+            aria-expanded={sideOpen}
+            aria-controls="side-panel"
+            onClick={() => setSideOpen((v) => !v)}
+            title="打开/收起导入与作业侧栏（不丢当前筛选与头像选择）"
+          >
+            导入 / 作业 <span className="badge muted" title="进行中的作业数">{inFlight}</span>
+            <span className="hint">{inFlight ? "进行中" : "空闲"}</span>
+          </button>
+        </div>
         <SearchBar
           text={text} onText={setText} filters={filters} onFilters={setFilters}
           atAvatars={parsed.avatars} unresolved={resolved.unresolved} onRemoveAt={removeAtName}
           loading={itemsLoading} total={total}
           categories={categories} catCounts={catCounts}
           countsScope={catCounts ? "filtered" : "global"} catErr={catErr}
+          avatarCount={effAvatarIds.length} onClearAll={clearAll}
         />
         {selectMode && (
           <CategoryBatchBar
@@ -390,7 +482,7 @@ export default function App() {
           {!itemsErr && !itemsLoading && !shownItems.length && (
             <div className="empty">
               没有匹配的条目
-              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前是内置 mock 数据（后端不可达）：左上角点「重连」，或等它每 4 秒自动重连。" : "试着放宽过滤器或清空 @头像。"}</div>
+              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前是内置 mock 数据（后端不可达）：左栏「更多工具 → 重连」，或等它每 4 秒自动重连。" : "试着放宽过滤器或清空 @头像。"}</div>
             </div>
           )}
           {itemsLoading && !shownItems.length && <div className="empty"><Spinner /> 载入条目…</div>}
@@ -420,20 +512,26 @@ export default function App() {
         </div>
       </div>
 
-      <div className="col side">
+      <aside
+        id="side-panel"
+        className={"side-panel" + (sideOpen ? " open" : "")}
+        aria-hidden={!sideOpen}
+        aria-label="导入与作业侧栏"
+        style={{ top: sideTop }}
+      >
         <div className="pane-head" style={{ gap: "6px" }}>
           <div className="seg">
             <button className={sideTab === "import" ? "on" : ""} onClick={() => setSideTab("import")}>导入</button>
             <button className={sideTab === "jobs" ? "on" : ""} onClick={() => setSideTab("jobs")}>作业 {inFlight ? "(" + inFlight + ")" : ""}</button>
           </div>
           <span className="spacer" />
-          <button className="btn tiny" title="库根 / 收件箱监听 / 下载目录 / Unity MCP / 检查更新" onClick={() => setSettingsPanel(true)}>设置</button>
           <button className="btn tiny" onClick={() => { loadItems(); loadJobs(); loadMeta(); }}>全部刷新</button>
+          <button className="btn tiny" onClick={closeSide} title="收起侧栏（Esc）" aria-label="收起侧栏">收起</button>
         </div>
         {sideTab === "import"
           ? <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} />
           : <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />}
-      </div>
+      </aside>
 
       {/* 有更新才弹的居中面板：当前版本 → 最新版本 + Release 链接 + notes 前 500 字 + 资产文件名/大小 */}
       {updateInfo && (

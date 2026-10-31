@@ -29,8 +29,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 a { color: var(--accent); }
 
-.app { display: grid; grid-template-columns: 268px minmax(420px, 1fr) 420px; height: 100vh; overflow: hidden; }
-@media (max-width: 1400px) { .app { grid-template-columns: 240px minmax(360px, 1fr) 360px; } }
+/* 右栏改为按需侧栏，主区只保留左轨 + 素材列表（列表是主体）。 */
+.app { display: grid; grid-template-columns: 268px minmax(0, 1fr); height: 100vh; overflow: hidden; }
+@media (max-width: 1280px) { .app { grid-template-columns: 232px minmax(0, 1fr); } }
+@media (max-width: 980px) { .app { grid-template-columns: 208px minmax(0, 1fr); } }
 
 .col { min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .col.rail { border-right: 1px solid var(--line); background: var(--bg-soft); }
@@ -123,7 +125,8 @@ input[type=checkbox] { accent-color: var(--accent); }
 .filters label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--fg-mute); }
 
 /* ---------- grid + card ---------- */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; padding: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; padding: 12px; }
+@media (min-width: 1500px) { .grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); } }
 .card { border: 1px solid var(--line); background: var(--bg-card); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; cursor: pointer; }
 .card:hover { border-color: var(--accent); }
 .card.sel { box-shadow: 0 0 0 1px var(--accent); }
@@ -414,3 +417,100 @@ input[type=color] { background: #0f141b; border: 1px solid var(--line); border-r
 .pipe-ev { font-family: var(--mono); font-size: 10.5px; max-height: 150px; overflow: auto; background: #0d1219; border: 1px solid var(--line-soft); border-radius: 7px; padding: 6px; }
 .pipe-kv > span, .pipe-kv > b { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .pipe-fail { border: 1px solid rgba(232,98,79,.45); background: rgba(232,98,79,.1); border-radius: 8px; padding: 6px 8px; font-size: 11px; color: #ffb9ae; display: flex; flex-direction: column; gap: 2px; }
+
+/* =========================================================================
+   日常浏览布局
+   目标：素材列表为主体；右栏按需侧栏；搜索/常用分类常显、其余「更多分类」；
+   高级筛选折叠；活动条件摘要 + 明确的清空语义；窄屏不再被固定左右栏挤成单列。
+   ========================================================================= */
+
+/* ---------- 左轨：品牌 + 常用入口（工作台常显，低频工具收进「更多工具」） ---------- */
+.brand { align-items: center; }
+.brand-tools { display: flex; align-items: center; gap: 6px; flex: 1 1 100%; flex-wrap: wrap; }
+.more-tools { position: relative; }
+.more-tools > summary { list-style: none; white-space: nowrap; }
+.more-tools > summary::-webkit-details-marker { display: none; }
+.more-tools[open] > summary { border-color: var(--accent); color: #fff; }
+.more-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 40; min-width: 176px;
+  display: flex; flex-direction: column; gap: 1px; padding: 6px;
+  background: var(--bg-card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+}
+.more-menu button {
+  text-align: left; border: 0; background: transparent; color: var(--fg-dim);
+  padding: 6px 8px; border-radius: 6px; font-size: 12px; white-space: nowrap;
+}
+.more-menu button:hover:not(:disabled) { background: var(--bg-hi); color: var(--fg); }
+.more-menu button:disabled { opacity: .45; cursor: not-allowed; }
+.more-menu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.more-sep { height: 1px; background: var(--line-soft); margin: 4px 2px; }
+
+/* ---------- 中栏顶条：素材库标题 + 侧栏入口（作业数/状态） ---------- */
+.main-head {
+  display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  border-bottom: 1px solid var(--line); background: var(--bg-soft); flex: 0 0 auto;
+}
+.main-head h1 { margin: 0; font-size: 13px; letter-spacing: .04em; font-weight: 650; }
+.main-head-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none; }
+@media (min-width: 1180px) { .main-head-sub { display: inline; } }
+.side-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.side-toggle.on { border-color: var(--accent); color: #fff; background: var(--accent-soft); }
+
+/* ---------- 搜索 + 排序 + 条件摘要 ---------- */
+.sb-row-main { display: flex; align-items: center; gap: 8px; }
+.sb-row-main .search-wrap { flex: 1 1 auto; min-width: 0; }
+.sb-sort { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.sb-sort select { width: auto; min-width: 96px; }
+.sb-cond-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; row-gap: 5px; }
+.sb-cond-label { color: var(--fg-mute); font-size: 11px; }
+.sb-cond-chips { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.cond-chip {
+  font-size: 11px; line-height: 1.5; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+  color: #cfe6ff; background: var(--accent-soft); border: 1px solid rgba(77, 163, 255, .4);
+}
+.sb-adv.on { border-color: var(--accent); color: #fff; background: var(--accent-soft); }
+.sb-count-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#sb-advanced .chk { padding-top: 12px; }
+
+/* ---------- 分类：常用常显（换行，不隐藏式横向截断），其余进「更多分类」 ---------- */
+.cat-bar { flex-wrap: wrap; overflow: visible; padding-bottom: 2px; }
+.cat-bar-sub { row-gap: 5px; }
+.cat-more-wrap { position: relative; display: inline-flex; }
+.cat-more-btn { cursor: pointer; border-style: dashed; }
+/* 固定定位 + 实测 left/top（CategoryBars 内联）：分类栏是横向滚动容器（overflow 非 visible），
+   absolute 定位会被裁切；fixed 同时避免窄屏靠右时面板出界。 */
+.cat-more-panel {
+  position: fixed; top: 0; left: 0; z-index: 40; box-sizing: border-box;
+  width: min(560px, calc(100vw - 56px)); max-height: min(70vh, 420px); overflow: auto; padding: 8px;
+  background: var(--bg-card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .55);
+}
+.cat-more-head { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); margin-bottom: 6px; }
+.cat-more-grid { display: flex; flex-wrap: wrap; gap: 6px; max-height: 240px; overflow: auto; }
+
+/* ---------- 按需侧栏（默认收起；不占布局列，所以 1024 不会把网格挤成单列） ---------- */
+.side-panel {
+  /* 从顶条下方展开：入口按钮始终可见，点同一按钮即可收起。 */
+  position: fixed; top: var(--side-top, 47px); right: 0; bottom: 0; z-index: 15;
+  width: min(420px, 100vw); display: flex; flex-direction: column; min-height: 0;
+  background: var(--bg-soft); border-left: 1px solid var(--line);
+  box-shadow: -18px 0 42px rgba(0, 0, 0, .42);
+  visibility: hidden; transform: translateX(102%); transition: transform .18s ease, visibility .18s;
+}
+.side-panel.open { visibility: visible; transform: none; }
+@media (max-width: 720px) { .side-panel { width: 100%; } }
+.side-panel .pane-head { flex: 0 0 auto; }
+
+/* ---------- 卡片：长标题/长元数据不撑破网格 ---------- */
+.card, .card-body { min-width: 0; }
+.card-title { overflow-wrap: anywhere; word-break: break-word; }
+.card-meta { min-width: 0; overflow-wrap: anywhere; }
+
+
+/* ---------- 窄屏：长清空文案缩短，避免把工具栏推高 ---------- */
+.sb-clear-short { display: none; }
+@media (max-width: 1100px) {
+  .sb-clear-full { display: none; }
+  .sb-clear-short { display: inline; }
+}

@@ -1,19 +1,16 @@
 /**
- * 分类体系 v3 §8：中栏「一级分类栏 / 二级分类栏」。
- * 标签不再单独筛选（v3.1）：标签名参与全局搜索（FTS/LIKE 都会命中 tags_text），
- * 所以这里只保留分类导航；标签仍然在卡片/详情页展示与管理。
- *
- * - 一级栏：横向紧凑 chip（深色底 + 中性边框，选中用紫色强调），含「全部」与系统分类「未分类」；
- *   数字是 **当前筛选下**的计数（GET /api/categories/counts；不可用时退回分类树上的全局 itemCount 并标注）。
- * - 二级栏：随所选一级动态渲染，首项「全部<一级名>」；无子分类的一级（如「未分类」）**不占位**。
- * - 键盘：Tab 聚焦 + ←/→ 在同类 chip 间移动焦点并选中（分类栏是单选语义），焦点环见 styles.css 的 :focus-visible。
+ * 分类导航（隔离预览版）：常用分类常显 + 「更多分类」按需展开。
+ * - 一级：前 N 个（默认 8）常显；其余收进弹层；选中项即使不在前 N 也强制常显（不隐藏生效条件）。
+ * - 二级：随所选一级渲染，换行展示，不横向截断。
+ * - 键盘：Tab + ←/→ 在同类 chip 间移动焦点并选中；弹层支持 Escape 关闭并回焦。
  */
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { CategoryNode } from "@core/contracts";
 import { UNCATEGORIZED_ID, UNCATEGORIZED_LABEL } from "@core/categories/taxonomy";
 import type { CategoryCounts } from "../types";
+import { commonCategories, pushEscLayer, dropEscLayer, isTopEscLayer } from "../ui-state";
 
-/** ←/→ 在同一个 bar 里的 chip 之间移动焦点，并把选择一起带过去（skip 掉的按钮不参与）。 */
 function chipKeyNav(e: ReactKeyboardEvent<HTMLButtonElement>): void {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
   const bar = e.currentTarget.parentElement;
@@ -28,23 +25,70 @@ function chipKeyNav(e: ReactKeyboardEvent<HTMLButtonElement>): void {
   next.click();
 }
 
-const fmtCount = (n: number | null | undefined): string => (typeof n === "number" ? String(n) : "");
-
 export function CategoryBars(props: {
-  /** 分类树（GET /api/categories）；未加载 / 后端不支持时为空数组 */
   categories: CategoryNode[];
-  /** 当前筛选下的计数（GET /api/categories/counts）；null = 该端点不可用，退回全局 itemCount */
   counts: CategoryCounts | null;
-  /** counts 的来源，用于给 chip 加 tooltip（filtered=当前筛选 / global=全局） */
   countsScope: "filtered" | "global";
   catErr?: string;
-  /** 选中的一级（"" = 全部）；未分类 = UNCATEGORIZED_ID */
   top: string;
-  /** 选中的二级（"" = 该一级的全部） */
   sub: string;
   loading?: boolean;
   onPick: (top: string, sub: string) => void;
+  /** 常用分类常显数量（默认 8） */
+  limit?: number;
 }) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  /** 弹层用 position:fixed + 实测坐标：分类栏是横向滚动容器（overflow 非 visible），
+   *  absolute 定位会被裁切；固定定位同时把面板夹在视口内（窄屏靠右时不出界）。 */
+  const [panelPos, setPanelPos] = useState<{ left: number; top: number } | null>(null);
+  const moreBtn = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  // 展开前先量好位置（useLayoutEffect：避免首帧闪在 (0,0)）。
+  useLayoutEffect(() => {
+    if (!moreOpen) { setPanelPos(null); return; }
+    const b = moreBtn.current?.getBoundingClientRect();
+    if (!b) return;
+    const w = Math.min(560, Math.max(240, window.innerWidth - 56));
+    setPanelPos({ left: Math.max(8, Math.min(b.left, window.innerWidth - w - 8)), top: b.bottom + 6 });
+  }, [moreOpen]);
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    pushEscLayer("cat-more");
+    const place = () => {
+      const b = moreBtn.current?.getBoundingClientRect();
+      if (!b) return;
+      const w = Math.min(560, Math.max(240, window.innerWidth - 56));
+      setPanelPos({ left: Math.max(8, Math.min(b.left, window.innerWidth - w - 8)), top: b.bottom + 6 });
+    };
+    place();
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (panelRef.current?.contains(t) || moreBtn.current?.contains(t)) return;
+      setMoreOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // 只关最上层：其上有别的弹层时先交给那一层。
+      if (!isTopEscLayer("cat-more")) return;
+      setMoreOpen(false);
+      moreBtn.current?.focus();
+      e.stopImmediatePropagation();
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      dropEscLayer("cat-more");
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [moreOpen]);
+
   const tops = (props.categories ?? []).filter((t) => t.enabled || t.id === props.top);
   const hasUncat = tops.some((t) => t.id === UNCATEGORIZED_ID);
   const curTop = tops.find((t) => t.id === props.top) ?? null;
@@ -55,6 +99,16 @@ export function CategoryBars(props: {
     props.counts ? (id === UNCATEGORIZED_ID ? props.counts.uncategorized : (props.counts.tops[id] ?? 0)) : fallback;
   const countOfSub = (id: string, fallback: number): number => (props.counts ? (props.counts.subs[id] ?? 0) : fallback);
   const allCount = props.counts ? props.counts.all : null;
+
+  const { common, more } = commonCategories(tops, props.top, props.limit ?? 8);
+
+  const pick = (top: string, sub: string, fromMore = false) => {
+    props.onPick(top, sub);
+    if (fromMore) {
+      setMoreOpen(false);
+      moreBtn.current?.focus();
+    }
+  };
 
   const chip = (
     key: string, label: string, on: boolean, count: number | null, onClick: () => void, title: string,
@@ -79,15 +133,53 @@ export function CategoryBars(props: {
       <div className="cat-bar" role="group" aria-label="一级分类">
         <span className="cat-bar-label">分类</span>
         {chip("all", "全部", props.top === "", allCount,
-          () => props.onPick("", ""), "清除分类限制（返回全部）")}
+          () => pick("", ""), "清除分类限制（返回全部）")}
         {!hasUncat && chip("uncat", UNCATEGORIZED_LABEL, props.top === UNCATEGORIZED_ID, props.counts ? props.counts.uncategorized : null,
-          () => props.onPick(UNCATEGORIZED_ID, ""), "只看未分类（cat_id 为空；与分类树里的系统分类「未分类」是同一集合）")}
-        {tops.map((t) => chip("top-" + t.id, t.name, props.top === t.id, countOfTop(t.id, t.itemCount),
-          () => props.onPick(t.id, ""),
-          (t.id === UNCATEGORIZED_ID
-            ? "只看未分类（cat_id 为空）"
-            : "按一级分类筛选（含其下所有子分类）")
-          + " · 计数=" + scope + (t.enabled ? "" : " · 该分类已停用")))}
+          () => pick(UNCATEGORIZED_ID, ""), "只看未分类（cat_id 为空；与分类树里的系统分类「未分类」是同一集合）")}
+        {common.map((t) => chip("top-" + t.id, t.name, props.top === t.id, countOfTop(t.id, t.itemCount),
+          () => pick(t.id, ""),
+          (t.id === UNCATEGORIZED_ID ? "只看未分类（cat_id 为空）" : "按一级分类筛选（含其下所有子分类）")
+            + " · 计数=" + scope + (t.enabled ? "" : " · 该分类已停用")))}
+
+        {more.length > 0 && (
+          <span className="cat-more-wrap">
+            <button
+              ref={moreBtn}
+              type="button"
+              className={"cat-chip cat-more-btn" + (more.some((c) => c.id === props.top) ? " on" : "")}
+              aria-expanded={moreOpen}
+              aria-controls="cat-more-panel"
+              title={"还有 " + more.length + " 个一级分类，点开查看全部"}
+              onClick={() => setMoreOpen((v) => !v)}
+            >
+              更多分类 <span className="cat-chip-n">{more.length}</span> {moreOpen ? "▴" : "▾"}
+            </button>
+            {moreOpen && (
+              <div
+                id="cat-more-panel"
+                ref={panelRef}
+                role="dialog"
+                aria-label="更多分类"
+                className="cat-more-panel"
+                style={panelPos ? { left: panelPos.left, top: panelPos.top } : undefined}
+              >
+                <div className="cat-more-head">
+                  <span>全部分类（{tops.length + (hasUncat ? 0 : 1)}）</span>
+                  <span className="spacer" />
+                  <button className="btn tiny ghost" onClick={() => { setMoreOpen(false); moreBtn.current?.focus(); }}>关闭</button>
+                </div>
+                <div className="cat-more-grid">
+                  {tops.map((t) => chip("more-" + t.id, t.name, props.top === t.id, countOfTop(t.id, t.itemCount),
+                    () => pick(t.id, "", true),
+                    "按一级分类筛选 · 计数=" + scope + (t.enabled ? "" : " · 该分类已停用")))}
+                  {!hasUncat && chip("more-uncat", UNCATEGORIZED_LABEL, props.top === UNCATEGORIZED_ID, props.counts ? props.counts.uncategorized : null,
+                    () => pick(UNCATEGORIZED_ID, "", true), "只看未分类")}
+                </div>
+                <div className="hint">常用分类常显；这里只是收起，不会被隐藏生效。</div>
+              </div>
+            )}
+          </span>
+        )}
       </div>
 
       {props.sub !== "" || (curTop && kids.length > 0) ? (
@@ -95,10 +187,10 @@ export function CategoryBars(props: {
           <span className="cat-bar-label">{curTop ? curTop.name : "子分类"}</span>
           {chip("sub-all", "全部" + (curTop?.name ?? ""), props.sub === "",
             curTop ? countOfTop(curTop.id, curTop.itemCount) : null,
-            () => props.onPick(props.top, ""),
+            () => pick(props.top, ""),
             "不限制二级分类（等于该一级分类的全部）")}
           {kids.map((c) => chip("sub-" + c.id, c.name, props.sub === c.id, countOfSub(c.id, c.itemCount),
-            () => props.onPick(props.top, c.id),
+            () => pick(props.top, c.id),
             "按二级分类筛选 · 计数=" + scope + (c.enabled ? "" : " · 该分类已停用")))}
         </div>
       ) : null}
@@ -110,5 +202,3 @@ export function CategoryBars(props: {
     </div>
   );
 }
-
-
