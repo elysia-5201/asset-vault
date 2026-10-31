@@ -12,6 +12,7 @@
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { Writable } from "node:stream";
 import { createRequire } from "node:module";
 import { mkdtempSync, rmSync, readFileSync, readdirSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -293,21 +294,30 @@ describe("发布：既有文件保留 + 竞争不覆盖", () => {
     assert.equal(listing().filter((f) => f.endsWith(".tmp")).length, 0, "不得留下孤儿 tmp");
   });
 
-  test("平台不支持硬链接（EPERM）时：安全非覆盖回退，绝不覆盖既有文件", { timeout: 5000 }, async () => {
-    writeFileSync(join(dir, "pkg.zip"), Buffer.from("KEEP-OLD", "utf8"));
-    mockFetch(() => respond([bytes(300, 8)]));
-    const original = cjsFs.linkSync;
-    (cjsFs as any).linkSync = () => { const e: any = new Error("EPERM: operation not permitted, link"); e.code = "EPERM"; throw e; };
-    let r: any;
-    try {
-      r = await downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "pkg.zip", maxBytes: 1024 * 1024, timeoutMs: 5000 });
-    } finally {
-      (cjsFs as any).linkSync = original;
+  test("硬链接不可用（EPERM/ENOTSUP/EXDEV）：fail-closed，不复制、不产生终名、既有文件原样", { timeout: 8000 }, async () => {
+    for (const code of ["EPERM", "ENOTSUP", "EXDEV"]) {
+      writeFileSync(join(dir, "pkg.zip"), Buffer.from("KEEP-OLD", "utf8"));
+      mockFetch(() => respond([bytes(300, 8)]));
+      const oLink = cjsFs.linkSync;
+      const oCopy = cjsFs.copyFileSync;
+      let copyCalls = 0;
+      (cjsFs as any).linkSync = () => { const e: any = new Error(code + ": link not supported"); e.code = code; throw e; };
+      (cjsFs as any).copyFileSync = (...a: any[]) => { copyCalls++; return (oCopy as any)(...a); };
+      let r: any = null;
+      let e: any = null;
+      try {
+        r = await downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "pkg.zip", maxBytes: 1024 * 1024, timeoutMs: 5000 });
+      } catch (x) { e = x; } finally {
+        (cjsFs as any).linkSync = oLink;
+        (cjsFs as any).copyFileSync = oCopy;
+      }
+      assert.equal(r, null, code + "：不得静默降级为复制并报成功");
+      assert.equal(e?.code, "UPSTREAM_ERROR", code + "：必须明确失败（fail-closed）");
+      assert.match(e?.message ?? "", /硬链接|link/i, code + "：诊断需明确指向硬链接不可用");
+      assert.equal(copyCalls, 0, code + "：不得调用 copyFileSync（同步整包复制会阻塞事件循环且非原子）");
+      assert.deepEqual(listing(), ["pkg.zip"], code + "：不得产生任何终名或孤儿 tmp");
+      assert.deepEqual(readFileSync(join(dir, "pkg.zip")), Buffer.from("KEEP-OLD", "utf8"), code + "：既有文件必须原样");
     }
-    assert.deepEqual(readFileSync(join(dir, "pkg.zip")), Buffer.from("KEEP-OLD", "utf8"), "回退路径同样不得覆盖既有文件");
-    assert.equal(r.fileName, "pkg (1).zip");
-    assert.deepEqual(readFileSync(r.path), bytes(300, 8));
-    assert.equal(listing().filter((f) => f.endsWith(".tmp")).length, 0);
   });
 });
 
@@ -320,5 +330,115 @@ describe("源码级防回退：这条下载路径不再整包缓冲", () => {
     assert.ok(/getReader\s*\(/.test(src), "必须走 ReadableStream reader 逐块读");
     assert.ok(/createWriteStream/.test(src), "必须走流式文件写入");
     assert.ok(/linkSync/.test(src), "发布必须用独占原语（link 语义），不许裸 rename 覆盖");
+    // 注释可以记录「已删除的旧机制」，这里只检查真实代码行。
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    assert.ok(!/copyFileSync/.test(code), "代码中不得整包复制（同步拷贝阻塞事件循环、失败可留终名残片）");
+    assert.ok(!/COPYFILE_EXCL/.test(code), "不得保留 COPYFILE_EXCL 回退路径");
+  });
+});
+
+describe("F1 deadline 覆盖写/收尾/发布：超期不得成功，清理不得永挂", () => {
+  test("写回调永不返回（磁盘写卡死）：有限时间内拒绝并清理，绝不无限挂起", { timeout: 8000 }, async () => {
+    mockFetch(() => respond([bytes(512, 1)]));
+    const original = cjsFs.createWriteStream;
+    let openedFd: number | null = null;
+    (cjsFs as any).createWriteStream = (_p: string, o: any) => {
+      openedFd = o?.fd ?? null;
+      return new Writable({
+        write() { /* 永不回调：模拟内核写卡死 */ },
+        destroy(err: any, cb: any) { try { if (openedFd !== null) cjsFs.closeSync(openedFd); } catch { /* ignore */ } cb(err); },
+      });
+    };
+    const t0 = Date.now();
+    let e: any = null;
+    try {
+      e = await rejection(downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "stuck.zip", maxBytes: 1024 * 1024, timeoutMs: 150 }));
+    } finally {
+      (cjsFs as any).createWriteStream = original;
+    }
+    const elapsed = Date.now() - t0;
+    assert.equal(e?.code, "UPSTREAM_TIMEOUT", "写回调卡死必须报超时，而不是永远 pending");
+    assert.ok(elapsed < 5000, "必须在有限时间内放弃（实测 " + elapsed + "ms）");
+    assert.deepEqual(listing(), [], "超时必须清理 tmp，且不得留下成品");
+  });
+
+  test("收尾挂起（end 后 finished 不返回）：被 deadline 中断并清理", { timeout: 8000 }, async () => {
+    mockFetch(() => respond([bytes(256, 2)]));
+    const original = cjsFs.createWriteStream;
+    let openedFd: number | null = null;
+    (cjsFs as any).createWriteStream = (_p: string, o: any) => {
+      openedFd = o?.fd ?? null;
+      return new Writable({
+        write(_c: any, _e: any, cb: any) { cb(); },
+        final() { /* 永不完成：模拟 fsync/close 卡死 */ },
+        destroy(err: any, cb: any) { try { if (openedFd !== null) cjsFs.closeSync(openedFd); } catch { /* ignore */ } cb(err); },
+      });
+    };
+    const t0 = Date.now();
+    let e: any = null;
+    try {
+      e = await rejection(downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "finish.zip", maxBytes: 1024 * 1024, timeoutMs: 150 }));
+    } finally {
+      (cjsFs as any).createWriteStream = original;
+    }
+    const elapsed = Date.now() - t0;
+    assert.equal(e?.code, "UPSTREAM_TIMEOUT", "收尾卡死必须报超时");
+    assert.ok(elapsed < 5000, "必须在有限时间内放弃（实测 " + elapsed + "ms）");
+    assert.deepEqual(listing(), [], "超时必须清理 tmp/成品");
+  });
+
+  test("发布同步原语人为迟延 400ms 而 deadline=150ms：不得返回 SUCCESS，且撤销成品", { timeout: 8000 }, async () => {
+    mockFetch(() => respond([bytes(1024, 3)]));
+    const original = cjsFs.linkSync;
+    (cjsFs as any).linkSync = (...a: any[]) => {
+      const until = Date.now() + 400;
+      while (Date.now() < until) { /* 忙等：同步系统调用不可被 timer 抢占 */ }
+      return (original as any)(...a);
+    };
+    let r: any = null;
+    let e: any = null;
+    try {
+      r = await downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "late.zip", maxBytes: 1024 * 1024, timeoutMs: 150 });
+    } catch (x) { e = x; } finally {
+      (cjsFs as any).linkSync = original;
+    }
+    assert.equal(r, null, "越过 deadline 的发布绝不能返回成功: " + JSON.stringify(r));
+    assert.equal(e?.code, "UPSTREAM_TIMEOUT", "必须是超时，而不是成功或其它错误");
+    assert.deepEqual(listing(), [], "超期必须撤销成品并清理 tmp");
+  });
+});
+
+describe("F4 诊断不泄漏签名 / 凭据 / URL", () => {
+  const TOKEN = "SUPERSECRET_TOKEN_9f3c";
+
+  test("非法 dlUrl：不回显 URL 或其签名参数（正例：合法 BOOTH URL 仍可用）", { timeout: 5000 }, async () => {
+    const bad = "https://cdn.evil.example/pkg.zip?token=" + TOKEN + "&signature=deadbeef";
+    const e = await rejection(downloadBoothFile({ dlUrl: bad, destDir: dir, fileName: "x.zip", maxBytes: 1024, timeoutMs: 1000 }));
+    assert.equal(e.code, "INVALID_INPUT");
+    assert.ok(!String(e.message).includes(TOKEN), "错误文本不得包含签名参数: " + e.message);
+    assert.ok(!/https?:\/\//.test(String(e.message)), "错误文本不得回显下载 URL: " + e.message);
+    assert.equal(fetchCalls.length, 0, "非法 URL 不得发起请求");
+    assert.deepEqual(listing(), []);
+    // 正例：合法 BOOTH URL 不受影响（短 body 正常发布）
+    mockFetch(() => respond([bytes(64, 1)]));
+    const r = await downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "ok.zip", maxBytes: 1024, timeoutMs: 5000 });
+    assert.deepEqual(readFileSync(r.path), bytes(64, 1));
+  });
+
+  test("被拒绝的重定向只报主机名，不泄漏其查询参数", { timeout: 5000 }, async () => {
+    mockFetch(() => redirectTo("https://evil.example/steal.zip?token=" + TOKEN));
+    const e = await rejection(downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "evil.zip", maxBytes: 1024, timeoutMs: 5000 }));
+    assert.equal(e.code, "INVALID_INPUT");
+    assert.ok(!String(e.message).includes(TOKEN), "不得泄漏被拒目标的查询参数: " + e.message);
+    assert.match(String(e.message), /evil\.example/, "保留主机名便于诊断");
+    assert.deepEqual(listing(), []);
+  });
+
+  test("上游错误文本中的 URL / 签名同样被脱敏", { timeout: 5000 }, async () => {
+    mockFetch(() => { throw new Error("connect failed for https://booth.pm/dl?token=" + TOKEN); });
+    const e = await rejection(downloadBoothFile({ dlUrl: URL_A, destDir: dir, fileName: "up.zip", maxBytes: 1024, timeoutMs: 5000 }));
+    assert.equal(e.code, "UPSTREAM_ERROR");
+    assert.ok(!String(e.message).includes(TOKEN), "上游文本里的签名参数也不得外泄: " + e.message);
+    assert.deepEqual(listing(), []);
   });
 });

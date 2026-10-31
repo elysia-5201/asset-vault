@@ -91,10 +91,11 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 
 - **流式落盘**：逐块写入目标目录内的唯一临时文件 `.av-dl-*.tmp`，完成后才发布；这条路径不再出现 `arrayBuffer()` / 整包 `Buffer` / `.text()`。HTML 登录页只用 **256 字节有界前缀**判定（→ 401 `LOGIN_REQUIRED`），不会为了判类型读完整包。
 - **实际字节硬上限**：默认 **8 GiB**（`DEFAULT_DOWNLOAD_MAX_BYTES`），累计的是**实际读到的 body 字节**；`Content-Length` 仅用于提前拒绝，缺失或伪造都不能绕过 → 413 `TOO_LARGE` 并清理。
-- **全流程 deadline**：默认 **120s**（`DEFAULT_DOWNLOAD_DEADLINE_MS`）。从首个请求开始计时，**跨所有重定向与 body 落盘共享、逐跳不重置**；stall 的响应体会被 abort → 504 `UPSTREAM_TIMEOUT`（错误文本不含下载 URL/凭据/签名参数）。
+- **全流程 deadline**：默认 **30 分钟**（`DEFAULT_DOWNLOAD_DEADLINE_MS`）。从首个请求开始计时，**跨所有重定向、body 读写、收尾（fsync/close）与发布前后共享、逐跳不重置**；stall 的响应体、永不返回的写回调/收尾都会被 abort 打断 → 504 `UPSTREAM_TIMEOUT`。**限制**：`link`/`stat` 这类同步系统调用无法被定时器抢占，因此发布前后各按绝对时间复查一次——越过 deadline 就撤销刚独占发布的成品（只删自己创建的名字）并报超时，绝不返回"晚到的成功"；清理等待自身也有上限（`CLEANUP_WAIT_MS`），句柄永不 close 也不会永挂。错误文本不含下载 URL/凭据/签名参数。
+- **两个边界互相独立**：字节上限管"多大"，deadline 管"挂多久"；30 分钟只兜住病态挂起，**不是任何真实带宽/大文件场景的吞吐保证，未在真实 BOOTH/大文件上实测**；测试一律注入短 deadline，不等 30 分钟。
 - **重定向**：每一跳都重新校验 `https://*.booth.pm` 白名单，跳数上限 6；被拒绝的目标主机不会被请求。
-- **发布**：`link()` 语义**独占**发布，绝不覆盖既有同名文件——既有的同名文件保持原样，新内容自动改用 `name (1).ext` 这类候选名；即使竞争者在"检查通过之后"抢先建成同名文件，也只会让出名字（`EEXIST` → 换下一个候选），不存在 check-then-rename 覆盖窗口。硬链接不可用的文件系统回退 `copyFileSync(..., COPYFILE_EXCL)`（同样绝不覆盖；可见性从"原子出现"降级为"独占创建"，并在日志中显式说明，不做静默降级）。
-- **失败清理**：超限 / 断流 / 超时 / HTTP 失败 / HTML 登录页 / 写盘失败都会关闭文件句柄、取消响应 body、删除临时文件；既有目标文件保持不变。
+- **发布**：只用 `link()` 语义**独占**发布，绝不覆盖既有同名文件——既有的同名文件保持原样，新内容自动改用 `name (1).ext` 这类候选名；即使竞争者在"检查通过之后"抢先建成同名文件，也只会让出名字（`EEXIST` → 换下一个候选），不存在 check-then-rename 覆盖窗口。**硬链接不可用（`EPERM`/`ENOTSUP`/`EXDEV`/`ENOSYS`/`EACCES`/`EMLINK`）时 fail-closed**：直接报 502 并删除临时文件，**不复制、不 rename、不产生任何终名**；不再有 `COPYFILE_EXCL` 回退（同步整包复制会阻塞事件循环、令 deadline 失效，且复制中途失败可在终名下留下部分成品）。
+- **失败清理**：超限 / 断流 / 超时 / HTTP 失败 / HTML 登录页 / 写盘失败都会关闭文件句柄、取消响应 body、删除临时文件；既有目标文件保持不变；清理等待有上限（`CLEANUP_WAIT_MS`），不会因为句柄永不 close 而永挂。
 - **可覆盖项**：`downloadBoothFile` 接受 `maxBytes` / `timeoutMs`（`maxHops`）覆盖，但必须是**正有限整数**，否则 `INVALID_INPUT` 且不发起任何请求；HTTP 路由当前不暴露这些覆盖，运维默认值即上面两项。
 | POST | `/scan` `{rootId?, path?, deep?}` | → `{jobId}` |
 | GET | `/jobs?state=&limit=` | `{jobs: JobRow[]}` |
