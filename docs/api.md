@@ -132,12 +132,14 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/unity/status` | 探测当前编辑器。**连不上也返回 200**：`{ok:false, error, candidates[], dropped, allowRemote}`；成功时带 `editor:{projectPath, projectName, unityVersion, isPlaying, isCompiling, scenePath}`。`candidates` 是**边界过滤且已脱敏**的地址（非回环默认被丢弃，只在 `dropped` 里计数，不回显主机/凭据） |
+| GET | `/unity/status` | 探测当前编辑器。**连不上也返回 200**：`{ok:false, error, candidates[], dropped, allowRemote}`；成功时带 `editor:{projectPath, projectName, unityVersion, isPlaying, isCompiling, scenePath}`。`candidates` 是**边界过滤且已脱敏**的地址（非回环/非法地址被丢弃，只在 `dropped` 里计数，不回显主机/凭据）；`error` 文本里的 URL 也过脱敏（连接串里的 `?token=` 与旧库 userinfo 一律剥离） |
 | GET | `/unity/packages?itemId=` | 这个条目里可导入的 `.unitypackage`（压缩包内的、含一层 zip 套 zip 的也列）：`{itemId, packages:[{key, label, assetId, container, sourcePath, entryPath, innerEntryPath, size, note?}]}` |
 | POST | `/unity/import` | **已弃用**：永远 `409 {error:{code:"UNITY_IMPORT_REQUIRES_PLAN", message, migration:{plan,confirm,execute,workbench}}}`，**无任何副作用**（不连 Unity、不落 staging、不写 `project_imports`）。导入请走 `/import-plans`（见「头像工作台」） |
 
 行为要点：
-- **MCP 端点边界**（task-1）：`settings.unity_mcp_url` 写库前校验形状/协议（只 http/https、不得内嵌用户名密码），非回环主机默认拒绝（`REMOTE_NOT_ALLOWED`），需显式 `PUT /settings {unityMcpAllowRemote:true}`（底层键 `unity_mcp_allow_remote=1`）才放行；日志/健康/状态只出现脱敏地址。
+- **MCP 端点边界**（task-1）：`settings.unity_mcp_url` 写库前校验形状/协议（只 http/https、不得内嵌用户名密码），非回环主机默认拒绝（`REMOTE_NOT_ALLOWED`），需显式 `PUT /settings {unityMcpAllowRemote:true}`（底层键 `unity_mcp_allow_remote=1`，设置面板「允许非回环 Unity MCP 端点」，默认关闭并提示风险）才放行；**旧库脏值同样校验**（`file://`、无效串、内嵌凭据即便 allowRemote=1 也被丢弃），日志/健康/状态只出现脱敏地址。
+- **`PUT /settings` 原子性**：先校验全部入参（`downloadRoot`/`unityMcpUrl`/`unityMcpAllowRemote`/`updateRepo`），任一非法直接 400 且**不写任何一项**（含不创建下载目录、不改 `unity_mcp_url`）；关掉 `unityMcpAllowRemote` 会同时清掉已存的远程地址。
+- **详情页 → 工作台上下文**：详情页勾选的包按 `assetId + rel_path`（直接 unitypackage=文件名、压缩包内=entryPath、zip 套 zip=`entryPath::innerEntryPath`）映射到工作台单元，只有精确且无歧义（同资产单单元、无互斥槽位冲突）的才预选；对不上/多义时不预选并显式提示，仍需人工「生成计划 → 看风险 → 确认 → 执行」。详情页不再有直接导入入口。
 - 导入前**清空 Unity 控制台**，导入后回读 `read_console` 的 error —— 计划执行链路按单元做，逐项状态可追溯（`import_runs` / `run_items`）。
 - 压缩包内的包会先"落地"到 `<dataDir>/unity-staging/<assetId>/`，再交给 Unity（`AssetDatabase.ImportPackage` 只吃磁盘上的文件）。
 - 当前工程会自动登记进 `projects`（`unity_version` 由编辑器上报）并写 `project_imports`。

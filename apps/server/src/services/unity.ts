@@ -36,6 +36,11 @@ export function sanitizeMcpUrl(raw: string): string {
   catch { return "<invalid-url>"; }
 }
 
+/** 自由文本里的 URL 一律降级成脱敏形态（错误信息、日志、回包都过这里，避免 query token/userinfo 外泄）。 */
+export function redactUrlCredentials(text: string): string {
+  return String(text ?? "").replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`|，。；、）》】]+/gi, (m) => sanitizeMcpUrl(m));
+}
+
 const ALLOWED_MCP_PROTOCOLS = new Set(["http:", "https:"]);
 
 export type UnityMcpUrlCheck = { ok: true; url: string } | { ok: false; code: string; message: string };
@@ -78,12 +83,15 @@ export function unityMcpBoundary(repo: Pick<Repo, "getSetting">): McpBoundary {
   const allowRemote = String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1";
   const candidates = saved ? [saved, ...UNITY_MCP_URLS.filter((u) => u !== saved)] : UNITY_MCP_URLS.slice();
   const urls: string[] = []; const dropped: string[] = [];
+  // 旧库脏值也走同一套校验：形状/协议/内嵌凭据一律丢弃，allowRemote 只放宽"非回环"这一条。
   for (const c of candidates) {
-    if (isLoopbackMcpUrl(c) || allowRemote) urls.push(c);
-    else dropped.push(sanitizeMcpUrl(c));
+    const check = validateUnityMcpUrl(c, { allowRemote });
+    if (check.ok && check.url) urls.push(check.url);
+    else if (!check.ok) dropped.push(sanitizeMcpUrl(c));
   }
   if (dropped.length) {
-    console.warn("[assetvault] unity MCP non-loopback endpoint(s) ignored: " + dropped.join(", ") + " (set settings.unity_mcp_allow_remote='1' to permit)");
+    console.warn("[assetvault] unity MCP endpoint(s) ignored: " + dropped.join(", ")
+      + " (non-loopback requires settings.unity_mcp_allow_remote='1'; invalid shape/protocol/credentials are always rejected)");
   }
   return { allowRemote, urls: urls.length ? urls : UNITY_MCP_URLS.slice(), dropped };
 }
@@ -247,11 +255,11 @@ export class UnityMcp {
           params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "asset-vault", version: "0.1.0" } },
         });
         const info = r.json?.result?.serverInfo;
-        if (r.status !== 200 || !info || !r.sid) { errors.push(url + ": HTTP " + r.status + (r.json?.error?.message ? " " + r.json.error.message : "")); continue; }
+        if (r.status !== 200 || !info || !r.sid) { errors.push(sanitizeMcpUrl(url) + ": HTTP " + r.status + (r.json?.error?.message ? " " + r.json.error.message : "")); continue; }
         await this.post(url, { jsonrpc: "2.0", method: "notifications/initialized" }, r.sid).catch(() => null);
         this.session = { url, sid: r.sid, name: String(info.name ?? ""), version: String(info.version ?? "") };
         return this.session;
-      } catch (e) { errors.push(url + ": " + String((e as Error).message ?? e)); }
+      } catch (e) { errors.push(sanitizeMcpUrl(url) + ": " + String((e as Error).message ?? e)); }
     }
     throw Object.assign(new Error("连不上 Unity MCP（" + errors.join("；") + "）"), { code: "UPSTREAM_ERROR", status: 503 });
   }

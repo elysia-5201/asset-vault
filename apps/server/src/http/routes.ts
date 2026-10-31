@@ -13,7 +13,7 @@ import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
 import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlanWithRisk, applyPlanRisk, getRunView, cancelImportRun, sweepStaging } from "../services/structure";
-import { unityMcpBoundary, unityEndpointPlan, validateUnityMcpUrl, publicMcpUrl, sanitizeMcpUrl, isLoopbackMcpUrl } from "../services/unity";
+import { unityMcpBoundary, unityEndpointPlan, validateUnityMcpUrl, publicMcpUrl, sanitizeMcpUrl, isLoopbackMcpUrl, redactUrlCredentials } from "../services/unity";
 import type { ItemQuery, Repo } from "../db/repo";
 import type { MediaStore } from "../services/media";
 import type { JobRunner } from "../jobs/runner";
@@ -1179,8 +1179,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const proj = (repo.listProjects() as any[]).find((p) => p.path_norm === normalizePath(editor.projectPath));
       return { ok: true, ...base, serverName: u.serverName, editor, projectAvatar: projectAvatarOf(editor.projectPath), projectId: proj?.id ?? null, registered: !!proj };
     } catch (e) {
-      // 连不上是常态（Unity 没开）；但被丢弃的远端地址只报数量，不回显主机/凭据。
-      return { ok: false, ...base, serverName: "", error: String((e as Error)?.message ?? e), projectAvatar: null };
+      // 连不上是常态（Unity 没开）；错误文本也要脱敏：URL 里可能有 ?token 或旧库的 userinfo。
+      return { ok: false, ...base, serverName: "", error: redactUrlCredentials(String((e as Error)?.message ?? e)), projectAvatar: null };
     }
   });
 
@@ -1621,33 +1621,43 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.put("/api/settings", async (req, reply) => {
     try {
       const b = (req.body ?? {}) as any;
-      if (typeof b.downloadRoot === "string" && b.downloadRoot.trim()) {
-        mkdirSync(b.downloadRoot.trim(), { recursive: true });
-        repo.setSetting("download_root", b.downloadRoot.trim());
-      }
+      // P2-5：**先校验全部入参，再统一落库** —— 任何一项非法都 400，绝不部分写入。
+      const nextAllowRemote = typeof b.unityMcpAllowRemote === "boolean"
+        ? b.unityMcpAllowRemote
+        : String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1";
       // Unity MCP 地址：形状/协议/回环边界都在写库前校验（非法值不落库，也不会出现在日志里）。
+      let nextUnityUrl: string | null = null;
       if (typeof b.unityMcpUrl === "string") {
-        const allowRemote = b.unityMcpAllowRemote === true || String(repo.getSetting("unity_mcp_allow_remote") ?? "") === "1";
-        const check = validateUnityMcpUrl(b.unityMcpUrl, { allowRemote });
+        const check = validateUnityMcpUrl(b.unityMcpUrl, { allowRemote: nextAllowRemote });
         if (!check.ok) return reply.status(400).send({ error: { code: check.code, message: check.message } });
-        repo.setSetting("unity_mcp_url", check.url);
+        nextUnityUrl = check.url;
       }
+      // 检查更新的仓库覆盖：空串 = 清掉（回到内置默认）；形状非法直接 400，别让脏值悄悄留库
+      let nextUpdateRepo: string | null = null;
+      if (typeof b.updateRepo === "string") {
+        const v = b.updateRepo.trim();
+        if (v && !REPO_SLUG_RE.test(v)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "updateRepo 形状应为 owner/repo" } });
+        nextUpdateRepo = v;
+      }
+      const nextDownloadRoot = typeof b.downloadRoot === "string" && b.downloadRoot.trim() ? b.downloadRoot.trim() : null;
+      const nextUpdateToken = typeof b.updateToken === "string" ? b.updateToken.trim() : null;
+      // 校验全过才开始产生副作用（mkdir 失败时也还没写任何 setting）。
+      if (nextDownloadRoot) {
+        mkdirSync(nextDownloadRoot, { recursive: true });
+        repo.setSetting("download_root", nextDownloadRoot);
+      }
+      if (nextUnityUrl !== null) repo.setSetting("unity_mcp_url", nextUnityUrl);
       // 显式开关：关掉时，已保存的远程地址必须一起清掉（否则关网关却没关端点）
       if (typeof b.unityMcpAllowRemote === "boolean") {
-        repo.setSetting("unity_mcp_allow_remote", b.unityMcpAllowRemote ? "1" : "");
-        if (!b.unityMcpAllowRemote) {
+        repo.setSetting("unity_mcp_allow_remote", nextAllowRemote ? "1" : "");
+        if (!nextAllowRemote) {
           const saved = (repo.getSetting("unity_mcp_url") ?? "").trim();
           if (saved && !isLoopbackMcpUrl(saved)) repo.setSetting("unity_mcp_url", "");
         }
       }
-      // 检查更新的仓库覆盖：空串 = 清掉（回到内置默认）；形状非法直接 400，别让脏值悄悄留库
-      if (typeof b.updateRepo === "string") {
-        const v = b.updateRepo.trim();
-        if (v && !REPO_SLUG_RE.test(v)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "updateRepo 形状应为 owner/repo" } });
-        repo.setSetting(UPDATE_REPO_KEY, v);
-      }
+      if (nextUpdateRepo !== null) repo.setSetting(UPDATE_REPO_KEY, nextUpdateRepo);
       // GitHub token（可选，提高匿名 60 次/小时的额度）：空串 = 清掉。**只进不出**，回包里只给"有没有"。
-      if (typeof b.updateToken === "string") repo.setSetting(UPDATE_TOKEN_KEY, b.updateToken.trim());
+      if (nextUpdateToken !== null) repo.setSetting(UPDATE_TOKEN_KEY, nextUpdateToken);
       return {
         downloadRoot: downloadRootOf(repo, deps.dataDir),
         unityMcpUrl: publicMcpUrl((repo.getSetting("unity_mcp_url") ?? "").trim()),
