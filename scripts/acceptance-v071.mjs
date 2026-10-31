@@ -359,7 +359,10 @@ async function main() {
       const view = await structure.createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: PROJECT });
       check("P1", "PLAN", "干净单包计划建立（ready）", view.plan.status === "ready", view.plan.status);
       appendFileSync(single, Buffer.alloc(64, 0x41));
-      env.t.db.prepare("UPDATE assets SET size=?, mtime=? WHERE id=?").run(statSync(single).size, new Date(statSync(single).mtimeMs).toISOString(), env.assets.s);
+      // 模拟重扫描：direct 包 unit.size 取自资产 size（structure.ts:471），重扫须同步更新对应 unit，否则单元大小仍是旧值。
+      const nst = statSync(single);
+      env.t.db.prepare("UPDATE assets SET size=?, mtime=? WHERE id=?").run(nst.size, new Date(nst.mtimeMs).toISOString(), env.assets.s);
+      env.t.db.prepare("UPDATE asset_units SET size=? WHERE asset_id=? AND id=?").run(nst.size, env.assets.s, Number(u.id));
       let code = null;
       try { structure.precheckImportPlan(env.repo, view.plan.id); } catch (e) { code = errCode(e); }
       check("P2", "PLAN", "指纹变化 → FINGERPRINT_CHANGED 且计划 blocked", code === "FINGERPRINT_CHANGED" && env.repo.getImportPlan(view.plan.id).status === "blocked", "code=" + code);

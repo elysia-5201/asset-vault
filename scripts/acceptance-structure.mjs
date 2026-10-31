@@ -353,8 +353,11 @@ async function main() {
       const view = await createImportPlan(env.repo, { unitIds: [Number(u.id)], projectPath: project });
       check("B-3a", "PLAN", "单包计划建立（ready）", view.plan.status === "ready" && view.items.length === 1, view.plan.status);
       appendFileSync(single, Buffer.alloc(64, 0x41));
-      // 模拟重扫描：真实流程由 scan/watcher 更新 assets.size/mtime；precheck 比较的是 DB 行与单元指纹
-      env.t.db.prepare("UPDATE assets SET size=?, mtime=? WHERE id=?").run(statSync(single).size, new Date(statSync(single).mtimeMs).toISOString(), env.assets.s);
+      // 模拟重扫描：真实流程由 scan/watcher 更新 assets.size/mtime 并重算单元；precheck 比较的是 DB 行与单元指纹。
+      // direct 包 unit.size 取自资产 size（structure.ts:471），只改 assets 会留下旧单元大小，重扫必须同步更新对应 unit。
+      const nst = statSync(single);
+      env.t.db.prepare("UPDATE assets SET size=?, mtime=? WHERE id=?").run(nst.size, new Date(nst.mtimeMs).toISOString(), env.assets.s);
+      env.t.db.prepare("UPDATE asset_units SET size=? WHERE asset_id=? AND id=?").run(nst.size, env.assets.s, Number(u.id));
       let code = null;
       try { precheckImportPlan(env.repo, view.plan.id); } catch (e) { code = errCode(e); }
       check("B-3b", "PLAN", "改文件后 precheck → FINGERPRINT_CHANGED 且计划 blocked", code === "FINGERPRINT_CHANGED" && env.repo.getImportPlan(view.plan.id).status === "blocked", "code=" + code);
