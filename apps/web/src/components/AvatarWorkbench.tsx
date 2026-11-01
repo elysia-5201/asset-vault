@@ -3,10 +3,17 @@ import {
   confirmImportPlan, createImportPlans, describeError, executeImportPlan, getImportPlan, getImportRun,
   listJobs, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems,
 } from "../api";
-import type { ImportPlan, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
+import type { ImportPlan, PlanLatestRun, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
 import { focusApplyAllowed, focusNotice, mapFocusToUnits, sameSlot, type FocusMap, type WorkbenchFocus } from "../workbench-focus";
+import {
+  GUID_SCOPE_NOTE, PLAN_STATE_LABEL, RUN_STATE_TONE, VERIFICATION_SCOPE_LABEL, consoleErrorCauseText, planToneOf,
+  runCountsText, runVerdictOf, verificationText,
+} from "../run-display";
 import { formatDate, shortenPath } from "../util";
 import { Badge, Spinner, useDebounced } from "./ui";
+
+// 计划/校验的文案与 tone 规则放在纯函数模块（run-display）里，这里原样再导出，保持既有调用方/smoke 不变。
+export { PLAN_STATE_LABEL, VERIFICATION_SCOPE_LABEL, verificationText };
 
 /** 互斥槽位规则在 workbench-focus（纯函数，可单测）里；这里原样再导出，保持既有调用方/smoke 不变。 */
 export { sameSlot } from "../workbench-focus";
@@ -66,13 +73,7 @@ export const UNIT_STATE_TONE: Record<string, Tone> = {
   verifying: "busy", verified: "ok", partial_success: "warn", failed: "bad", unknown: "warn", cancelled: "muted",
 };
 
-/** 计划状态 → 中文（后端 import_plans.status：ready / running / executed / failed / blocked）。 */
-export const PLAN_STATE_LABEL: Record<string, string> = {
-  ready: "待执行", running: "执行中", executed: "已完成", failed: "失败", blocked: "预检受阻",
-};
-export const PLAN_STATE_TONE: Record<string, Tone> = {
-  ready: "warn", running: "busy", executed: "ok", failed: "bad", blocked: "bad",
-};
+// PLAN_STATE_LABEL 由 run-display 提供（executed = 「已执行」，不等于验证通过）；这里只保留终态常量。
 /** 计划的终态（**只用于决定停止轮询**；值来自后端，不新增状态）。 */
 const PLAN_TERMINAL_STATES = ["executed", "failed", "blocked"];
 
@@ -88,12 +89,7 @@ export const RISK_TONE: Record<string, Tone> = {
 export const RISK_HIT_LIMIT = 20;
 /** unknown 执行状态必须给出的警告文案（不自动重试）。 */
 export const UNKNOWN_STATE_HINT = "结果未知：可能已产生副作用，请先在 Unity 工程中核对，不要直接重试";
-export const VERIFICATION_SCOPE_LABEL: Record<string, string> = { full: "全量校验", sampled: "抽样校验" };
-/** verification_scope + checked/expected/found/missing → 一行可读文案。 */
-export function verificationText(v: { scope: string; checked: number; expected: number; found: number; missing: number } | null | undefined): string {
-  if (!v) return "";
-  return (VERIFICATION_SCOPE_LABEL[v.scope] ?? v.scope) + "：已查 " + v.checked + "/" + v.expected + "，命中 " + v.found + "，缺失 " + v.missing;
-}
+// verificationText / VERIFICATION_SCOPE_LABEL 由 run-display 提供（计数未知 = 「未提供」，不是 0）。
 /** 只有 failed 的计划才允许重建（unknown 必须先人工核对）。 */
 export function canRebuildPlan(state: string): boolean { return state === "failed"; }
 
@@ -253,13 +249,15 @@ export function PlanPanel(props: {
       <div className="row" style={{ gap: "6px" }}>
         <b>导入计划 #{plan.id}</b>
         {plan.itemId !== null && plan.itemId !== undefined ? <span className="hint mono">条目 #{plan.itemId}</span> : null}
-        {plan.state ? <Badge tone={PLAN_STATE_TONE[plan.state] ?? "muted"} title={plan.state}>{PLAN_STATE_LABEL[plan.state] ?? plan.state}</Badge> : null}
+        {plan.state ? <Badge tone={planToneOf(plan)} title={plan.state}>{PLAN_STATE_LABEL[plan.state] ?? plan.state}</Badge> : null}
         {riskState ? <Badge tone={RISK_TONE[riskState] ?? "muted"} title={"risk_state=" + riskState}>{RISK_LABEL[riskState] ?? riskState}</Badge> : null}
         <Badge tone={plan.precheck.ok ? "ok" : "warn"}>{plan.precheck.ok ? "预检通过" : "预检有警告"}</Badge>
         {props.jobId !== null && props.jobId !== undefined ? <span className="hint mono">job #{props.jobId}</span> : null}
         <span className="spacer" />
         <span className="hint">已勾选 {checkedCount}/{units.length}</span>
       </div>
+      {/* 「已执行」只表示导入命令已发/验证收尾；结论必须来自同一 plan 的最近 run，没有就保守未知 */}
+      {plan.state === "executed" || plan.latestRun ? <PlanLatestRunBlock plan={plan} /> : null}
       {plan.precheck.errors.map((e, i) => (
         <div className="err" key={"pe" + i}>{e.code}：{e.message}</div>
       ))}
@@ -345,6 +343,106 @@ export function PlanPanel(props: {
 export function plansToastText(count: number, warnCount = 0): string {
   const base = "已生成 " + count + " 个计划（按条目分组）";
   return warnCount > 0 ? base + "，其中 " + warnCount + " 个预检有警告" : base;
+}
+
+/** 控制台消息最多展示多少条（其余只给条数）。 */
+export const CONSOLE_MESSAGE_LIMIT = 20;
+
+/** partial 的中文原因：只说能证的（缺失数 / 控制台条数），不猜根因。 */
+export function partialReasonText(lr: PlanLatestRun | null): string {
+  if (!lr) return "没有执行记录，无法确认是否验证通过";
+  if (lr.status !== "partial_success") return "";
+  const errs = lr.consoleErrors;
+  const missing = lr.verification?.missing ?? null;
+  if (errs && errs.length > 0 && missing === 0) return "原因：GUID 缺失为 0，但控制台 error 级条目非空";
+  if (missing !== null && missing > 0) return "原因：GUID 缺失 " + missing + " 个";
+  if (errs === null || missing === null) return "原因：控制台或 GUID 缺失计数未提供，无法进一步确认";
+  return "原因：控制台有 error 级条目或 GUID 缺失，明细见上";
+}
+
+/** 控制台消息（可展开）—— 一律 React 文本，不用 dangerouslySetInnerHTML。 */
+function ConsoleMessages(props: { errors: string[] | null | undefined }) {
+  const errors = props.errors ?? [];
+  if (!errors.length) return null;
+  const shown = errors.slice(0, CONSOLE_MESSAGE_LIMIT);
+  return (
+    <details>
+      <summary className="hint" style={{ cursor: "pointer" }}>展开查看控制台 error {errors.length} 条（点开看消息文本）</summary>
+      <div className="preview-list" style={{ maxHeight: "18vh" }}>
+        {shown.map((m, i) => (
+          <div key={i} className="hint mono" style={{ padding: "2px 6px", wordBreak: "break-all" }}>{m}</div>
+        ))}
+      </div>
+      {errors.length > shown.length ? <div className="hint">还有 {errors.length - shown.length} 条未显示</div> : null}
+    </details>
+  );
+}
+
+/** 计划卡上的「最近一次执行」：结论 / 单元计数 / GUID 覆盖 / 控制台原因，与「已执行」分开。 */
+export function PlanLatestRunBlock(props: { plan: ImportPlan }) {
+  const lr = props.plan.latestRun;
+  const verdict = runVerdictOf(lr?.status ?? "");
+  if (!lr) {
+    return <div className="hint" data-run-verdict="none">最近执行：验证状态未知（无执行记录），「已执行」只代表导入命令已发</div>;
+  }
+  return (
+    <div className="notice" data-run-verdict={verdict.key} style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
+      <div className="row" style={{ gap: "6px" }}>
+        <span className="hint">最近执行</span>
+        <b className="mono">run #{lr.id}</b>
+        <Badge tone={verdict.tone} title={"status=" + lr.status}>{verdict.label}</Badge>
+        <span className="spacer" />
+        <span className="hint">{formatDate(lr.startedAt)}{lr.finishedAt ? " → " + formatDate(lr.finishedAt) : ""}</span>
+      </div>
+      <div className="hint">{runCountsText(lr.counts)}</div>
+      <div className="hint mono">{lr.verification ? "GUID 覆盖 — " + verificationText(lr.verification) : "GUID 覆盖：未提供"}</div>
+      <div className="hint">{consoleErrorCauseText(lr.consoleErrors, lr.verification?.missing ?? null)}</div>
+      {partialReasonText(lr) ? <div className="hint">{partialReasonText(lr)}</div> : null}
+      <ConsoleMessages errors={lr.consoleErrors} />
+      <div className="hint">{GUID_SCOPE_NOTE}</div>
+    </div>
+  );
+}
+
+/** 执行记录卡：中文结论 + 原始状态原样透传 + 单元/GUID 计数分开 + 控制台消息可查看。 */
+export function RunCard(props: { run: ImportRun }) {
+  const run = props.run;
+  const verdict = runVerdictOf(run.state);
+  const ver = run.verification;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "4px" }} data-run-verdict={verdict.key}>
+      <div className="row" style={{ gap: "6px" }}>
+        <b className="mono">run #{run.id}</b>
+        {run.planId > 0 ? <span className="hint mono">计划 #{run.planId}</span> : null}
+        <Badge tone={verdict.tone} title={"status=" + run.state}>{verdict.label}</Badge>
+        <span className="hint mono">{run.state || "—"}</span>
+        <span className="spacer" />
+        <span className="hint">{formatDate(run.startedAt)}{run.finishedAt ? " → " + formatDate(run.finishedAt) : ""}</span>
+      </div>
+      {run.error && <div className="err">{run.error.code}：{run.error.message}</div>}
+      {run.counts && run.counts.total !== null ? <div className="hint">{runCountsText(run.counts)}</div> : null}
+      <div className="hint mono">{ver ? "GUID 覆盖 — " + verificationText(ver) : "GUID 覆盖：未提供"}</div>
+      <div className="hint">{consoleErrorCauseText(run.consoleErrors, ver?.missing ?? null)}</div>
+      {(run.state === "partial_success" || run.state === "unknown") ? (
+        <div className="hint">{partialReasonText(run.counts ? { id: run.id, status: run.state, startedAt: run.startedAt, finishedAt: run.finishedAt, verification: ver, consoleErrors: run.consoleErrors, counts: run.counts } : null)}</div>
+      ) : null}
+      <ConsoleMessages errors={run.consoleErrors} />
+      {(run.state === "unknown" || run.units.some((u) => u.state === "unknown")) && (
+        <div className="err">{UNKNOWN_STATE_HINT}</div>
+      )}
+      {run.units.map((u) => (
+        <div className="row" key={u.unitId} style={{ gap: "6px", alignItems: "flex-start" }}>
+          <Badge tone={UNIT_STATE_TONE[u.state]}>{UNIT_STATE_LABEL[u.state] ?? u.state}</Badge>
+          <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.title}>{u.title}</span>
+          <span className="hint mono" style={{ flex: "0 0 auto" }}>{u.state}</span>
+          {u.verification ? <span className="hint" style={{ flex: "0 0 auto" }} title={verificationText(u.verification)}>{verificationText(u.verification)}</span> : null}
+          {u.consoleErrors && u.consoleErrors.length > 0 ? <span className="hint" style={{ flex: "0 0 auto" }}>控制台 error {u.consoleErrors.length} 条</span> : null}
+          {u.error && <span className="err-text" style={{ flex: "0 0 auto" }}>{u.error.code}: {u.error.message}</span>}
+        </div>
+      ))}
+      {!run.units.length && <div className="hint">这个 run 还没有单元</div>}
+    </div>
+  );
 }
 
 /**
@@ -918,31 +1016,7 @@ export function AvatarWorkbench(props: {
                   <span className="spacer" />
                 </div>
                 {runErr && <div className="err">{runErr}</div>}
-                {runs.map((run) => (
-                  <div key={run.id} style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                    <div className="row" style={{ gap: "6px" }}>
-                      <b className="mono">run #{run.id}</b>
-                      <Badge tone="busy">{run.state || "—"}</Badge>
-                      <span className="spacer" />
-                      <span className="hint">{formatDate(run.startedAt)}{run.finishedAt ? " → " + formatDate(run.finishedAt) : ""}</span>
-                    </div>
-                    {run.error && <div className="err">{run.error.code}：{run.error.message}</div>}
-                    {run.verification ? <div className="hint mono">校验覆盖度 — {verificationText(run.verification)}</div> : null}
-                    {(run.state === "unknown" || run.units.some((u) => u.state === "unknown")) && (
-                      <div className="err">{UNKNOWN_STATE_HINT}</div>
-                    )}
-                    {run.units.map((u) => (
-                      <div className="row" key={u.unitId} style={{ gap: "6px", alignItems: "flex-start" }}>
-                        <Badge tone={UNIT_STATE_TONE[u.state]}>{UNIT_STATE_LABEL[u.state] ?? u.state}</Badge>
-                        <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.title}>{u.title}</span>
-                        <span className="hint mono" style={{ flex: "0 0 auto" }}>{u.state}</span>
-                        {u.verification ? <span className="hint" style={{ flex: "0 0 auto" }} title={verificationText(u.verification)}>{VERIFICATION_SCOPE_LABEL[u.verification.scope] ?? u.verification.scope} {u.verification.found}/{u.verification.expected}</span> : null}
-                        {u.error && <span className="err-text" style={{ flex: "0 0 auto" }}>{u.error.code}: {u.error.message}</span>}
-                      </div>
-                    ))}
-                    {!run.units.length && <div className="hint">这个 run 还没有单元</div>}
-                  </div>
-                ))}
+                {runs.map((run) => <RunCard key={run.id} run={run} />)}
               </div>
             )}
           </div>

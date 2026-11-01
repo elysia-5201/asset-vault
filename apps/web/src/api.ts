@@ -16,7 +16,7 @@ import type {
   DuplicateLevel, DuplicateMatch, HealthResponse,
   ItemCardWeb, ItemDetailWeb, ItemDuplicatesResponse, ItemQuery, ItemsResponse, ItemRelatedResponse, ItemUsageResponse, JobIdResponse, JobsResponse, JobActionResponse,
   PipelineEvent, PipelineOverview, PipelineStage, PipelineTask,
-  ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, PlanRisk, StagingCleanupResult, StagingUsage, VerificationStats,
+  ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, PlanLatestRun, PlanRisk, RunCounts, StagingCleanupResult, StagingUsage, VerificationStats,
   WorkbenchAvatar, WorkbenchAvatarCounts, WorkbenchItem, WorkbenchItemQuery, WorkbenchItemsResponse,
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
@@ -1204,17 +1204,70 @@ function riskOf(raw: unknown): PlanRisk {
     },
   };
 }
-/** 校验覆盖度：{scope, checked, expected, found, missing}；没有该字段返回 null（不伪造 0/0）。 */
+/**
+ * 校验覆盖度归一化。后端有**两种形状**：
+ * - 嵌套（旧）：{ verification: { scope, checked, expected, found, missing } }（类似 cov 对象）
+ * - 扁平（现网）：{ verificationScope, checked, expected, found, missing }（summary_json / detail_json）
+ * 没给的计数保持 null（未知，展示成「未提供」）；显式 0 保留。
+ */
 function verificationOf(raw: unknown): VerificationStats | null {
   if (!raw || typeof raw !== "object") return null;
-  const v = rec(raw);
-  const scope = typeof v.scope === "string" ? v.scope : "";
-  const checked = numOrNull(v.checked);
-  const expected = numOrNull(v.expected);
+  const outer = rec(raw);
+  const nested = outer.verification && typeof outer.verification === "object" ? rec(outer.verification) : null;
+  const v = nested ?? outer;
+  const scopeRaw = v.scope ?? v.verificationScope;
+  const scope = typeof scopeRaw === "string" ? scopeRaw : "";
+  const checked = numOrNull(v.checked ?? v.checked_count);
+  const expected = numOrNull(v.expected ?? v.expected_count);
   const found = numOrNull(v.found);
   const missing = numOrNull(v.missing);
   if (!scope && checked === null && expected === null && found === null && missing === null) return null;
-  return { scope: scope || "unknown", checked: checked ?? 0, expected: expected ?? 0, found: found ?? 0, missing: missing ?? 0 };
+  return { scope: scope || "unknown", checked, expected, found, missing };
+}
+
+/** 控制台消息归一化：null = 未提供；[] = 明确 0 条（不要把缺字段当 0）。 */
+function consoleErrorsOf(raw: unknown): string[] | null {
+  const x = jsonOf(raw);
+  if (!Array.isArray(x)) return null;
+  return x
+    .map((e) => (typeof e === "string" ? e : e && typeof e === "object" ? String(rec(e).message ?? JSON.stringify(e)) : String(e)))
+    .filter((s) => s.length > 0);
+}
+
+/** run 的单元计数（summary_json 扁平形状）；缺字段为 null。 */
+function runCountsOf(raw: unknown): RunCounts {
+  const o = rec(jsonOf(raw));
+  return {
+    total: numOrNull(o.total),
+    verified: numOrNull(o.verified),
+    partialSuccess: numOrNull(o.partial_success ?? o.partialSuccess),
+    failed: numOrNull(o.failed),
+    unknown: numOrNull(o.unknown),
+    cancelled: numOrNull(o.cancelled),
+  };
+}
+
+/**
+ * 计划视图里的「最近一次执行」。只绑定同一 plan：latestRun.id 必须与 plan 的 run_id 一致，
+ * 否则返回 null（保守未知）—— 不拿别的 plan 的 run 或过期 run 充数。
+ */
+function latestRunOf(outer: Record<string, unknown>, runId: number | null): PlanLatestRun | null {
+  const lrRaw = outer.latestRun;
+  if (!lrRaw || typeof lrRaw !== "object") return null;
+  const lr = rec(lrRaw);
+  const id = numOr(lr.id ?? lr.runId, 0);
+  if (id <= 0) return null;
+  if (runId !== null && runId !== id) return null;
+  const summary = jsonOf(lr.summary);
+  return {
+    id,
+    status: String(lr.status ?? lr.state ?? ""),
+    startedAt: strField(lr, "startedAt", "started_at"),
+    finishedAt: strField(lr, "finishedAt", "finished_at"),
+    verification: verificationOf(lr.verification) ?? verificationOf(summary),
+    consoleErrors: consoleErrorsOf(lr.console_errors ?? lr.consoleErrors),
+    counts: runCountsOf(summary),
+  };
 }
 
 /** precheck 可能以 precheck_json 字符串落库（repo 里就是 TEXT）。 */
@@ -1231,6 +1284,12 @@ function planOf(raw: unknown): ImportPlan {
   const p = outer.plan && typeof outer.plan === "object" ? rec(outer.plan) : outer;
   const unitsSrc = outer.items ?? outer.units ?? p.units ?? p.items ?? p.plan_items;
   const precheckSrc = outer.precheck ?? p.precheck ?? p.precheck_json;
+  // run_id / latestRun.id 任一即可接上轮询；latestRun 的绑定校验在 latestRunOf 里做。
+  const runId = numField(p, "runId", "run_id")
+    ?? numField(outer, "runId", "run_id")
+    ?? (outer.latestRun && typeof outer.latestRun === "object" ? numField(rec(outer.latestRun), "id", "id") : null)
+    ?? (outer.run && typeof outer.run === "object" ? numField(rec(outer.run), "id", "id") : null);
+  const latestRun = latestRunOf(outer, runId);
   return {
     id: numOr(p.id ?? p.planId, 0),
     itemId: numField(p, "itemId", "item_id"),
@@ -1246,12 +1305,10 @@ function planOf(raw: unknown): ImportPlan {
       (p.risk ?? outer.risk)
       ?? { state: p.risk_state ?? outer.risk_state, hits: p.risk_hits ?? outer.risk_hits, scan: p.risk_scan ?? outer.risk_scan },
     ),
-    verification: verificationOf(outer.verification ?? p.verification)
-      ?? verificationOf(rec(jsonOf(outer.latestRun ? rec(outer.latestRun).summary : null)).verification),
+    verification: verificationOf(outer.verification ?? p.verification) ?? latestRun?.verification ?? null,
     // run 是在 import job 里建出来的：后端若在 plan 视图里暴露 run_id / latestRun.id 就能自动接上轮询
-    runId: numField(p, "runId", "run_id")
-      ?? (outer.latestRun && typeof outer.latestRun === "object" ? numField(rec(outer.latestRun), "id", "id") : null)
-      ?? (outer.run && typeof outer.run === "object" ? numField(rec(outer.run), "id", "id") : null),
+    runId,
+    latestRun,
     jobId: numField(p, "jobId", "job_id"),
     createdAt: strField(p, "createdAt", "created_at"),
     error: errOf(p.error),
@@ -1269,7 +1326,9 @@ function runUnitOf(raw: unknown, idx: number): ImportRunUnit {
     error: errOf(o.error),
     startedAt: strField(o, "startedAt", "started_at"),
     finishedAt: strField(o, "finishedAt", "finished_at"),
-    verification: verificationOf(o.verification) ?? verificationOf(rec(jsonOf(o.detail_json)).verification),
+    // detail_json：verified/partial_success 是扁平形状；unknown 分支是嵌套 verification
+    verification: verificationOf(o.verification) ?? verificationOf(jsonOf(o.detail_json)),
+    consoleErrors: consoleErrorsOf(rec(jsonOf(o.detail_json)).consoleErrors ?? o.consoleErrors),
   };
 }
 function runOf(raw: unknown): ImportRun {
@@ -1279,11 +1338,16 @@ function runOf(raw: unknown): ImportRun {
     id: numOr(o.id ?? o.runId, 0),
     planId: numOr(o.planId ?? o.plan_id, 0),
     state: String(o.state ?? o.status ?? ""),
-    units: arr<unknown>(o.units ?? o.items ?? o.run_items).map(runUnitOf),
+    // getRunView 返回**外层** { run, items }；o 是 run 行，没有 units，不能只看 o
+    units: arr<unknown>(o.units ?? o.items ?? o.run_items ?? outer.items ?? outer.units).map(runUnitOf),
     error: errOf(o.error),
     startedAt: strField(o, "startedAt", "started_at"),
     finishedAt: strField(o, "finishedAt", "finished_at"),
-    verification: verificationOf(o.verification) ?? verificationOf(rec(jsonOf(o.summary_json)).verification),
+    // summary_json 是扁平形状（verificationScope/checked/expected）；run 行还有 verification_scope 列兜底
+    verification: verificationOf(o.verification) ?? verificationOf(jsonOf(o.summary_json)) ?? verificationOf(o),
+    counts: runCountsOf(o.summary_json),
+    consoleErrors: consoleErrorsOf(o.console_errors ?? o.consoleErrors)
+      ?? consoleErrorsOf(rec(jsonOf(o.summary_json)).consoleErrors),
   };
 }
 

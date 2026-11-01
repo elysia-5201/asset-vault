@@ -708,13 +708,43 @@ export interface PlanRisk {
  * 校验覆盖度：full = 全量校验（所有期望 GUID 都查了），sampled = 抽样（只查了前 N 个）。
  * checked/expected/found/missing 是计数口径，展示时不要自己再推算。
  */
-export type VerificationScope = "full" | "sampled" | string;
+export type VerificationScope = "full" | "sampled" | "all" | string;
+/**
+ * 计数口径：null = 后端没给（**未知**，展示成「未提供」，绝不写成 0）；
+ * 0 = 后端明确给了 0。checked/expected 是 GUID 数，不是单元数。
+ */
+export type VerificationCount = number | null;
 export interface VerificationStats {
   scope: VerificationScope;
-  checked: number;
-  expected: number;
-  found: number;
-  missing: number;
+  checked: VerificationCount;
+  expected: VerificationCount;
+  found: VerificationCount;
+  missing: VerificationCount;
+}
+
+/** 一次 run 的单元计数（后端 summary_json / PlanView.latestRun.summary 的扁平形状）。 */
+export interface RunCounts {
+  total: number | null;
+  verified: number | null;
+  partialSuccess: number | null;
+  failed: number | null;
+  unknown: number | null;
+  cancelled: number | null;
+}
+
+/**
+ * 计划卡上展示的「最近一次执行」：只来自同一 plan 的 latestRun，且必须与该 plan 的 run_id 一致。
+ * 没有执行记录 / 绑定不一致 → null（保守未知），不拿别的 plan 或过期 run 充数。
+ */
+export interface PlanLatestRun {
+  id: number;
+  status: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  verification: VerificationStats | null;
+  /** 控制台 error 消息；null = 没读到（未知），[] = 明确 0 条 */
+  consoleErrors: string[] | null;
+  counts: RunCounts;
 }
 
 export interface ImportPlan {
@@ -737,8 +767,10 @@ export interface ImportPlan {
   error: { code: string; message: string } | null;
   /** 风险扫描（后端未提供时 state 为空串 / hits 空，UI 显示"未提供风险扫描"） */
   risk: PlanRisk;
-  /** 校验覆盖度（full/sampled + 计数）；未执行为 null */
+  /** 校验覆盖度（全量/抽样 + 计数）；未执行或后端未给为 null */
   verification: VerificationStats | null;
+  /** 同一 plan 的最近一次执行（与 runId 绑定）；无执行记录为 null */
+  latestRun: PlanLatestRun | null;
 }
 
 /**
@@ -770,6 +802,8 @@ export interface ImportRunUnit {
   finishedAt: string | null;
   /** 该单元的校验覆盖度与计数（有就展示，没有不猜） */
   verification: VerificationStats | null;
+  /** 该单元导入后读到的控制台 error 消息；null = 未提供，[] = 明确 0 条 */
+  consoleErrors: string[] | null;
 }
 export interface ImportRun {
   id: number;
@@ -780,6 +814,10 @@ export interface ImportRun {
   startedAt: string | null;
   finishedAt: string | null;
   verification: VerificationStats | null;
+  /** 单元计数（summary_json 扁平形状）；缺失字段为 null */
+  counts: RunCounts;
+  /** 控制台 error 消息；null = 未提供，[] = 明确 0 条 */
+  consoleErrors: string[] | null;
 }
 
 // ---------------- staging（unity-staging 缓存） ----------------
