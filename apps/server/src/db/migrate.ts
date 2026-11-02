@@ -37,6 +37,8 @@ const COLUMN_MIGRATIONS: ReadonlyArray<{ table: string; column: string; ddl: str
   { table: "assets", column: "index_error", ddl: "TEXT" },
   { table: "assets", column: "indexed_at", ddl: "TEXT" },
   { table: "assets", column: "content_version", ddl: "TEXT" },
+  // v10：目录枚举摘要（可加列；旧库补列后为 NULL → 完整性未知，不冒充完整）
+  { table: "assets", column: "archive_listing", ddl: "TEXT" },
   // v6：jobs 租约/心跳（只加列，不改状态机；旧代码可忽略这些列 → 回滚只需回滚代码）
   { table: "jobs", column: "holder", ddl: "TEXT" },
   { table: "jobs", column: "lease_until", ddl: "TEXT" },

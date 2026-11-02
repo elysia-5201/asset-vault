@@ -228,35 +228,65 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
     } }),
     extra: { sample: sample ?? "unreadable" },
   });
+  // 目录语义（mode）不塞进 key（既有缓存的键公式是冻结契约），改为命中时校验 payload：
+  // 旧严格 listing 缓存没有 summary → 视为 miss（显式重解析前不复用旧前缀），同语义仍可复用。
+  const expectedMode = asset.container === "zip" ? "metadata" : "strict";
   // 强身份命中时校验条目记录的 content_sha（防 DB 行被改/旧实现写入的脏条目）；弱身份没有 sha 可比
   const cached = sample === null ? null : await ctx.cache.get<any>("archive-listing", key, weak ? undefined : { contentSha: String(asset.sha256 ?? "") });
-  if (cached && Array.isArray(cached.entries)) {
+  if (cached && !(Array.isArray(cached.entries) && cached.summary?.mode === expectedMode)) {
+    ctx.log("archive asset " + asset.id + " stale listing cache ignored (mode mismatch)");
+  }
+  if (cached && Array.isArray(cached.entries) && cached.summary?.mode === expectedMode) {
     checkAbort(ctx.signal);
     applyArchiveListing(ctx.repo, asset.id, cached.entries);
+    if (cached.summary) ctx.repo.setAssetArchiveListing(asset.id, JSON.stringify(cached.summary));
     ctx.progress({ itemsDone: cached.entries.length, itemsTotal: cached.entries.length });
-    return { itemsTotal: cached.entries.length, note: "cache hit" + (weak ? " (weak identity)" : ""), limited: cached.limited ?? null };
+    return { itemsTotal: cached.entries.length, note: "cache hit" + (weak ? " (weak identity)" : ""), limited: cached.summary?.stoppedReason ?? cached.limited ?? null };
   }
 
+  // ZIP 目录用途 opt-in 元数据模式：只枚举中央目录，不按声明解压字节预扣内容读取预算。
+  // 实际内容读取（预览/解压/unitypackage 解析）仍受原单条/总量/压缩比限额；7z/rar 等格式语义不变。
+  const isZip = asset.container === "zip";
   const listing: any = await core.list(asset.path, {
     maxEntries: ctx.limits.maxArchiveEntries,
     maxEntryBytes: ctx.limits.maxEntryBytes,
     maxTotalBytes: ctx.limits.maxTotalReadBytes,
     maxCompressionRatio: ctx.limits.maxCompressionRatio,
+    ...(isZip ? { metadataOnly: true } : {}),
     signal: ctx.signal,
   });
   checkAbort(ctx.signal);
   const entries = (listing.entries ?? []).map((e: any) => ({ path: e.path, size: Number(e.size) || 0, isDir: !!e.isDir }));
   applyArchiveListing(ctx.repo, asset.id, entries);
-  const limited = listing.limited ?? (listing.truncated ? { code: "ENTRIES", message: "条目超过上限 " + ctx.limits.maxArchiveEntries + "，目录已截断" } : null);
+  // 停止原因与"只标记不停"的 flag 分开：先 flag 后 stop 时必须显示真正的 stop 原因
+  const stoppedReason = listing.stoppedReason
+    ?? (listing.truncated ? { code: "ENTRIES", message: "条目超过上限 " + ctx.limits.maxArchiveEntries + "，目录已截断" } : null);
+  const flags = Array.isArray(listing.flags) ? listing.flags : [];
+  const summary = {
+    mode: listing.mode ?? (isZip ? "metadata" : "strict"),
+    complete: listing.complete ?? !listing.truncated,
+    stoppedReason,
+    flags,
+    listedEntries: entries.length,
+    declaredBytesListed: Number(listing.bytesListed ?? 0),
+    contentReadLimited: listing.contentReadLimited ?? flags.some((f: any) => f.code === "BYTES" || f.code === "RATIO"),
+    metadataBytes: Number(listing.metadataBytes ?? 0),
+  };
+  ctx.repo.setAssetArchiveListing(asset.id, JSON.stringify(summary));
   if (sample !== null) {
-    await ctx.cache.put("archive-listing", key, { entries, limited, passwordProtected: !!listing.passwordProtected, truncated: !!listing.truncated }, {
+    await ctx.cache.put("archive-listing", key, { entries, summary, passwordProtected: !!listing.passwordProtected, truncated: !summary.complete }, {
       kind: "archive-listing", contentSha: weak ? null : String(asset.sha256 ?? ""), versionKey: "archive:v" + core.version, weak,
     });
   } else {
     ctx.log("archive asset " + asset.id + " content sample unreadable, cache bypassed");
   }
   ctx.progress({ itemsDone: entries.length, itemsTotal: entries.length });
-  return { itemsTotal: entries.length, note: "entries=" + entries.length + (limited ? " (truncated)" : "") + (sample === null ? "; sample unreadable (cache bypassed)" : ""), limited };
+  return {
+    itemsTotal: entries.length,
+    note: "entries=" + entries.length + (stoppedReason ? " (stopped)" : "") + " mode=" + summary.mode
+      + (summary.contentReadLimited ? " contentLimited" : "") + (sample === null ? "; sample unreadable (cache bypassed)" : ""),
+    limited: stoppedReason as any,
+  };
 }
 
 function applyArchiveListing(repo: Repo, assetId: number, entries: { path: string; size: number; isDir: boolean }[]): void {

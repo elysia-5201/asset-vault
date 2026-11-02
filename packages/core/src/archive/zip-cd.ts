@@ -91,6 +91,10 @@ export interface CdLimits {
   maxTotalBytes?: number | null;
   maxEntryBytes?: number | null;
   maxCompressionRatio?: number | null;
+  /** 元数据枚举：不按声明解压字节停止（内容读取预算另算） */
+  metadataOnly?: boolean;
+  /** 中央目录字节上限（元数据自身的读取上界） */
+  maxMetadataBytes?: number | null;
 }
 
 export interface CdScan {
@@ -110,6 +114,12 @@ export interface CdScan {
   bytesListed: number;
   /** 是否因上限提前停止 */
   truncated: boolean;
+  /** 只标记不停的原因（单条超限/压缩比） */
+  flags: ListingLimit[];
+  /** 真正停止原因（null = 未停止） */
+  stoppedReason: ListingLimit | null;
+  /** 中央目录字节数（元数据读取量） */
+  metadataBytes: number;
 }
 
 export interface CdScanOptions {
@@ -164,6 +174,15 @@ export function scanZipCentralDirectory(file: string, opts: CdScanOptions = {}):
       }
     }
     if (cdOffset + cdSize > size) throw new AppError("NOT_AN_ARCHIVE", `zip: central directory out of range (${file})`, 400);
+    // 元数据自身的读取上界：中央目录字节数（与"声明解压体积"无关）
+    if (lim?.maxMetadataBytes != null && cdSize > lim.maxMetadataBytes) {
+      const msg = `central directory ${cdSize} bytes > maxMetadataBytes ${lim.maxMetadataBytes}`;
+      return {
+        entries: [], unsafeSkipped: 0, unsafeReasons: [], backslashNormalized: 0, passwordProtected: false,
+        encoding: "utf8", zip64: false, limited: { code: "BYTES", message: msg }, bytesListed: 0,
+        truncated: true, flags: [], stoppedReason: { code: "BYTES", message: msg }, metadataBytes: cdSize,
+      };
+    }
     const cd = readAt(fd, cdOffset, Math.min(cdSize, 512 * 1024 * 1024));
 
     const entries: CdEntry[] = [];
@@ -173,6 +192,8 @@ export function scanZipCentralDirectory(file: string, opts: CdScanOptions = {}):
     let passwordProtected = false;
     let encoding = "utf8";
     let limited: ListingLimit | null = null;
+    let stoppedReason: ListingLimit | null = null;
+    const limitFlags: ListingLimit[] = [];
     let bytesListed = 0;
     let truncated = false;
     const maxEntries = lim?.maxEntries ?? null;
@@ -232,20 +253,27 @@ export function scanZipCentralDirectory(file: string, opts: CdScanOptions = {}):
         if (maxEntries !== null && entries.length >= maxEntries) {
           truncated = true;
           limited = { code: "ENTRIES", message: `stopped at maxEntries=${maxEntries}` };
+          if (!stoppedReason) stoppedReason = limited;
           break;
         }
         // 上限 2/3：累计声明字节超了就停（防"1M 条 × 10MB"把内存/DB 打满）
-        if (maxTotalBytes !== null && bytesListed + usize > maxTotalBytes) {
+        // 元数据模式：只枚举目录、不读内容 → 不按声明解压字节停止（maxMetadataBytes 另有上界）
+        if (lim?.metadataOnly !== true && maxTotalBytes !== null && bytesListed + usize > maxTotalBytes) {
           truncated = true;
           limited = { code: "BYTES", message: `bytesListed ${bytesListed} + entry ${usize} > maxTotalBytes ${maxTotalBytes}` };
+          if (!stoppedReason) stoppedReason = limited;
           break;
         }
         // 上限 3/3：单条目过大 / 压缩比异常 —— 仍然列出（目录要完整），只标记
-        if (maxEntryBytes !== null && usize > maxEntryBytes && limited === null) {
-          limited = { code: "BYTES", message: `entry ${safe.path.slice(0, 80)} declared ${usize} > maxEntryBytes ${maxEntryBytes}` };
+        if (maxEntryBytes !== null && usize > maxEntryBytes) {
+          const f = { code: "BYTES" as const, message: `entry ${safe.path.slice(0, 80)} declared ${usize} > maxEntryBytes ${maxEntryBytes}` };
+          limitFlags.push(f);
+          if (limited === null) limited = f;
         }
-        if (maxRatio !== null && csize > 0 && usize / csize > maxRatio && limited === null) {
-          limited = { code: "RATIO", message: `entry ${safe.path.slice(0, 80)} ratio ${(usize / csize).toFixed(1)}:1 > maxCompressionRatio ${maxRatio}` };
+        if (maxRatio !== null && csize > 0 && usize / csize > maxRatio) {
+          const f = { code: "RATIO" as const, message: `entry ${safe.path.slice(0, 80)} ratio ${(usize / csize).toFixed(1)}:1 > maxCompressionRatio ${maxRatio}` };
+          limitFlags.push(f);
+          if (limited === null) limited = f;
         }
         entries.push({ path: safe.path, size: usize, compressedSize: csize, crc, isDir, encrypted: (flags & 1) !== 0, method, localOffset });
         bytesListed += usize;
@@ -254,7 +282,10 @@ export function scanZipCentralDirectory(file: string, opts: CdScanOptions = {}):
       p += 46 + namelen + extralen + commentlen;
       seen++;
     }
-    return { entries, unsafeSkipped, unsafeReasons, backslashNormalized, passwordProtected, encoding, zip64, limited, bytesListed, truncated };
+    return {
+      entries, unsafeSkipped, unsafeReasons, backslashNormalized, passwordProtected, encoding, zip64,
+      limited, bytesListed, truncated, flags: limitFlags, stoppedReason, metadataBytes: cdSize,
+    };
   } finally {
     try { closeSync(fd); } catch { /* ignore */ }
   }

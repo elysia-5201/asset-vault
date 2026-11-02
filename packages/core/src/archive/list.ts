@@ -54,6 +54,13 @@ export const DEFAULT_MAX_ENTRIES = 20000;
 export const DEFAULT_MAX_TOTAL_BYTES: number | null = null;
 /** 默认压缩比上限：null = 不设（建议 200：正常素材包通常 < 20，炸弹常在 1000+）。 */
 export const DEFAULT_MAX_COMPRESSION_RATIO: number | null = null;
+/**
+ * 元数据枚举模式（metadataOnly）下中央目录的读取上限（字节）。
+ * 目录枚举不该被"声明解压体积"拖垮，但元数据本身也要有上界（防超长中央目录）。
+ */
+export const DEFAULT_MAX_METADATA_BYTES = 64 * 1024 * 1024;
+/** 目录用途：strict=旧契约（声明字节预算会截断）；metadata=只枚举中央目录，不预扣内容读取预算。 */
+export type ListingMode = "strict" | "metadata";
 /** 7za 单次调用的默认超时（毫秒）：损坏包可能让工具挂住；传了 opts.timeoutMs 时以调用方为准。 */
 const SEVEN_ZIP_TIMEOUT_MS = 120_000;
 
@@ -65,48 +72,70 @@ export type { SafePathResult, SafePathOk, SafePathRejected } from "./safepath";
 interface ListingState {
   entries: ArchiveEntry[];
   truncated: boolean;
+  /** 兼容字段：停止原因优先，否则第一个 flag（旧调用方只读这个） */
   limited: ListingLimit | null;
+  /** 真正让枚举停下的原因（不会被先到的单条标记顶掉） */
+  stopReason: ListingLimit | null;
+  /** 只标记不停的原因（单条超限 / 压缩比异常） */
+  flags: ListingLimit[];
+  mode: ListingMode;
   bytesListed: number;
+  metadataBytes: number;
   maxEntries: number;
   maxEntryBytes: number | null;
   maxTotalBytes: number | null;
   maxRatio: number | null;
+  maxMetadataBytes: number | null;
   notes: string[];
   passwordProtected: boolean;
 }
 
-function makeState(opts: { maxEntries?: number; maxEntryBytes?: number | null; maxTotalBytes?: number | null; maxCompressionRatio?: number | null }): ListingState {
+function makeState(opts: { maxEntries?: number; maxEntryBytes?: number | null; maxTotalBytes?: number | null; maxCompressionRatio?: number | null; metadataOnly?: boolean; maxMetadataBytes?: number | null }): ListingState {
   const maxEntries = Math.max(1, Math.floor(opts.maxEntries ?? DEFAULT_MAX_ENTRIES));
   return {
-    entries: [], truncated: false, limited: null, bytesListed: 0,
+    entries: [], truncated: false, limited: null, stopReason: null, flags: [],
+    mode: opts.metadataOnly === true ? "metadata" : "strict",
+    bytesListed: 0, metadataBytes: 0,
     maxEntries,
     maxEntryBytes: normalizeLimit("maxEntryBytes", opts.maxEntryBytes, 1),
     maxTotalBytes: normalizeLimit("maxTotalBytes", opts.maxTotalBytes, 1),
     maxRatio: normalizeLimit("maxCompressionRatio", opts.maxCompressionRatio, 1),
+    maxMetadataBytes: normalizeLimit("maxMetadataBytes", opts.maxMetadataBytes ?? DEFAULT_MAX_METADATA_BYTES, 1),
     notes: [], passwordProtected: false,
   };
+}
+
+/** 记录一次"只标记不停"的原因：绝不覆盖停止原因，也不覆盖更早的 flag 之外的语义。 */
+function flagLimit(st: ListingState, limit: ListingLimit): void {
+  st.flags.push(limit);
+}
+
+/** 记录真正停止原因（首个停止原因胜出），并置 truncated。 */
+function stopListing(st: ListingState, limit: ListingLimit): void {
+  st.truncated = true;
+  if (!st.stopReason) st.stopReason = limit;
 }
 
 /**
  * 把一条条目并入结果；返回 false 表示"该停了"（调用方 break）。
  * 语义：条目数满 / 累计字节超 → 停（truncated=true）；单条过大 / 压缩比异常 → 只标记不停。
  */
-function addEntry(st: ListingState, e: { path: string; size: number; isDir: boolean; crc?: number | null }, packedSize?: number | null): boolean {
+function addEntry(st: ListingState, e: { path: string; size: number; isDir: boolean; crc?: number | null }, packedSize?: number | null, enforceDeclaredBudget = true): boolean {
   if (st.entries.length >= st.maxEntries) {
-    st.truncated = true;
-    if (!st.limited) st.limited = { code: "ENTRIES", message: `stopped at maxEntries=${st.maxEntries}` };
+    stopListing(st, { code: "ENTRIES", message: `stopped at maxEntries=${st.maxEntries}` });
     return false;
   }
-  if (st.maxTotalBytes !== null && st.bytesListed + e.size > st.maxTotalBytes) {
-    st.truncated = true;
-    if (!st.limited) st.limited = { code: "BYTES", message: `bytesListed ${st.bytesListed} + entry ${e.size} > maxTotalBytes ${st.maxTotalBytes}` };
+  // 元数据模式（zip 目录用途）：只枚举中央目录、不读取内容，因此不按"声明解压字节"预扣内容读取预算。
+  // 真正的内容读取（readArchiveEntry）仍然受原单条上限约束——这里放下的是枚举，不是解压。
+  if (enforceDeclaredBudget && st.maxTotalBytes !== null && st.bytesListed + e.size > st.maxTotalBytes) {
+    stopListing(st, { code: "BYTES", message: `bytesListed ${st.bytesListed} + entry ${e.size} > maxTotalBytes ${st.maxTotalBytes}` });
     return false;
   }
-  if (st.maxEntryBytes !== null && e.size > st.maxEntryBytes && !st.limited) {
-    st.limited = { code: "BYTES", message: `entry ${e.path.slice(0, 80)} declared ${e.size} > maxEntryBytes ${st.maxEntryBytes}` };
+  if (st.maxEntryBytes !== null && e.size > st.maxEntryBytes) {
+    flagLimit(st, { code: "BYTES", message: `entry ${e.path.slice(0, 80)} declared ${e.size} > maxEntryBytes ${st.maxEntryBytes}` });
   }
-  if (st.maxRatio !== null && typeof packedSize === "number" && packedSize > 0 && e.size / packedSize > st.maxRatio && !st.limited) {
-    st.limited = { code: "RATIO", message: `entry ${e.path.slice(0, 80)} ratio ${(e.size / packedSize).toFixed(1)}:1 > maxCompressionRatio ${st.maxRatio}` };
+  if (st.maxRatio !== null && typeof packedSize === "number" && packedSize > 0 && e.size / packedSize > st.maxRatio) {
+    flagLimit(st, { code: "RATIO", message: `entry ${e.path.slice(0, 80)} ratio ${(e.size / packedSize).toFixed(1)}:1 > maxCompressionRatio ${st.maxRatio}` });
   }
   st.entries.push({ path: e.path, size: e.size, isDir: e.isDir, ...(e.crc === undefined ? {} : { crc: e.crc }) });
   st.bytesListed += e.size;
@@ -326,6 +355,28 @@ function translateArchiveError(err: unknown, file: string, container: string, en
   return new AppError("NOT_AN_ARCHIVE", `cannot read ${container} (${file}): ${msg.slice(0, 400)}`, 400);
 }
 
+/** 读 EOCD 取中央目录字节数（只读尾部 66KB，不碰包体）；取不到/zip64 返回 null。 */
+function zipCentralDirectorySize(file: string): number | null {
+  try {
+    const { openSync: o, readSync: r, fstatSync, closeSync: c } = require_("node:fs") as typeof import("node:fs");
+    const fd = o(file, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const tailLen = Math.min(size, 66_000);
+      const tail = Buffer.alloc(tailLen);
+      r(fd, tail, 0, tailLen, size - tailLen);
+      let eocd = -1;
+      for (let i = tail.length - 22; i >= 0; i--) {
+        if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) { eocd = i; break; }
+      }
+      if (eocd < 0) return null;
+      const cdSize = tail.readUInt32LE(eocd + 12);
+      if (cdSize === 0xffffffff) return null; // zip64：交给 CD 解析自身的上界
+      return cdSize;
+    } finally { c(fd); }
+  } catch { return null; }
+}
+
 function isMaliciousEntryError(err: unknown): boolean {
   return /malicious entry/i.test((err as Error)?.message ?? "");
 }
@@ -334,6 +385,15 @@ function isMaliciousEntryError(err: unknown): boolean {
 async function listZipWithPassword(file: string, st: ListingState, deadline: Deadline | null): Promise<void> {
   let zip: any;
   try {
+    // 元数据模式：目录枚举本身也要有上界（中央目录字节），但不再按声明解压体积停止。
+    if (st.mode === "metadata" && st.maxMetadataBytes !== null) {
+      const cdBytes = zipCentralDirectorySize(file);
+      st.metadataBytes = cdBytes ?? 0;
+      if (cdBytes !== null && cdBytes > st.maxMetadataBytes) {
+        stopListing(st, { code: "BYTES", message: `central directory ${cdBytes} bytes > maxMetadataBytes ${st.maxMetadataBytes}` });
+        return;
+      }
+    }
     const opened = await openZipDecoded(file, deadline);
     zip = opened.zip;
     const raw = opened.entries;
@@ -345,7 +405,7 @@ async function listZipWithPassword(file: string, st: ListingState, deadline: Dea
       const isDir = e.isDirectory === true || (e.isFile === false && normalized.endsWith("/"));
       const path = normalized.replace(/\/+$/, "");
       const crc = typeof e.crc === "number" ? e.crc >>> 0 : null;
-      if (!addEntry(st, { path, size: Number(e.size ?? 0), isDir, crc }, Number(e.compressedSize ?? 0) || null)) break;
+      if (!addEntry(st, { path, size: Number(e.size ?? 0), isDir, crc }, Number(e.compressedSize ?? 0) || null, st.mode !== "metadata")) break;
     }
     if (st.passwordProtected) st.notes.push("zip has encrypted entries (per-entry flag set)");
   } catch (err) {
@@ -353,7 +413,7 @@ async function listZipWithPassword(file: string, st: ListingState, deadline: Dea
     // 整包列目录失败。现实里 Windows 工具生成的 zip 普遍如此（本机样本 901/901 条）。
     // 回退到自研中央目录解析：反斜杠归一化为 "/"，只跳过真正危险的（绝对路径/盘符/..）。
     const limit = limitFromStop(err);
-    if (limit) { st.limited = limit; st.truncated = true; return; }
+    if (limit) { stopListing(st, limit); return; }
     if (isMaliciousEntryError(err)) { await listZipViaCentralDirectory(file, st, deadline); return; }
     throw translateArchiveError(err, file, "zip");
   } finally {
@@ -367,17 +427,22 @@ async function listZipViaCentralDirectory(file: string, st: ListingState, deadli
   try {
     scan = scanZipCentralDirectory(file, {
       deadline,
-      limits: { maxEntries: st.maxEntries, maxTotalBytes: st.maxTotalBytes, maxEntryBytes: st.maxEntryBytes, maxCompressionRatio: st.maxRatio },
+      limits: {
+        maxEntries: st.maxEntries, maxTotalBytes: st.maxTotalBytes, maxEntryBytes: st.maxEntryBytes,
+        maxCompressionRatio: st.maxRatio, metadataOnly: st.mode === "metadata", maxMetadataBytes: st.maxMetadataBytes,
+      },
     });
   } catch (err) {
     const limit = limitFromStop(err);
-    if (limit) { st.limited = limit; st.truncated = true; return; }
+    if (limit) { stopListing(st, limit); return; }
     throw err;
   }
   const { entries } = listFromScan(scan, st.maxEntries);
-  for (const e of entries) addEntry(st, e);
-  if (scan.truncated) st.truncated = true;
-  if (scan.limited && !st.limited) st.limited = scan.limited;
+  for (const e of entries) addEntry(st, e, null, st.mode !== "metadata");
+  if (scan.metadataBytes) st.metadataBytes = scan.metadataBytes;
+  if (scan.stoppedReason) stopListing(st, scan.stoppedReason);
+  else if (scan.truncated) st.truncated = true;
+  for (const f of scan.flags ?? []) flagLimit(st, f);
   if (scan.passwordProtected) st.passwordProtected = true;
   if (scan.unsafeSkipped > 0) {
     const head = scan.unsafeReasons.slice(0, 3).join(" | ");
@@ -704,6 +769,14 @@ async function readSevenZipEntry(file: string, container: "7z" | "rar", entryPat
 // ---------------------------------------------------------------- 公共 API
 
 export interface ListArchiveOptions extends AbortOptions {
+  /**
+   * 目录用途 opt-in（仅 zip）：只枚举中央目录元数据，不按「声明解压字节」预扣内容读取预算。
+   * 旧默认 strict 契约不变；maxEntries/路径安全/中央目录字节上限/内容读取上限全部保留。
+   * 7z/rar/tar 等需要读 payload 才能列目录的格式不受此开关影响。
+   */
+  metadataOnly?: boolean;
+  /** 元数据读取上限（中央目录字节数，默认 64 MiB；仅 metadataOnly 生效） */
+  maxMetadataBytes?: number;
   /** 最多列出多少条（默认 20000）。超出 → truncated + limited.code=ENTRIES */
   maxEntries?: number;
   /** 单条目声明字节上限：超过只标记 limited（仍列出，目录要完整） */
@@ -715,10 +788,22 @@ export interface ListArchiveOptions extends AbortOptions {
 }
 
 export interface ArchiveListingResult extends ArchiveListing {
-  /** 命中的第一个上限（null = 完整列出）；流水线据此降级并允许调大限制后重跑 */
+  /** 兼容字段：真正停止原因优先，否则第一个 flag（null = 完整列出且无标记） */
   limited: ListingLimit | null;
   /** 已列出条目的声明字节合计（不含被跳过的危险条目） */
   bytesListed: number;
+  /** 目录语义：strict=旧契约；metadata=只枚举中央目录元数据 */
+  mode: ListingMode;
+  /** 条目枚举是否走到目录末尾（true 才代表"目录本身完整"；不代表每个文件都能解压） */
+  complete: boolean;
+  /** 真正让枚举停下的原因（不会被先到的单条标记顶掉） */
+  stoppedReason: ListingLimit | null;
+  /** 只标记不停的原因（单条声明上限/压缩比） */
+  flags: ListingLimit[];
+  /** 目录完整但存在超内容读取上限的文件（预览/解压仍会受限） */
+  contentReadLimited: boolean;
+  /** 元数据读取量（zip 中央目录字节数；其它格式 0） */
+  metadataBytes: number;
 }
 
 export interface ReadEntryOptions extends AbortOptions { /* timeoutMs / signal */ }
@@ -761,11 +846,11 @@ export async function listArchive(file: string, opts: ListArchiveOptions = {}): 
   } catch (err) {
     const limit = limitFromStop(err);
     if (!limit) throw err;
-    st.limited = limit;
-    st.truncated = true;
+    stopListing(st, limit);
   } finally {
     deadline?.dispose();
   }
+  st.limited = st.stopReason ?? st.flags[0] ?? null;
   return {
     container: container as ContainerKind,
     entries: st.entries,
@@ -774,6 +859,15 @@ export async function listArchive(file: string, opts: ListArchiveOptions = {}): 
     ...(st.notes.length ? { note: st.notes.join("; ") } : {}),
     limited: st.limited,
     bytesListed: st.bytesListed,
+    // 目录语义/完整性（加法字段，旧调用方忽略即可）
+    mode: st.mode,
+    complete: !st.truncated,
+    /** 真正停止枚举的原因（不会被先到的单条标记顶掉） */
+    stoppedReason: st.stopReason,
+    /** 只标记不停的原因（单条声明上限/压缩比）；目录完整 ≠ 每个文件都能解压 */
+    flags: st.flags,
+    contentReadLimited: st.flags.some((f) => f.code === "BYTES" || f.code === "RATIO"),
+    metadataBytes: st.metadataBytes,
   };
 }
 
@@ -812,9 +906,9 @@ export async function listArchiveWith7zip(file: string, container: "7z" | "rar" 
   } catch (err) {
     const limit = limitFromStop(err);
     if (!limit) throw err;
-    st.limited = limit;
-    st.truncated = true;
+    stopListing(st, limit);
   }
+  st.limited = st.stopReason ?? st.flags[0] ?? null;
   return {
     container: container === "zip" ? "zip" : container,
     entries: st.entries,
@@ -823,6 +917,12 @@ export async function listArchiveWith7zip(file: string, container: "7z" | "rar" 
     ...(st.notes.length ? { note: st.notes.join("; ") } : {}),
     limited: st.limited,
     bytesListed: st.bytesListed,
+    mode: st.mode,
+    complete: !st.truncated,
+    stoppedReason: st.stopReason,
+    flags: st.flags,
+    contentReadLimited: st.flags.some((f) => f.code === "BYTES" || f.code === "RATIO"),
+    metadataBytes: st.metadataBytes,
   };
 }
 

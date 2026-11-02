@@ -621,7 +621,12 @@ export async function getAsset(id: number): Promise<AssetDetailResponse> {
 export async function getAssetTree(id: number, opts: { nested?: string } = {}): Promise<AssetTreeResponse> {
   const q = opts.nested ? "?nested=" + encodeURIComponent(opts.nested) : "";
   const raw = await request<AssetTreeResponse>("GET", "/assets/" + id + "/tree" + q);
-  return { ...(raw as AssetTreeResponse), entries: arr<ArchiveEntry>(raw?.entries) };
+  return {
+    ...(raw as AssetTreeResponse),
+    entries: arr<ArchiveEntry>(raw?.entries),
+    // 目录完整性：null/缺失 = 未知（旧条目），不冒充完整
+    listing: (raw?.listing ?? null) as AssetTreeResponse["listing"],
+  } as AssetTreeResponse;
 }
 export async function getUnityPackage(id: number): Promise<UnityPackageResponse> {
   const raw = await request<UnityPackageResponse>("GET", "/assets/" + id + "/unitypackage");

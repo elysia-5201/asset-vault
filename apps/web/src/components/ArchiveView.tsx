@@ -58,7 +58,14 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
   const [pkgLoadingId, setPkgLoadingId] = useState<number | null>(null);
   const inFlight = useRef<Set<number>>(new Set());
   const mountedRef = useRef(true);
-  const [meta, setMeta] = useState<{ truncated?: boolean; passwordProtected?: boolean; note?: string }>({});
+  const [meta, setMeta] = useState<{
+    truncated?: boolean | null; passwordProtected?: boolean; note?: string;
+    /** 目录枚举摘要（null = 旧条目无记录 → 完整性未知，不冒充完整） */
+    listing?: { mode?: string; complete?: boolean; contentReadLimited?: boolean } | null;
+    completeness?: string;
+    stoppedReason?: { code: string; message: string } | null;
+    contentReadLimited?: boolean;
+  }>({});
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [needle, setNeedle] = useState("");
@@ -80,7 +87,15 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
     if (!isUp) {
       setLoading(true);
       getAssetTree(asset.id)
-        .then((d) => { if (alive) { setEntries(d.entries); setMeta({ truncated: d.truncated, passwordProtected: d.passwordProtected, note: d.note }); } })
+        .then((d) => {
+          if (!alive) return;
+          setEntries(d.entries);
+          setMeta({
+            truncated: d.truncated, passwordProtected: d.passwordProtected, note: d.note,
+            listing: d.listing ?? null, completeness: d.completeness,
+            stoppedReason: d.stoppedReason ?? null, contentReadLimited: !!d.contentReadLimited,
+          });
+        })
         .catch((e) => { if (alive) setErr(describeError(e)); })
         .finally(() => { if (alive) setLoading(false); });
     }
@@ -195,7 +210,18 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
       {tab === "unitypackage" && upLoading && <div className="hint"><span className="spin" /> 解析包里的 .unitypackage…</div>}
       {err && <div className="err">{err}</div>}
       {meta.passwordProtected && <div className="err">压缩包已加密（ARCHIVE_PASSWORD），无法列目录</div>}
-      {meta.truncated && <div className="notice">列表被截断（truncated=true），仅显示前 N 条</div>}
+      {meta.truncated && (
+        <div className="notice">
+          目录不完整（已列出 {entries.length} 条即停止）
+          {meta.stoppedReason ? "：" + meta.stoppedReason.message : ""}
+        </div>
+      )}
+      {meta.completeness === "unknown" && (
+        <div className="hint">目录完整性未知：该条目由旧版本索引，需显式重新解析后才能确认是否列全。</div>
+      )}
+      {meta.listing?.complete === true && meta.contentReadLimited && (
+        <div className="hint">目录已完整列出；其中部分文件超过内容读取上限，预览/解压仍会受限（目录完整不等于文件都能解压）。</div>
+      )}
       {meta.note && <div className="hint">{meta.note}</div>}
 
       {tab === "tree" && !loading && !err && (

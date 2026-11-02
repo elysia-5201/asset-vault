@@ -120,12 +120,31 @@ export interface StatsResponse {
 export interface AssetDetailResponse extends AssetRow {
   avatars: AssetAvatarRow[];
 }
+/** 目录枚举摘要（服务端 assets.archive_listing）：目录完整 ≠ 每个文件都能解压。 */
+export interface ArchiveListingSummary {
+  mode: "strict" | "metadata" | string;
+  complete: boolean;
+  stoppedReason: { code: string; message: string } | null;
+  flags: { code: string; message: string }[];
+  listedEntries?: number;
+  declaredBytesListed?: number;
+  contentReadLimited?: boolean;
+  metadataBytes?: number;
+}
 export interface AssetTreeResponse {
   container: ContainerKind;
   entries: ArchiveEntry[];
-  truncated?: boolean;
+  truncated?: boolean | null;
   passwordProtected?: boolean;
   note?: string;
+  /** 目录枚举摘要；null/缺失 = 旧条目无记录（完整性未知，需显式重解析） */
+  listing?: ArchiveListingSummary | null;
+  /** complete | truncated | unknown | not-applicable */
+  completeness?: string;
+  stoppedReason?: { code: string; message: string } | null;
+  flags?: { code: string; message: string }[];
+  contentReadLimited?: boolean;
+  mode?: string | null;
   /** ?nested=<包内路径> 时返回的是内层压缩包的目录 */
   path?: string;
 }

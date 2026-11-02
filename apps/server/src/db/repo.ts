@@ -670,6 +670,11 @@ export class Repo {
   touchAsset(id: number): void { this.stmt("UPDATE assets SET last_verified_at=? WHERE id=?").run(now(), id); }
   setAssetSha(id: number, sha: string | null, state: "ok" | "error" | "pending"): void { this.stmt("UPDATE assets SET sha256=?, sha256_state=? WHERE id=?").run(sha, state, id); }
 
+  /** 目录枚举摘要（JSON 字符串；null = 无记录/未知）。与 archive_entries 分写，失败不影响条目本身。 */
+  setAssetArchiveListing(assetId: number, json: string | null): void {
+    this.stmt("UPDATE assets SET archive_listing=? WHERE id=?").run(json, assetId);
+  }
+
   replaceArchiveEntries(assetId: number, entries: { path: string; size: number; isDir: boolean; ext?: string | null }[]): void {
     const tx = this.db.transaction((rows: typeof entries) => {
       this.stmt("DELETE FROM archive_entries WHERE asset_id=?").run(assetId);

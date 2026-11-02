@@ -426,7 +426,7 @@ export function ItemDetail(props: {
           <button className="btn tiny" onClick={() => guard(checkUpdate(itemId), "已起 check_update 作业")}>检查更新</button>
           <button className="btn tiny" onClick={() => guard(matchAvatars(itemId), "已起 match_avatars 作业")}>重跑头像匹配</button>
           {detail.status === "trashed"
-            ? <button className="btn tiny" onClick={() => guard(restoreItem(itemId), "已从回收站恢复")}>恢复</button>
+            ? <button className="btn tiny" title="只恢复条目状态；合并时已迁到别处的压缩包/图片/标签/模型不会自动迁回" onClick={() => guard(restoreItem(itemId), "已从回收站恢复（资源不自动迁回）")}>恢复</button>
             : <button className="btn tiny danger" onClick={() => guard(deleteItem(itemId), "已软删（status=trashed）")}>删除</button>}
           <button className="btn" onClick={props.onClose}>关闭</button>
         </div>
@@ -535,10 +535,16 @@ export function ItemDetail(props: {
               </div>
               <div className="hint">套装 = 保留各自条目、只做归组（适合"模型包 + 材质包"分别售卖的情况）。</div>
               <div className="hr" />
-              <label className="hint">合并到另一条目（把这条的压缩包/图片/标签/模型并过去，本条进回收站、可恢复）</label>
+              <label className="hint">
+                合并到另一条目（方向：<b>本条 → 目标</b>，单向；搜索只查其他条目、不含本条。合并后本条进回收站——
+                「恢复」只恢复条目状态，已并过去的压缩包/图片/标签/模型不会自动迁回）
+              </label>
               <div className="row">
                 <input placeholder="搜索目标条目标题…" value={mergeQ} onChange={(e) => { setMergeQ(e.target.value); const q = e.target.value.trim(); if (q.length >= 2) listItems({ q, limit: 6 }).then((r) => setMergeHits(r.items.filter((x) => x.id !== itemId).map((x) => ({ id: x.id, title: x.title })))).catch(() => setMergeHits([])); else setMergeHits([]); }} style={{ flex: 1 }} />
               </div>
+              {mergeQ.trim().length >= 2 && mergeHits.length === 0 && (
+                <div className="hint">没有匹配的条目（搜索只含其他条目，不含本条；本页没有反向搜索）</div>
+              )}
               {mergeHits.length > 0 && (
                 <div className="row wrap" style={{ gap: "4px", marginTop: "4px" }}>
                   {mergeHits.map((h) => (

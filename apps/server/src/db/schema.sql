@@ -98,7 +98,10 @@ CREATE TABLE IF NOT EXISTS assets (
   index_state TEXT NOT NULL DEFAULT 'pending',
   index_error TEXT,
   indexed_at TEXT,
-  content_version TEXT
+  content_version TEXT,
+  -- v10：目录枚举摘要（JSON：mode/complete/stoppedReason/flags/listedEntries/contentReadLimited）
+  -- NULL = 旧条目无记录（完整性未知，需显式重解析），不冒充完整
+  archive_listing TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_assets_item ON assets(item_id);
 CREATE INDEX IF NOT EXISTS ix_assets_sha ON assets(sha256) WHERE sha256 IS NOT NULL;

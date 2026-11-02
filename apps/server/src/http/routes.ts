@@ -514,7 +514,23 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         repo.replaceArchiveEntries(id, listing.entries.map((e) => ({ path: e.path, size: e.size, isDir: e.isDir })));
         entries = repo.getArchiveEntries(id);
       }
-      return { container: a.container, path: a.path, entries, cached: true };
+      // 完整性/限制（加法字段）：目录完整 ≠ 每个文件都能解压；旧条目无记录 → 未知，不冒充完整
+      const rawListing = (a as any).archive_listing;
+      let listing: any = null;
+      if (rawListing) { try { listing = JSON.parse(String(rawListing)); } catch { listing = null; } }
+      return {
+        container: a.container,
+        path: a.path,
+        entries,
+        cached: true,
+        listing,
+        completeness: listing ? (listing.complete ? "complete" : "truncated") : (a.container === "unitypackage" ? "not-applicable" : "unknown"),
+        truncated: listing ? listing.complete === false : null,
+        stoppedReason: listing?.stoppedReason ?? null,
+        flags: listing?.flags ?? [],
+        contentReadLimited: !!listing?.contentReadLimited,
+        mode: listing?.mode ?? null,
+      };
     } catch (e) { return fail(reply, e); }
   });
   /**
