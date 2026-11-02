@@ -343,3 +343,65 @@ export function listFromScan(scan: CdScan, maxEntries: number): { entries: { pat
     truncated,
   };
 }
+
+// ---------------------------------------------------------------- 真实中央目录大小（不读 CD）
+
+export interface ZipCdSizeInfo {
+  /** 中央目录字节数（经典 EOCD，或真 zip64 的 zip64 EOCD 记录） */
+  cdSize: number;
+  /** 中央目录起始偏移 */
+  cdOffset: number;
+  /** 经典 EOCD 三字段为哨兵、走了 zip64 EOCD */
+  zip64: boolean;
+}
+
+/**
+ * 只读尾部 + EOCD（必要时 zip64 locator/EOCD）取得真实中央目录字节数。
+ * metadata 预算必须在 node-stream-zip 读取/分配完整 CD 之前判定，因此绝不读中央目录本身；
+ * 任何一步不可信（坏 locator/越界/非安全整数）→ null（未知），由调用方 fail closed。
+ */
+export function readZipCentralDirectorySize(file: string): ZipCdSizeInfo | null {
+  let fd: number;
+  try { fd = openSync(file, "r"); } catch { return null; }
+  try {
+    const size = fstatSync(fd).size;
+    if (!Number.isSafeInteger(size) || size < 22) return null;
+    const tailLen = Math.min(size, 66_000);
+    const tail = readAt(fd, size - tailLen, tailLen);
+    let eocd = -1;
+    for (let i = tail.length - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === EOCD_SIG) { eocd = i; break; }
+    }
+    if (eocd < 0) return null;
+    const eocdAbs = size - tailLen + eocd;
+    const entryCount = tail.readUInt16LE(eocd + 10);
+    let cdSize = tail.readUInt32LE(eocd + 12);
+    let cdOffset = tail.readUInt32LE(eocd + 16);
+    let zip64 = false;
+    if (entryCount === 0xffff || cdOffset === 0xffffffff || cdSize === 0xffffffff) {
+      // 经典 EOCD 前 20 字节是 zip64 locator；zip64 EOCD 记录本身 56 字节
+      if (eocdAbs < 20) return null;
+      const loc = readAt(fd, eocdAbs - 20, 20);
+      if (loc.readUInt32LE(0) !== EOCD64_LOC_SIG) return null;
+      const z64OffRaw = loc.readBigUInt64LE(8);
+      if (z64OffRaw > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      const z64Off = Number(z64OffRaw);
+      if (!Number.isSafeInteger(z64Off) || z64Off < 0 || z64Off + 56 > size) return null;
+      const z64 = readAt(fd, z64Off, 56);
+      if (z64.readUInt32LE(0) !== EOCD64_SIG) return null;
+      const size64 = z64.readBigUInt64LE(40);
+      const off64 = z64.readBigUInt64LE(48);
+      if (size64 > BigInt(Number.MAX_SAFE_INTEGER) || off64 > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+      cdSize = Number(size64);
+      cdOffset = Number(off64);
+      zip64 = true;
+    }
+    if (!Number.isSafeInteger(cdSize) || !Number.isSafeInteger(cdOffset) || cdSize < 0 || cdOffset < 0) return null;
+    if (cdOffset + cdSize > size) return null;
+    return { cdSize, cdOffset, zip64 };
+  } catch {
+    return null;
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
+}

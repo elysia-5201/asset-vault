@@ -129,7 +129,7 @@ export interface ArchiveListingSummary {
   listedEntries?: number;
   declaredBytesListed?: number;
   contentReadLimited?: boolean;
-  metadataBytes?: number;
+  metadataBytes?: number | null;
 }
 export interface AssetTreeResponse {
   container: ContainerKind;

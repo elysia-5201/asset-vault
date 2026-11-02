@@ -39,7 +39,7 @@ import { AppError, type AppErrorCode, type ArchiveEntry, type ArchiveListing, ty
 import { CancelledError, TimeoutError, deadlineOf, isCancelledError, isTimeoutError, type AbortOptions, type Deadline } from "../abort";
 import { LimitError, normalizeLimit, type ListingLimit } from "../limits";
 import { listRar, readRarEntry } from "./rar";
-import { listFromScan, nameScore, readZipEntryFromCentralDirectory, scanZipCentralDirectory } from "./zip-cd";
+import { listFromScan, nameScore, readZipCentralDirectorySize, readZipEntryFromCentralDirectory, scanZipCentralDirectory } from "./zip-cd";
 
 const require_ = createRequire(import.meta.url);
 
@@ -80,7 +80,8 @@ interface ListingState {
   flags: ListingLimit[];
   mode: ListingMode;
   bytesListed: number;
-  metadataBytes: number;
+  /** 元数据读取量（zip 中央目录字节数）；未知 = null（绝不写 0 冒充已知） */
+  metadataBytes: number | null;
   maxEntries: number;
   maxEntryBytes: number | null;
   maxTotalBytes: number | null;
@@ -92,15 +93,18 @@ interface ListingState {
 
 function makeState(opts: { maxEntries?: number; maxEntryBytes?: number | null; maxTotalBytes?: number | null; maxCompressionRatio?: number | null; metadataOnly?: boolean; maxMetadataBytes?: number | null }): ListingState {
   const maxEntries = Math.max(1, Math.floor(opts.maxEntries ?? DEFAULT_MAX_ENTRIES));
+  const mode: ListingMode = opts.metadataOnly === true ? "metadata" : "strict";
   return {
     entries: [], truncated: false, limited: null, stopReason: null, flags: [],
-    mode: opts.metadataOnly === true ? "metadata" : "strict",
-    bytesListed: 0, metadataBytes: 0,
+    mode,
+    bytesListed: 0, metadataBytes: null,
     maxEntries,
     maxEntryBytes: normalizeLimit("maxEntryBytes", opts.maxEntryBytes, 1),
     maxTotalBytes: normalizeLimit("maxTotalBytes", opts.maxTotalBytes, 1),
     maxRatio: normalizeLimit("maxCompressionRatio", opts.maxCompressionRatio, 1),
-    maxMetadataBytes: normalizeLimit("maxMetadataBytes", opts.maxMetadataBytes ?? DEFAULT_MAX_METADATA_BYTES, 1),
+    // 旧 strict 契约不变：maxMetadataBytes 只对 metadataOnly 生效，不把 64 MiB 新默认塞进旧模式
+    // （旧 strict 自身的安全界限原样保留，不提高也不删除）。
+    maxMetadataBytes: mode === "metadata" ? normalizeLimit("maxMetadataBytes", opts.maxMetadataBytes ?? DEFAULT_MAX_METADATA_BYTES, 1) : null,
     notes: [], passwordProtected: false,
   };
 }
@@ -355,28 +359,6 @@ function translateArchiveError(err: unknown, file: string, container: string, en
   return new AppError("NOT_AN_ARCHIVE", `cannot read ${container} (${file}): ${msg.slice(0, 400)}`, 400);
 }
 
-/** 读 EOCD 取中央目录字节数（只读尾部 66KB，不碰包体）；取不到/zip64 返回 null。 */
-function zipCentralDirectorySize(file: string): number | null {
-  try {
-    const { openSync: o, readSync: r, fstatSync, closeSync: c } = require_("node:fs") as typeof import("node:fs");
-    const fd = o(file, "r");
-    try {
-      const size = fstatSync(fd).size;
-      const tailLen = Math.min(size, 66_000);
-      const tail = Buffer.alloc(tailLen);
-      r(fd, tail, 0, tailLen, size - tailLen);
-      let eocd = -1;
-      for (let i = tail.length - 22; i >= 0; i--) {
-        if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) { eocd = i; break; }
-      }
-      if (eocd < 0) return null;
-      const cdSize = tail.readUInt32LE(eocd + 12);
-      if (cdSize === 0xffffffff) return null; // zip64：交给 CD 解析自身的上界
-      return cdSize;
-    } finally { c(fd); }
-  } catch { return null; }
-}
-
 function isMaliciousEntryError(err: unknown): boolean {
   return /malicious entry/i.test((err as Error)?.message ?? "");
 }
@@ -387,10 +369,17 @@ async function listZipWithPassword(file: string, st: ListingState, deadline: Dea
   try {
     // 元数据模式：目录枚举本身也要有上界（中央目录字节），但不再按声明解压体积停止。
     if (st.mode === "metadata" && st.maxMetadataBytes !== null) {
-      const cdBytes = zipCentralDirectorySize(file);
-      st.metadataBytes = cdBytes ?? 0;
-      if (cdBytes !== null && cdBytes > st.maxMetadataBytes) {
-        stopListing(st, { code: "BYTES", message: `central directory ${cdBytes} bytes > maxMetadataBytes ${st.maxMetadataBytes}` });
+      // 在库读取/分配完整中央目录之前取真实 CD 字节数（经典 EOCD；真 zip64 走 locator + zip64 EOCD）。
+      // 取不到（坏 locator/越界/非安全整数）→ 未知：不得写 0，也不得绕过预算假 complete（fail closed）。
+      const cd = readZipCentralDirectorySize(file);
+      if (cd === null) {
+        st.metadataBytes = null;
+        stopListing(st, { code: "BYTES", message: "zip central directory size unknown (EOCD/zip64 locator invalid); refused metadata listing under maxMetadataBytes " + st.maxMetadataBytes });
+        return;
+      }
+      st.metadataBytes = cd.cdSize;
+      if (cd.cdSize > st.maxMetadataBytes) {
+        stopListing(st, { code: "BYTES", message: "central directory " + cd.cdSize + " bytes > maxMetadataBytes " + st.maxMetadataBytes });
         return;
       }
     }
@@ -439,7 +428,7 @@ async function listZipViaCentralDirectory(file: string, st: ListingState, deadli
   }
   const { entries } = listFromScan(scan, st.maxEntries);
   for (const e of entries) addEntry(st, e, null, st.mode !== "metadata");
-  if (scan.metadataBytes) st.metadataBytes = scan.metadataBytes;
+  if (typeof scan.metadataBytes === "number" && Number.isSafeInteger(scan.metadataBytes)) st.metadataBytes = scan.metadataBytes;
   if (scan.stoppedReason) stopListing(st, scan.stoppedReason);
   else if (scan.truncated) st.truncated = true;
   for (const f of scan.flags ?? []) flagLimit(st, f);
@@ -802,8 +791,8 @@ export interface ArchiveListingResult extends ArchiveListing {
   flags: ListingLimit[];
   /** 目录完整但存在超内容读取上限的文件（预览/解压仍会受限） */
   contentReadLimited: boolean;
-  /** 元数据读取量（zip 中央目录字节数；其它格式 0） */
-  metadataBytes: number;
+  /** 元数据读取量（zip 中央目录字节数；未知 = null；其它格式 0） */
+  metadataBytes: number | null;
 }
 
 export interface ReadEntryOptions extends AbortOptions { /* timeoutMs / signal */ }

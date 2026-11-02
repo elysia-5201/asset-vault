@@ -270,7 +270,7 @@ export async function stageArchive(ctx: StageCtx, asset: AssetRow): Promise<Stag
     listedEntries: entries.length,
     declaredBytesListed: Number(listing.bytesListed ?? 0),
     contentReadLimited: listing.contentReadLimited ?? flags.some((f: any) => f.code === "BYTES" || f.code === "RATIO"),
-    metadataBytes: Number(listing.metadataBytes ?? 0),
+    metadataBytes: typeof listing.metadataBytes === "number" ? listing.metadataBytes : null,
   };
   ctx.repo.setAssetArchiveListing(asset.id, JSON.stringify(summary));
   if (sample !== null) {
