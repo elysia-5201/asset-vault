@@ -2,6 +2,26 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AvatarMatch, CategoryRefSource, ContainerKind, ItemStatus, SourceSite } from "@core/contracts";
 import { parseEvidence, shortenPath } from "../util";
 
+/**
+ * 来源枚举 → 中文（只做展示映射；不改 source 枚举/DTO/匹配规则）。
+ * 未知/空值明确回退「来源未知」，原始值放 title 便于排查。
+ */
+const SOURCE_LABELS: Record<string, string> = { auto: "自动识别", manual: "人工标注", confirmed: "用户确认" };
+export function sourceLabel(source?: string | null): { text: string; known: boolean } {
+  const key = String(source ?? "").trim().toLowerCase();
+  if (!key) return { text: "来源未知", known: false };
+  const hit = SOURCE_LABELS[key];
+  return hit ? { text: hit, known: true } : { text: "来源未知", known: false };
+}
+
+/** 置信度 → 百分比；缺失/非有限/越界一律「置信度未知」，绝不输出 NaN。 */
+export function confidenceLabel(confidence?: number | null): { text: string; known: boolean } {
+  if (confidence === undefined || confidence === null) return { text: "置信度未知", known: false };
+  const n = Number(confidence);
+  if (!Number.isFinite(n) || n < 0 || n > 1) return { text: "置信度未知", known: false };
+  return { text: Math.round(n * 100) + "%", known: true };
+}
+
 export function Badge(props: { tone?: "ok" | "warn" | "bad" | "busy" | "muted" | "violet" | ""; children: ReactNode; title?: string }) {
   return <span className={"badge " + (props.tone ?? "")} title={props.title}>{props.children}</span>;
 }
@@ -48,8 +68,10 @@ export function EvidenceLine(props: { name: string; source?: string | null; evid
       <div className="row wrap" style={{ gap: "6px", alignItems: "center" }}>
         <b>@{props.name}</b>
         {props.prefix ? <span className="hint" title="entry_prefix">prefix={shortenPath(props.prefix, 40)}</span> : null}
-        <span className="hint">source={props.source ?? "—"}</span>
-        {props.confidence !== undefined && props.confidence !== null ? <span className="hint">conf {props.confidence.toFixed(2)}</span> : null}
+        <span className="hint" title={"原始来源：" + (props.source ?? "—")}>来源：{sourceLabel(props.source).text}</span>
+        {confidenceLabel(props.confidence).known
+          ? <span className="hint" title={"原始置信度：" + String(props.confidence)}>置信度 {confidenceLabel(props.confidence).text}</span>
+          : <span className="hint">置信度未知</span>}
         {inline && <span className="hint" style={{ wordBreak: "break-all" }}>{groups.map((g) => g.key + ": " + shortenPath(g.items.join("、"), 96)).join(" · ")}</span>}
         <span className="spacer" />
         {!inline && groups.map((g) => (

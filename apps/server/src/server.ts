@@ -10,6 +10,7 @@ import { MediaStore } from "./services/media";
 import { JobRunner } from "./jobs/runner";
 import { InboxWatcher } from "./services/watcher";
 import { registerRoutes } from "./http/routes";
+import { registerMediaCacheRoutes } from "./http/media-cache-routes";
 import { BoothClient } from "../../../packages/core/src/source/booth";
 import { DEFAULT_TAGS, TAGS_SEED_VERSION } from "../../../packages/core/src/categories/default-tags";
 import { DerivedCache } from "./services/pipeline/cache";
@@ -113,6 +114,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
     registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits, build: readBuildInfo() });
+    registerMediaCacheRoutes(fastify, { repo, dataDir, log });
     const distDir = opts.webDistDir ?? join(repoRoot, "apps", "web", "dist");
     if (existsSync(join(distDir, "index.html"))) {
       // wildcard 默认 true：否则 /assets/* 不注册，全部落到 SPA 兜底 → JS 以 text/html 返回导致白屏

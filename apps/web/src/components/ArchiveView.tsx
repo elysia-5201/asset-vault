@@ -65,6 +65,9 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
     completeness?: string;
     stoppedReason?: { code: string; message: string } | null;
     contentReadLimited?: boolean;
+    ready?: boolean;
+    reason?: string;
+    message?: string;
   }>({});
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -94,6 +97,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
             truncated: d.truncated, passwordProtected: d.passwordProtected, note: d.note,
             listing: d.listing ?? null, completeness: d.completeness,
             stoppedReason: d.stoppedReason ?? null, contentReadLimited: !!d.contentReadLimited,
+            ready: d.ready, reason: d.reason, message: d.message,
           });
         })
         .catch((e) => { if (alive) setErr(describeError(e)); })
@@ -223,6 +227,11 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
         <div className="hint">目录已完整列出；其中部分文件超过内容读取上限，预览/解压仍会受限（目录完整不等于文件都能解压）。</div>
       )}
       {meta.note && <div className="hint">{meta.note}</div>}
+      {meta.ready === false && (
+        <div className="notice">
+          {meta.message ?? "目录缓存未就绪；请使用「重解析」显式重建。"}
+        </div>
+      )}
 
       {tab === "tree" && !loading && !err && (
         <>

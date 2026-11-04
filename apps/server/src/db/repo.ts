@@ -1,9 +1,11 @@
 import type Database from "better-sqlite3";
 import { now, uid, ftsPhrase } from "../util";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
-import { normKey, type AssetRow, type AvatarAliasRow, type AvatarKind, type AvatarMatch, type AvatarRow, type CategoryAssignment, type CategoryNode, type CategoryRefSource, type CategorySuggestion, type ImageOrigin, type ImageRole, type ImageRow, type ItemCard, type ItemDetail, type ItemRow, type ItemStatus, type JobEvent, type JobKind, type JobRow, type JobState, type RootMode, type SourceSite, type UpdateKind } from "../../../../packages/core/src/contracts";
+import { AppError, normKey, type AssetRow, type AvatarAliasRow, type AvatarKind, type AvatarMatch, type AvatarRow, type CategoryAssignment, type CategoryNode, type CategoryRefSource, type CategorySuggestion, type ImageOrigin, type ImageRole, type ImageRow, type ItemCard, type ItemDetail, type ItemRow, type ItemStatus, type JobEvent, type JobKind, type JobRow, type JobState, type RootMode, type SourceSite, type UpdateKind } from "../../../../packages/core/src/contracts";
 import { UNCATEGORIZED_ID, type CategoryDef } from "../../../../packages/core/src/categories/taxonomy";
 import { resolveTransition } from "../../../../packages/core/src/contracts";
+import { mergeLoadoutItemsTx, type MergeLoadoutItemsResult } from "./loadouts";
+import { mergeCleanupIgnoresTx } from "./cleanup";
 
 export interface ItemQuery {
   q?: string; avatarIds?: number[]; avatarMatch?: "any" | "all"; ownedOnly?: boolean;
@@ -115,6 +117,8 @@ export class Repo {
   constructor(private db: Database.Database, opts: { disableReturning?: boolean } = {}) {
     if (opts.disableReturning) this.returningSupported = false;
   }
+  /** 底层连接（测试/诊断用；不改变任何写路径语义）。 */
+  get connection(): Database.Database { return this.db; }
 
   /**
    * 有界 LRU 语句缓存（v0.6.1 task-17）：动态 SQL（IN 列表/可变 SET）会生成不同文本，缓存必须封顶。
@@ -363,6 +367,24 @@ export class Repo {
     this.stmt("DELETE FROM item_images WHERE id = ? AND item_id = ?").run(imageId, itemId);
   }
   setCover(itemId: number, imageId: number): void { this.stmt("UPDATE items SET cover_image_id=?, updated_at=? WHERE id=?").run(imageId, now(), itemId); }
+  findImageBySha(itemId: number, sha256: string): ImageRow | null {
+    return (this.stmt("SELECT * FROM item_images WHERE item_id=? AND sha256=?").get(itemId, sha256) as ImageRow) ?? null;
+  }
+  /** 同一事务：删除该 item 的 archive 默认图 + 设置新封面；任一步失败整体回滚。 */
+  replaceArchiveImagesWithBooth(itemId: number, coverImageId: number): number {
+    const tx = this.db.transaction(() => {
+      const rows = this.stmt("SELECT id FROM item_images WHERE item_id=? AND origin='archive'").all(itemId) as any[];
+      for (const r of rows) this.deleteImage(itemId, Number(r.id));
+      this.setCover(itemId, coverImageId);
+      return rows.length;
+    });
+    return tx();
+  }
+  updateImage(id: number, patch: Partial<Pick<ImageRow, "role" | "origin" | "source_url" | "file_path" | "thumb_path" | "width" | "height" | "bytes" | "position">>): void {
+    const keys = Object.keys(patch).filter((k) => ["role", "origin", "source_url", "file_path", "thumb_path", "width", "height", "bytes", "position"].includes(k));
+    if (!keys.length) return;
+    this.stmt("UPDATE item_images SET " + keys.map((k) => k + "=?").join(", ") + " WHERE id=?").run(...keys.map((k) => (patch as any)[k]), id);
+  }
   /** 历史修复：有图但 cover_image_id 为空的条目，取第一张图当封面。 */
   fixMissingCovers(): { fixed: number } {
     const rows = this.stmt(`SELECT i.id AS item_id, (SELECT id FROM item_images im WHERE im.item_id=i.id ORDER BY im.position, im.id LIMIT 1) AS img
@@ -381,6 +403,41 @@ export class Repo {
   // （实测 getAssetByPathNorm 1 万次 +141MB，registerAssets 1 万 +513MB），统一走 stmt 缓存。
   getAsset(id: number): AssetRow | null { return (this.stmt("SELECT * FROM assets WHERE id=?").get(id) as AssetRow) ?? null; }
   getAssetByPathNorm(p: string): AssetRow | null { return (this.stmt("SELECT * FROM assets WHERE path_norm=?").get(p) as AssetRow) ?? null; }
+  /**
+   * 资产归属变更的共享检查（import-precheck spec §9.1）：同 owner 幂等；带 asset_version_links
+   * 的资产只允许在合并事务（ctx.merge === true）里换 owner，否则 409 ASSET_HAS_VERSION_LINKS。
+   * 这是应用层保证，不是任意 SQL 的库层约束（库层只有关系侧触发器）。
+   */
+  assertAssetOwnerChange(assetId: number, newItemId: number, ctx: { merge?: boolean } = {}): void {
+    const existing = this.getAsset(assetId);
+    if (!existing || existing.item_id === newItemId) return;
+    const linked = this.stmt("SELECT 1 FROM asset_version_links WHERE asset_a_id=? OR asset_b_id=? LIMIT 1").get(assetId, assetId);
+    if (linked && ctx.merge !== true) {
+      throw new AppError("CONFLICT", "资产有版本关系，不能直接改归属", 409, { code: "ASSET_HAS_VERSION_LINKS" });
+    }
+  }
+  /**
+   * 资产 + 版本关系同事务迁移（spec §9.1）：mergeItems / moveAssets / link-booth 共用。
+   * 逐 asset 先过共享检查；事务末断言关系两侧 owner 与关系行一致，不一致即整体回滚。
+   * 保留关系 id/state/version/created_at/decided_at（只改 item_id/updated_at）。
+   */
+  moveAssetsAndVersionLinksTx(fromItemId: number, toItemId: number, ctx: { merge?: boolean } = {}): { assets: number; links: number } {
+    if (fromItemId === toItemId) return { assets: 0, links: 0 };
+    const tx = this.db.transaction(() => {
+      const ids = this.stmt("SELECT id FROM assets WHERE item_id=?").all(fromItemId) as { id: number }[];
+      for (const a of ids) this.assertAssetOwnerChange(a.id, toItemId, ctx);
+      const assets = this.stmt("UPDATE assets SET item_id=? WHERE item_id=?").run(toItemId, fromItemId).changes;
+      const links = this.stmt("UPDATE asset_version_links SET item_id=?, updated_at=? WHERE item_id=?").run(toItemId, now(), fromItemId).changes;
+      const bad = (this.stmt(
+        "SELECT COUNT(*) AS n FROM asset_version_links l " +
+        "JOIN assets a ON a.id = l.asset_a_id JOIN assets b ON b.id = l.asset_b_id " +
+        "WHERE l.item_id <> a.item_id OR l.item_id <> b.item_id"
+      ).get() as { n: number }).n;
+      if (bad !== 0) throw new AppError("CONFLICT", "合并后资产归属不一致", 409);
+      return { assets, links };
+    });
+    return tx();
+  }
   upsertAsset(input: { item_id: number; kind: AssetRow["kind"]; container: AssetRow["container"]; path: string; path_norm: string; root_id: number; size: number; mtime?: string | null; discovered_by: AssetRow["discovered_by"] }): { asset: AssetRow; created: boolean } {
     const existing = this.getAssetByPathNorm(input.path_norm);
     if (existing) {
@@ -389,6 +446,8 @@ export class Repo {
       // 未变化时不动 sha256/sha256_state（避免每次扫描都把已算好的哈希打成 pending）。
       const contentChanged = Number(existing.size) !== Number(input.size)
         || String(existing.mtime ?? "") !== String(input.mtime ?? "");
+      // 共享归属检查（spec §9.1）：非 merge 路径不得静默改带版本关系资产的 owner。
+      this.assertAssetOwnerChange(existing.id, input.item_id, { merge: false });
       this.stmt(
         "UPDATE assets SET item_id=?, size=?, mtime=?, status='present', last_verified_at=?, " +
         "sha256 = CASE WHEN ?=1 THEN NULL ELSE sha256 END, " +
@@ -552,30 +611,31 @@ export class Repo {
     ).get() as any)?.c ?? 0);
   }
   /**
-   * 合并条目：把 source 的资产/图片/模型/标签/更新历史/导入登记迁到 target，source 软删（可恢复）。
+   * 合并条目：把 source 的资产/模型/标签/更新历史/导入登记迁到 target；图片不迁移（source 的图留在 source，target 无封面时只用 target 自己的第一张图补封面）；source 软删（可恢复）。
    * 用于"同一商品的模型包 + 材质包分两个压缩包"这种应当算一条素材的情况。
    */
-  mergeItems(sourceId: number, targetId: number): { movedAssets: number; movedImages: number; targetId: number; categoryInherited: boolean; categoryConflicts: { categoryId: string; sourceCategoryId: string; targetCategoryId: string; kept: "target" }[] } {
+  mergeItems(sourceId: number, targetId: number): { movedAssets: number; movedImages: number; targetId: number; categoryInherited: boolean; categoryConflicts: { categoryId: string; sourceCategoryId: string; targetCategoryId: string; kept: "target" }[]; loadoutMerge: MergeLoadoutItemsResult; cleanupIgnoresMoved: number } {
     if (sourceId === targetId) throw Object.assign(new Error("不能合并到自己"), { code: "INVALID_INPUT", status: 400 });
     const src = this.stmt("SELECT * FROM items WHERE id=?").get(sourceId) as any;
     const tgt = this.stmt("SELECT * FROM items WHERE id=?").get(targetId) as any;
     if (!src || !tgt) throw Object.assign(new Error("条目不存在"), { code: "NOT_FOUND", status: 404 });
     const now2 = now();
     const tx = this.db.transaction(() => {
-      const movedAssets = this.stmt("UPDATE assets SET item_id=? WHERE item_id=?").run(targetId, sourceId).changes;
-      const movedImages = this.stmt("UPDATE item_images SET item_id=? WHERE item_id=?").run(targetId, sourceId).changes;
-      // 目标没有封面时，借用来源的封面
-      if (!tgt.cover_image_id && src.cover_image_id) {
-        this.stmt("UPDATE items SET cover_image_id=? WHERE id=?").run(src.cover_image_id, targetId);
-      } else if (!tgt.cover_image_id) {
+      // 资产 + 版本关系同事务迁移（spec §9.1）；动态派发，便于测试注入失败路径。
+      const moved = this.moveAssetsAndVersionLinksTx(sourceId, targetId, { merge: true });
+      const movedAssets = moved.assets;
+      // 审计（spec §10 ④）：同一事务内记录本次合并迁移的版本关系数；links=0 也记，保证每次合并可追溯。
+      this.logAudit("merge.version_links_moved", "item", String(targetId), { sourceItemId: sourceId }, { links: moved.links });
+      // P1-T5（spec §9.1）：清单成员与整理忽略在同一事务内合并（两个 hook 自带审计/回滚）。
+      // 任一 hook 抛错（CAS 0 行、审计失败、触发器 ABORT）→ 整个 mergeItems 回滚。
+      const loadoutMerge = mergeLoadoutItemsTx(this.db, sourceId, targetId, now2);
+      const cleanupIgnoresMoved = mergeCleanupIgnoresTx(this.db, sourceId, targetId);
+      // 缩略图规则：合并只保留 target 原有图片；source 图片留在 source（不迁入、不借封面）。
+      const movedImages = 0;
+      if (!tgt.cover_image_id) {
         const first = this.stmt("SELECT id FROM item_images WHERE item_id=? ORDER BY position, id LIMIT 1").get(targetId) as any;
         if (first) this.stmt("UPDATE items SET cover_image_id=? WHERE id=?").run(first.id, targetId);
       }
-      this.stmt("UPDATE item_images SET position = position + 1000 WHERE item_id=?").run(targetId);
-      this.stmt("UPDATE item_images SET position = position - 1000 WHERE item_id=? AND position >= 1000").run(targetId);
-      // FIX-08：图片已迁到 target；source 的 cover_image_id 必须清空，否则 source 仍引用已迁走的图，
-      // 之后删除该图会被 ON DELETE RESTRICT 拒绝（merge → 删除第一张缩略图即报错）。
-      this.stmt("UPDATE items SET cover_image_id=NULL WHERE id=?").run(sourceId);
       // 模型关联：并集，人工/已确认优先
       const srcAv = this.stmt("SELECT * FROM item_avatars WHERE item_id=?").all(sourceId) as any[];
       for (const a of srcAv) {
@@ -634,7 +694,14 @@ export class Repo {
       }
       const sets = Object.entries(patch).map(([k]) => k + " = ?");
       this.stmt("UPDATE items SET " + sets.join(", ") + ", updated_at=? WHERE id=?").run(...Object.values(patch) as any[], now2, sourceId);
-      return { movedAssets, movedImages, targetId, categoryInherited, categoryConflicts };
+      // 事务末断言（spec §9.1）：关系两侧 owner 必须与关系行一致，否则整体回滚。
+      const badLinks = (this.stmt(
+        "SELECT COUNT(*) AS n FROM asset_version_links l " +
+        "JOIN assets a ON a.id = l.asset_a_id JOIN assets b ON b.id = l.asset_b_id " +
+        "WHERE l.item_id <> a.item_id OR l.item_id <> b.item_id"
+      ).get() as { n: number }).n;
+      if (badLinks !== 0) throw new AppError("CONFLICT", "合并后资产归属不一致", 409);
+      return { movedAssets, movedImages, targetId, categoryInherited, categoryConflicts, loadoutMerge, cleanupIgnoresMoved };
     });
     const r = tx();
     this.syncFts(targetId);
@@ -644,8 +711,8 @@ export class Repo {
 
   /** 把某条目的资产整体挪到另一条目（用于"本地条目关联 BOOTH 商品后发现重复"的合并）。 */
   moveAssets(fromItemId: number, toItemId: number): number {
-    const r = this.stmt("UPDATE assets SET item_id = ? WHERE item_id = ?").run(toItemId, fromItemId);
-    return r.changes;
+    // 共享事务（spec §9.1）：资产与 asset_version_links 同事务迁移；link-booth 仍只移资产。
+    return this.moveAssetsAndVersionLinksTx(fromItemId, toItemId, { merge: true }).assets;
   }
   /**
    * 批量标缺失。SQLite 变量上限 32766：必须分块，否则大库（>3.2 万资产）整轮 scan 在写完资产后失败（verifier A4）。

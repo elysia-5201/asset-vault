@@ -147,6 +147,12 @@ export interface AssetTreeResponse {
   mode?: string | null;
   /** ?nested=<包内路径> 时返回的是内层压缩包的目录 */
   path?: string;
+  /** 目录缓存是否就绪（false 时 entries 为空，不得当作合法空目录） */
+  ready?: boolean;
+  /** CACHE_MISSING | NESTED_NOT_CACHED | NOT_APPLICABLE */
+  reason?: string;
+  /** 面向用户的未就绪说明 */
+  message?: string;
 }
 /** 压缩包里解析出来的那个 .unitypackage（一个压缩包里可能有好几个）。 */
 export interface UnityPackageInside {
@@ -853,5 +859,182 @@ export interface StagingCleanupResult {
   bytes: number;
   /** 清理失败（如文件被占用）的条目数 */
   failed: number;
+}
+
+
+export interface MediaCacheCandidate { path: string; size: number; mtimeMs: number }
+export interface MediaCacheUsage { mediaRoot: string; totalFiles: number; totalBytes: number; candidates: MediaCacheCandidate[]; protected: { referenced: number; recent: number; unknown: number; symlink: number }; scannedAt: number; blockedReason?: string }
+export interface MediaCachePreview extends MediaCacheUsage { token: string; expiresAt: number }
+export interface MediaCacheCleanupResult { deleted: number; failed: number; skipped: number; bytesFreed: number }
+
+// ---------------- feature123：导入预检 / 版本关系 / 搭配清单 / 清理待办 ----------------
+// 字段名与可空性来自三份已批准 spec（import-precheck §6.1/§6.2、avatar-loadouts §5/§6、cleanup-todos §6）；
+// 服务端行类型由各 db/*.ts 自己定义（*Row 后缀），这里只定义 web 消费的响应形状。
+
+/** POST /api/import/precheck 响应（只读预检；spec §6.1）。 */
+export interface PrecheckResponse {
+  checkedAt: string;
+  budget: { maxBytes: number; maxMs: number; usedBytes: number; usedMs: number; truncated: boolean };
+  results: PrecheckResult[];
+}
+
+/** 单文件预检结果；match 六字段互相独立，可同时非空。 */
+export interface PrecheckResult {
+  path: string;
+  pathNorm: string;
+  group: { rootPath: string; rootId: number | null };
+  size: number;
+  mtime: string;
+  hash: { state: "ok" | "unknown"; sha256?: string; reason?: string };
+  match: {
+    exact: { itemId: number; assetId: number; path: string; size: number; hashFresh: boolean; rehashVerified: boolean } | null;
+    sameProduct: { itemId: number; sourceItemId: string; title: string; status: ItemStatus } | null;
+    version: {
+      relation: "newer" | "older" | "same" | "unknown";
+      incomingKey: string;
+      existingKey: string;
+      basis: "filename" | "title";
+      proven: boolean;
+      existingAssetId: number;
+    } | null;
+    companion: { markers: string[] } | null;
+    weak: { reason: "existing_hash_stale" | "existing_hash_unverified" | "existing_hash_mismatch" | "name_size_hint" } | null;
+    pathCollision: { itemId: number; assetId: number; path: string; pathNorm: string; sameItem: boolean } | null;
+  };
+  summary: "exact" | "version-candidate" | "companion-candidate" | "same-product" | "pathCollision" | "weak" | "unknown" | "none";
+  warnings: string[];
+}
+
+/** GET /api/items/:id/version-links 的 links 元素（spec §6.2）。 */
+export interface VersionLink {
+  id: number;
+  assetAId: number;
+  assetBId: number;
+  relation: "a_newer" | "b_newer" | "same" | "companion";
+  basis: "filename" | "title" | "manual";
+  state: "candidate" | "confirmed" | "revoked";
+  evidence: unknown;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  decidedAt: string | null;
+  assets: {
+    a: { id: number; path: string; size: number; mtime: string };
+    b: { id: number; path: string; size: number; mtime: string };
+  };
+}
+
+/** 清单项状态（手动声明，无状态机；spec §5.2）。 */
+export type LoadoutState = "planned" | "imported" | "verified";
+
+/** 搭配清单（列表项形状 + 单行响应可带的 version/createdAt；spec §6.1）。 */
+export interface Loadout {
+  id: number;
+  avatarId: number;
+  name: string;
+  note: string | null;
+  sort: number;
+  itemCount: number;
+  stateCounts: { planned: number; imported: number; verified: number };
+  trashedCount: number;
+  updatedAt: string;
+  version?: number;
+  createdAt?: string;
+}
+
+/** 清单条目（loadout_items 行 + 只读证据 + 卡片；spec §6.3）。 */
+export interface LoadoutItem {
+  itemId: number;
+  state: LoadoutState;
+  note: string | null;
+  position: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  evidence: {
+    registered: boolean;
+    referenced: boolean;
+    verified: boolean;
+    registeredAt: string | null;
+    referencedAt: string | null;
+    verifiedAt: string | null;
+  };
+  item: ItemCardWeb;
+}
+
+/** GET /api/loadouts/:id 响应（spec §6.1）。 */
+export interface LoadoutDetail {
+  loadout: Loadout;
+  total: number;
+  stateCounts: { planned: number; imported: number; verified: number };
+  visibleStateCounts: { planned: number; imported: number; verified: number };
+  trashedCount: number;
+  items: LoadoutItem[];
+}
+
+/** 清理待办规则（spec §3）。 */
+export type CleanupRule = "missing_cover" | "missing_source" | "unlinked_model" | "missing_file";
+
+/** local 来源策略（必填、无服务端默认；spec §3.2.1）。 */
+export type LocalSourcePolicy = "exclude_local" | "include_local";
+
+/**
+ * 待办行（spec §6.1）；evidence 随 rule 变化，按服务端实际 DTO 声明（Ruling26）。
+ * 旧声明对所有规则都写 imageCount 属于过宣：只有 missing_cover 有该字段。
+ */
+export type CleanupTodoRow =
+  | { item: ItemCardWeb; rule: "missing_cover"; ignored: boolean; resolved: boolean | null; evidence: { imageCount: number } }
+  | { item: ItemCardWeb; rule: "missing_source"; ignored: boolean; resolved: boolean | null; evidence: { sourceSite: string; sourceGone: number } }
+  | { item: ItemCardWeb; rule: "unlinked_model"; ignored: boolean; resolved: boolean | null; evidence: { itemAvatarCount: number; assetAvatarCount: number } }
+  | { item: ItemCardWeb; rule: "missing_file"; ignored: boolean; resolved: boolean | null; evidence: { missingAssetCount: number } };
+
+/** GET /api/cleanup/todos 响应（spec §6.1）。 */
+export interface CleanupTodosResponse {
+  total: number;
+  counts: {
+    missing_cover: { total: number; ignored: number };
+    missing_source: { total: number; ignored: number; localExcluded: number };
+    unlinked_model: { total: number; ignored: number };
+    missing_file: { total: number; ignored: number };
+  };
+  items: CleanupTodoRow[];
+}
+
+/** 忽略行（spec §6.2）。 */
+export interface CleanupIgnore {
+  itemId: number;
+  rule: CleanupRule;
+  note: string | null;
+  ignoredAt: string;
+  resolved: boolean;
+  item: { id: number; title: string; status: ItemStatus };
+}
+
+/** GET /api/cleanup/ignores 响应（spec §6.2）。 */
+export interface CleanupIgnoresResponse {
+  total: number;
+  ignores: CleanupIgnore[];
+}
+
+/** 保存筛选的结构（严格校验，未知键拒绝；spec §6.3）。 */
+export interface CleanupFilter {
+  rule?: CleanupRule;
+  q?: string;
+  avatarIds?: number[];
+  categoryIds?: string[];
+  ignored?: "hide" | "show" | "only";
+  localSourcePolicy: LocalSourcePolicy;
+  sort?: "updated" | "title";
+  limit?: number;
+}
+
+/** 保存筛选行（spec §6.3）。 */
+export interface CleanupFilterRow {
+  id: number;
+  name: string;
+  filter: CleanupFilter;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
 }
 

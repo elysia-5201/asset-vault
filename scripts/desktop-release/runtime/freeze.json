@@ -1,0 +1,71 @@
+{
+  "task": "task-118",
+  "files": [
+    {
+      "name": "apply.ps1",
+      "bytes": 2623,
+      "sha256": "da655bc33452ac236cca27b4a0062cf068b86c91959179307a105807f70d5c40"
+    },
+    {
+      "name": "archive-marker.ps1",
+      "bytes": 3358,
+      "sha256": "98690a496d1e465d181619148aea50c39a6e3b4cefc600d0734b2666e22afd83"
+    },
+    {
+      "name": "backup-db.ps1",
+      "bytes": 5243,
+      "sha256": "f6463f667a7ffc23500ec2957bac731afd57fb0b1854022d56ffc61b28ff2659"
+    },
+    {
+      "name": "close.ps1",
+      "bytes": 4255,
+      "sha256": "42071a28d761a838951595fea4bd04fd9095c84fb1ef6d291d10367ab0e14c3a"
+    },
+    {
+      "name": "controls.mjs",
+      "bytes": 20816,
+      "sha256": "3fbe1c6b308182a4c09766818f185778f6d5b37dcf827c4999b9a06d84ce7ff0"
+    },
+    {
+      "name": "exec-schema.ps1",
+      "bytes": 20694,
+      "sha256": "1c42b2268a8aade90801b643bf4b87549f8d7ab291649cef5605021023a304c4"
+    },
+    {
+      "name": "fixture-manifest.sample.json",
+      "bytes": 1822,
+      "sha256": "59876dc306bdceda0e6c36fefaf23dea6c451927781e835f5f3e169f32d8c739"
+    },
+    {
+      "name": "fixture.ps1",
+      "bytes": 14078,
+      "sha256": "c535fa9f22ebd0b1fe8d09949353075d2769b752d7dcfc97ef9a5001bfa0e241"
+    },
+    {
+      "name": "guard.ps1",
+      "bytes": 10031,
+      "sha256": "c35c6b3fbca931d7557cc0bf5c660917c87ffa9f3861b864f7c56658e761fea9"
+    },
+    {
+      "name": "io-core.ps1",
+      "bytes": 5251,
+      "sha256": "0ee06b189f860a9e6599cd259ecffc074ea8632480e0c68b17df750bd8b121e1"
+    },
+    {
+      "name": "manifest-gen.mjs",
+      "bytes": 2953,
+      "sha256": "5eac518a2864594c07b67a050b98f9dbf86cb243e9d791fd3a2157ee1b1795da"
+    },
+    {
+      "name": "start.ps1",
+      "bytes": 4851,
+      "sha256": "f18f27004bbac2e3d6ec6368b8b6823ac213bfbe4d601f53025dd5c8173a045a"
+    },
+    {
+      "name": "transport.mjs",
+      "bytes": 2027,
+      "sha256": "56203f8bf3fd93e646936909bf8db21ab0cf786ca899cbf1cbd73fd807a7ebb6"
+    }
+  ],
+  "aggregate": "b07f072e843e015c934c8adaa37443be812297e2a5e502d566ae306549364782"
+}

@@ -1,11 +1,12 @@
 import { readdirSync, statSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
-import type { JobEvent, JobRow } from "../../../../packages/core/src/contracts";
+import { AppError, type JobEvent, type JobRow } from "../../../../packages/core/src/contracts";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { BoothClient } from "../../../../packages/core/src/source/booth";
 import { DEFAULT_JOB_HEARTBEAT_MS, DEFAULT_JOB_LEASE_MS, LeaseLostError, type JobFence, type JobLease, type Repo } from "../db/repo";
 import { importBoothUrl } from "../services/booth";
+import { assertNoForeignOwner, shouldSkipForOwnerConflict, verifyAcceptedFile } from "../services/import-files";
 import { indexAsset } from "../services/indexing";
 import { matchItem } from "../services/match";
 import { checkItemUpdate } from "../services/updates";
@@ -164,12 +165,24 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
 
     // ---- resolving ----
     if (job().kind === "scan" || job().kind === "import_file") {
-      const rootRow = payload.rootId ? (repo.listRoots() as any[]).find((r) => r.id === payload.rootId) : null;
+      const roots = repo.listRoots() as any[];
+      const rootRow = payload.rootId ? roots.find((r) => r.id === payload.rootId) : null;
       const scanPath: string = payload.path ?? rootRow?.path;
       if (!scanPath) throw new Error("scan/import 缺少 path 或 rootId");
-      const rootId = rootRow?.id ?? repo.ensureRoot(scanPath, "index_in_place").id;
       // import_file 可能直接指向单个文件（收件箱监听就是这种）；单文件不走目录遍历
       const isFile = statSync(scanPath).isFile();
+      // 接受列表的 group 是预检协议（rootPath/rootId），不是新 API：
+      //  - 有效 rootId 直接复用；
+      //  - rootId 为空时用 group.rootPath（目录展开保留外层根，嵌套文件不会各建一个根）；
+      //  - 真正无 group 的文件才回退 dirname；legacy 目录/扫描仍用 scanPath。
+      const group = payload.group && typeof payload.group === "object" ? payload.group : null;
+      const groupRootId = group && Number.isInteger(group.rootId) && group.rootId > 0
+        ? roots.find((r) => r.id === group.rootId)?.id ?? null
+        : null;
+      const groupRootPath = group && typeof group.rootPath === "string" && group.rootPath ? group.rootPath : null;
+      const rootId = rootRow?.id
+        ?? groupRootId
+        ?? repo.ensureRoot(groupRootPath ?? (isFile ? dirname(scanPath) : scanPath), "index_in_place").id;
       // M1：预览生成分支（只写 scan_preview_*，不建条目/资产；scanpreview 自己走 onBatch）
       if (payload.mode === "preview" && payload.previewId) {
         // task-20 R4：预览也接 limits（limit=本轮候选上限，batchSize=流式批大小，signal=可取消）
@@ -204,7 +217,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           return rel === "" ? 0 : rel.split("/").length - 1;
         };
         // v0.6.1-G2：只保留计数，不再保留 filesOut/seen/assetIds/fileNames（按批消费后立即丢弃）
-        let filesSeen = 0, assetNew = 0, assetChanged = 0, assetQueued = 0, batches = 0, throttled = 0;
+        let filesSeen = 0, assetNew = 0, assetChanged = 0, assetQueued = 0, batches = 0, throttled = 0, ownerSkipped = 0;
         let scan: ScanStats | null = null;
         let scanGate: { allowed: boolean; reasons: string[] } | null = null;
         const manifest = repoScanManifest(repo);
@@ -241,7 +254,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
          * scan.ts 只在 onBatch **成功返回后**才把本批 path_norm 写进 manifest（未提交批次不记）。
          * 批内抛错 ⇒ 整批回滚 + walk 中止 + 作业失败；重放时 upsertAsset 幂等（created=0，无孤儿条目）。
          */
-        const registerBatch = async (files: ScannedFile[], stats: WalkBatchStats | null): Promise<void> => {
+        const registerBatch = async (files: ScannedFile[], stats: WalkBatchStats | null, opts?: { strictOwner?: boolean }): Promise<void> => {
           ensureLease();
           if (files.length === 0) return;
           const g = await waitGate();
@@ -257,18 +270,44 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           let enqueuedNow = 0;
           repo.transaction(() => {
             for (const plan of plans) {
-              let itemId: number | null = null;
+              // N3/§9.1：createItem 之前逐文件做归属门。
+              //  - strict（新 files/expected 形状）：跨 owner（含新建意图）→ 抛 PATH_OWNED_BY_OTHER_ITEM，该文件失败；
+              //    禁止把既有 asset.owner 反推成预期 target 来蒙混同 owner。
+              //  - 非 strict（legacy/apply/目录）：只有“跨 owner 且带 version links”才跳过该文件（不迁老 owner），
+              //    无 link 保持旧 upsert 改 owner 语义；整批继续；若整组都冲突则不建空 item。
+              let targetItemId: number | null = null;
               if (plan.sourceItemId) {
-                const ex = repo.getItemBySource("booth", plan.sourceItemId);
-                if (ex) itemId = ex.id;
-                else itemId = repo.createItem({ title: plan.title, source_site: "booth", source_item_id: plan.sourceItemId, id_confidence: plan.confidence, id_match_method: plan.method, status: "active" }).id;
-              } else {
-                // 幂等：该物理路径已登记过资产 → 复用它所属条目，不重复建卡
+                targetItemId = repo.getItemBySource("booth", plan.sourceItemId)?.id ?? null;
+              } else if (!opts?.strictOwner) {
+                // legacy 幂等：该物理路径已登记过资产 → 复用它所属条目，不重复建卡
                 for (const a of plan.assets) {
                   const ex = repo.getAssetByPathNorm(normalizePath(a.file.path));
-                  if (ex) { itemId = ex.item_id; break; }
+                  if (ex) { targetItemId = ex.item_id; break; }
                 }
-                if (itemId === null) itemId = repo.createItem({ title: plan.title, source_site: "local", status: "inbox" }).id;
+              }
+              const passing: typeof plan.assets = [];
+              for (const a of plan.assets) {
+                const norm = normalizePath(a.file.path);
+                if (opts?.strictOwner) {
+                  assertNoForeignOwner(repo, targetItemId, norm);
+                  passing.push(a);
+                  continue;
+                }
+                const conflict = shouldSkipForOwnerConflict(repo, targetItemId, norm);
+                if (conflict.skip) {
+                  ownerSkipped++;
+                  repo.logJobEvent(jobId, null, job().state, "asset_owner_conflict_skipped",
+                    JSON.stringify({ path: a.file.path, itemId: conflict.itemId, assetId: conflict.assetId }), lease);
+                  continue;
+                }
+                passing.push(a);
+              }
+              if (plan.assets.length > 0 && passing.length === 0) continue; // 全冲突：不建空 item
+              let itemId: number | null = targetItemId;
+              if (itemId === null) {
+                itemId = plan.sourceItemId
+                  ? repo.createItem({ title: plan.title, source_site: "booth", source_item_id: plan.sourceItemId, id_confidence: plan.confidence, id_match_method: plan.method, status: "active" }).id
+                  : repo.createItem({ title: plan.title, source_site: "local", status: "inbox" }).id;
               }
               if (plan.sourceItemId && !repo.getItem(itemId)!.sourceUrl) {
                 // D7 修复：自动匹配的条目必须带回溯链接，否则无法做更新检查基线
@@ -276,7 +315,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
                 repo.updateItem(itemId, { source_url: url, canonical_url: url }, fence);
               }
               batchItemIds.push(itemId);
-              for (const a of plan.assets) {
+              for (const a of passing) {
                 const reg = registerAssets(repo, rootId, scanPath, itemId, a.file, "scan");
                 if (reg.created) assetNew++;
                 else if (reg.changed) assetChanged++;
@@ -331,12 +370,32 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
             await registerBatch(part, { files: Math.min(i + part.length, files.length), dirs: 0, bytes: 0, truncated: false, batch: Math.floor(i / batchSize) + 1, batchFiles: part.length });
           }
         } else if (isFile) {
+          // N3：接受列表（files 新形状）在 registerBatch 之前按 expected 重验；失败只记事件并让作业失败，
+          // 不建 item/asset。legacy 单文件（无 expected）保持旧行为。
+          const strictOwner = !!payload.expected;
+          if (strictOwner) {
+            const v = await verifyAcceptedFile({ repo }, { path: scanPath, expected: payload.expected, group: payload.group });
+            if (!v.ok) {
+              repo.logJobEvent(jobId, null, job().state, "precheck_stale",
+                JSON.stringify({ path: scanPath, reason: v.reason }), lease);
+              throw new AppError("CONFLICT", `precheck stale: ${scanPath}`, 409, { code: "PRECHECK_STALE" });
+            }
+          }
           const ext = extname(scanPath).toLowerCase();
           const sf: ScannedFile = {
             path: scanPath, size: statSync(scanPath).size, mtime: statSync(scanPath).mtime.toISOString(),
             container: ext.slice(1) as any, kind: ext === ".unitypackage" ? "unitypackage" : "archive",
           };
-          await registerBatch([sf], { files: 1, dirs: 0, bytes: sf.size, truncated: false, batch: 1, batchFiles: 1 });
+          try {
+            await registerBatch([sf], { files: 1, dirs: 0, bytes: sf.size, truncated: false, batch: 1, batchFiles: 1 }, { strictOwner });
+          } catch (e) {
+            // 事务已回滚：在事务外补一条明确的失败事件（reason + 双方 id），再让作业失败。
+            if (strictOwner && e instanceof AppError && e.details?.code === "PATH_OWNED_BY_OTHER_ITEM") {
+              repo.logJobEvent(jobId, null, job().state, "asset_owner_conflict_failed",
+                JSON.stringify({ path: scanPath, reason: "PATH_OWNED_BY_OTHER_ITEM", itemId: e.details.itemId, assetId: e.details.assetId }), lease);
+            }
+            throw e;
+          }
         } else {
           // 流式发现：walk 内部每批回调；filesOut 恒为空，不再把全量候选堆在内存里
           scan = await walkCandidates(scanPath, { maxDepth, limit: maxScanFiles, batchSize, manifest, signal, onBatch: (files, stats) => registerBatch(files, stats) });
@@ -368,7 +427,7 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
           if (ids.length) { repo.markAssetsMissing(ids, fence); deps.log(`apply job ${jobId}: marked ${ids.length} asset(s) missing (user-confirmed)`); }
         }
         scratch.scanQueued = assetQueued;
-        scratch.note = `scan: files=${scan?.files ?? filesSeen} new=${assetNew} changed=${assetChanged} queued=${assetQueued} batches=${batches}${throttled ? " throttled=" + throttled : ""} ${isFile ? "(single file)" : ""}` +
+        scratch.note = `scan: files=${scan?.files ?? filesSeen} new=${assetNew} changed=${assetChanged} queued=${assetQueued} batches=${batches}${throttled ? " throttled=" + throttled : ""}${ownerSkipped ? " ownerSkipped=" + ownerSkipped : ""} ${isFile ? "(single file)" : ""}` +
           (scanGate && !scanGate.allowed ? ` INCOMPLETE(${scanGate.reasons.join(",")})` : "");
       }
     } else if (job().kind === "structure") {

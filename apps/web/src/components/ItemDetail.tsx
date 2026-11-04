@@ -11,6 +11,9 @@ import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, Ite
 import { unityPackageRelPath, type WorkbenchFocus } from "../workbench-focus";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
+import { MergePreview } from "./MergePreview";
+import { VersionLinksSection } from "./VersionLinksSection";
+import { AddToLoadoutButton } from "./AddToLoadoutButton";
 import { CategoryEditor } from "./CategoryEditor";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
@@ -53,6 +56,11 @@ export function ItemDetail(props: {
   onOpenItem: (itemId: number) => void;
   /** 打开「头像工作台」——唯一合法的导入入口（计划 → 风险确认 → 作业）；带上本页勾选的包作为上下文。 */
   onOpenWorkbench?: (focus: WorkbenchFocus) => void;
+  /**
+   * 用户在头像轨显式选中的模型（恰好一个时才有值）。只用于「加入搭配清单」的显式目标，
+   * 不从条目的适配模型自动推断；null = 未选/多选，按钮只提示。
+   */
+  selectedAvatarId?: number | null;
 }) {
   const { itemId } = props;
   const [detail, setDetail] = useState<ItemDetailWeb | null>(null);
@@ -70,6 +78,7 @@ export function ItemDetail(props: {
   const [mergeHits, setMergeHits] = useState<{ id: number; title: string }[]>([]);
   const [boothBusy, setBoothBusy] = useState(false);
   const [boothHint, setBoothHint] = useState("");
+  const [mergePreview, setMergePreview] = useState<{ sourceId: number; targetId: number } | null>(null);
   const [localTags, setLocalTags] = useState<string[] | null>(null);
   const [localTagNote, setLocalTagNote] = useState(false);
   const [order, setOrder] = useState<number[] | null>(null);
@@ -458,7 +467,11 @@ export function ItemDetail(props: {
                   <button
                     className="btn"
                     disabled={!boothUrl.trim() || boothBusy}
-                    onClick={() => runBoothLink(boothUrl, (r) => "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "，抓取 " + (r?.images ?? 0) + " 张图")}
+                    onClick={() => runBoothLink(boothUrl, (r) => {
+                      const s = r?.imageStats;
+                      if (!s) return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "，抓取 " + (r?.images ?? 0) + " 张图";
+                      return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "：下载成功 " + s.downloaded + " / 新增 " + s.added + " / 复用 " + s.reused + " / 内容重复 " + s.duplicates + " / 失败 " + s.failed;
+                    })}
                   >抓取</button>
                   {boothBusy && <Spinner />}
                 </div>
@@ -522,8 +535,8 @@ export function ItemDetail(props: {
                         key={m.id}
                         className="btn tiny"
                         disabled={busy}
-                        title={"把 #" + m.id + "「" + m.title + "」合并到本条（它的压缩包/图片/标签并过来，它进回收站、可恢复）"}
-                        onClick={() => { if (window.confirm("把 #" + m.id + "「" + m.title + "」并进本条？\n它的压缩包/图片/标签/模型会归到本条，#" + m.id + " 进回收站（可恢复）。")) guard(mergeItems(m.id, itemId), "已把 #" + m.id + " 并入本条"); }}
+                        title={"把 #" + m.id + "「" + m.title + "」合并到本条（它的压缩包/标签/模型并过来；图片保留在原条目，它进回收站、可恢复）"}
+                        onClick={() => setMergePreview({ sourceId: m.id, targetId: itemId })}
                       >#{m.id} {m.title.slice(0, 20)} ⤵并入</button>
                     ))}
                   </div>
@@ -537,7 +550,7 @@ export function ItemDetail(props: {
               <div className="hr" />
               <label className="hint">
                 合并到另一条目（方向：<b>本条 → 目标</b>，单向；搜索只查其他条目、不含本条。合并后本条进回收站——
-                「恢复」只恢复条目状态，已并过去的压缩包/图片/标签/模型不会自动迁回）
+                「恢复」只恢复条目状态，已并过去的压缩包/标签/模型不会自动迁回；图片保留在原条目）
               </label>
               <div className="row">
                 <input placeholder="搜索目标条目标题…" value={mergeQ} onChange={(e) => { setMergeQ(e.target.value); const q = e.target.value.trim(); if (q.length >= 2) listItems({ q, limit: 6 }).then((r) => setMergeHits(r.items.filter((x) => x.id !== itemId).map((x) => ({ id: x.id, title: x.title })))).catch(() => setMergeHits([])); else setMergeHits([]); }} style={{ flex: 1 }} />
@@ -548,7 +561,7 @@ export function ItemDetail(props: {
               {mergeHits.length > 0 && (
                 <div className="row wrap" style={{ gap: "4px", marginTop: "4px" }}>
                   {mergeHits.map((h) => (
-                    <button key={h.id} className="btn tiny" onClick={() => { if (window.confirm("把本条合并到 #" + h.id + "「" + h.title + "」？本条会进回收站。")) guard(mergeItems(itemId, h.id), "已合并到 #" + h.id); }}>#{h.id} {h.title.slice(0, 24)}</button>
+                    <button key={h.id} className="btn tiny" onClick={() => setMergePreview({ sourceId: itemId, targetId: h.id })}>#{h.id} {h.title.slice(0, 24)}</button>
                   ))}
                 </div>
               )}
@@ -782,6 +795,15 @@ export function ItemDetail(props: {
                   <b>但「全アバター対応 / N アバター対応」的工具类素材（插件、姿势、着色器）本来就该匹配一大堆</b>，那种别删。
                 </div>
               )}
+              {/* 加入搭配清单（spec §7.1）：模型由父传入的显式选择，未选只提示、不推断。 */}
+              <div className="row wrap" style={{ marginTop: "7px" }}>
+                <AddToLoadoutButton
+                  itemId={itemId}
+                  avatarId={props.selectedAvatarId ?? null}
+                  onToast={props.onToast}
+                  onAdded={() => props.onChanged()}
+                />
+              </div>
               <div className="row" style={{ marginTop: "7px" }}>
                 <select value={compatPick} onChange={(e) => setCompatPick(e.target.value ? Number(e.target.value) : "")}>
                   <option value="">选择头像…</option>
@@ -836,6 +858,9 @@ export function ItemDetail(props: {
               </Section>
             )}
 
+            {/* 版本关系（spec §8.2）：只对已登记资产建候选，人工确认；不自动 proven。 */}
+            <VersionLinksSection itemId={itemId} onToast={props.onToast} onChanged={() => { load(); props.onChanged(); }} />
+
             <Section title={<>资产 {detail.assets.length}</>}>
               <div className="asset-list">
                 {detail.assets.map((a) => <ArchiveView key={a.id} asset={a} onToast={props.onToast} />)}
@@ -867,6 +892,14 @@ export function ItemDetail(props: {
             )}
           </div>
         </div>
+        {mergePreview && (
+          <MergePreview
+            sourceId={mergePreview.sourceId}
+            targetId={mergePreview.targetId}
+            onClose={() => setMergePreview(null)}
+            onConfirm={(sourceId, targetId) => { setMergePreview(null); guard(mergeItems(sourceId, targetId), "已合并 #" + sourceId + " → #" + targetId); }}
+          />
+        )}
       </div>
     </div>
   );

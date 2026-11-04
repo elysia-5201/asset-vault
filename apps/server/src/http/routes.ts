@@ -34,6 +34,13 @@ import { applyCategoryEvidence, getCategoryConfig, recommendForItem, reclassifyC
 import type { IndexPipeline } from "../services/pipeline/pipeline";
 import type { DerivedCache } from "../services/pipeline/cache";
 import { nonDefaultLimits, resolveLimits, type PipelineLimits } from "../services/pipeline/limits";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createStageTokenCodec, type StageTokenCodec } from "../services/stage-token";
+import { createImportPathJobs, verifyExpectedOrThrow } from "../services/import-files";
+import { stageDownload } from "../services/stage-commit";
+import { registerImportPrecheckRoutes } from "./routes/import-precheck";
+import { registerLoadoutRoutes } from "./routes/loadouts";
+import { registerCleanupRoutes } from "./routes/cleanup";
 
 export interface RouteDeps {
   repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher;
@@ -44,6 +51,11 @@ export interface RouteDeps {
   limits?: PipelineLimits;
   /** task-51：构建信息（/api/health.build；开发运行可为 null） */
   build?: any;
+  /**
+   * P1-T5：stage token codec。缺省在 registerRoutes 内用进程随机密钥 + 随机 epoch 构造一次，
+   * stage 下载与 commit 共用同一实例（重启即失效）。测试可注入已知 codec，不改变生产行为。
+   */
+  stageCodec?: StageTokenCodec;
 }
 
 const DEFAULT_DOWNLOAD_SUBDIR = "downloads";
@@ -75,12 +87,15 @@ function contentTypeFor(p: string): string {
   return "application/octet-stream";
 }
 
-function fail(reply: FastifyReply, e: unknown): FastifyReply {
+export function fail(reply: FastifyReply, e: unknown): FastifyReply {
   const err = e as any;
   const status = typeof err?.status === "number" ? err.status : Array.isArray(err?.statusCode) ? 400 : 500;
   const code = err?.code && typeof err.code === "string" ? err.code : status === 500 ? "INTERNAL" : "INVALID_INPUT";
   if (status >= 500) deps_log(String(err?.stack ?? err));
-  return reply.status(status).send({ error: { code, message: String(err?.message ?? err) } });
+  const payload: { error: { code: string; message: string; details?: unknown } } = { error: { code, message: String(err?.message ?? err) } };
+  const details = err?.details;
+  if (details && typeof details === "object") payload.error.details = details;
+  return reply.status(status).send(payload);
 }
 let deps_log: (m: string) => void = () => {};
 
@@ -225,6 +240,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
   setUnityLogger(deps.log);
   const { repo, media, booth } = deps;
+  /** P1-T5：stage 下载与 commit 共用同一 codec（进程内一次构造；epoch 随进程变化）。 */
+  const stageCodec = deps.stageCodec ?? createStageTokenCodec(randomBytes(32), randomUUID());
 
   /** 头像名单（名字 + 别名）——用来把"包名/工程名"认成 avatar。 */
   const avatarLite = () => (repo.listAvatars() as any[]).map((a) => ({ id: Number(a.id), name: String(a.name), aliases: (a.aliases ?? []) as string[] }));
@@ -388,6 +405,10 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const itemId = toInt((req.params as any).id, 0);
       const p = String((req.body as any)?.path ?? "");
       if (!p) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "path 必填" } });
+      // P1-T5（spec §6.3/§9.1）：任何业务写入前先按 expected 重验（可选）并过严格 owner 门。
+      // 陈旧 → 409 PRECHECK_STALE；属于另一个 item → 409 PATH_OWNED_BY_OTHER_ITEM（带 details），
+      // 不登记、不迁 owner；同 owner 幂等。legacy 无 expected 只跳过重验，owner 门仍生效。
+      await verifyExpectedOrThrow({ repo }, itemId, p, (req.body as any)?.expected);
       const st = statSync(p);
       const rootRow = repo.listRoots()[0] ?? repo.ensureRoot(p, "index_in_place");
       const added: number[] = [];
@@ -499,38 +520,71 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const nestedPath = String((req.query as any).nested ?? "");
       if (nestedPath) {
-        const { readArchiveEntry } = await import("../../../../packages/core/src/archive/list");
-        const tmp = join(tmpdir(), "av-nested-tree-" + process.pid + "-" + Date.now() + "-" + baseName(nestedPath).replace(/[^\w.\-]+/g, "_"));
-        try {
-          writeFileSync(tmp, await readArchiveEntry(a.path, nestedPath, 2 * 1024 * 1024 * 1024));
-          const listing = await listArchive(tmp, { maxEntries: 20000 });
-          return { container: "nested" as const, path: nestedPath, entries: listing.entries, truncated: listing.truncated, passwordProtected: listing.passwordProtected, cached: false };
-        } finally { try { unlinkSync(tmp); } catch { /* ignore */ } }
+        // 只读：GET 不再解包/写临时文件；显式展开走 POST 同路径。
+        return {
+          container: "nested" as const, path: nestedPath, entries: [], ready: false,
+          reason: "NESTED_NOT_CACHED", message: "嵌套目录未缓存；请用 POST /api/assets/:id/tree {nested} 显式展开",
+          truncated: false, passwordProtected: false, cached: false,
+        };
       }
-      let entries = repo.getArchiveEntries(id);
-      if (entries.length === 0 && a.container !== "unitypackage") {
-        const { listArchive } = await import("../../../../packages/core/src/archive/list");
-        const listing = await listArchive(a.path, { maxEntries: 20000 });
-        repo.replaceArchiveEntries(id, listing.entries.map((e) => ({ path: e.path, size: e.size, isDir: e.isDir })));
-        entries = repo.getArchiveEntries(id);
-      }
-      // 完整性/限制（加法字段）：目录完整 ≠ 每个文件都能解压；旧条目无记录 → 未知，不冒充完整
+      const entries = repo.getArchiveEntries(id);
+      // 只读：缓存缺失不再自动补索引/写库。listing 存在（含合法空归档）或已有条目即视为就绪。
       const rawListing = (a as any).archive_listing;
       let listing: any = null;
-      if (rawListing) { try { listing = JSON.parse(String(rawListing)); } catch { listing = null; } }
+      if (rawListing) {
+        try {
+          const p = JSON.parse(String(rawListing));
+          // 只有结构有效的 listing 才算"已就绪"；损坏 JSON 不得冒充合法空 cache。
+          if (p && typeof p === "object" && typeof p.complete === "boolean") listing = p;
+        } catch { listing = null; }
+      }
+      if (a.container === "unitypackage") {
+        return {
+          container: a.container, path: a.path, entries: [], cached: true, ready: false, reason: "NOT_APPLICABLE",
+          message: "unitypackage 无归档目录；请使用 /api/assets/:id/unitypackage",
+          listing: null, completeness: "not-applicable", truncated: null, stoppedReason: null, flags: [], contentReadLimited: false, mode: null,
+        };
+      }
+      const ready = entries.length > 0 || listing !== null;
+      if (!ready) {
+        return {
+          container: a.container, path: a.path, entries: [], cached: false, ready: false, reason: "CACHE_MISSING",
+          message: "目录缓存未就绪；请使用显式重解析（POST /api/assets/:id/reindex）",
+          listing: null, completeness: "unknown", truncated: null, stoppedReason: null, flags: [], contentReadLimited: false, mode: null,
+        };
+      }
       return {
         container: a.container,
         path: a.path,
         entries,
         cached: true,
+        ready: true,
         listing,
-        completeness: listing ? (listing.complete ? "complete" : "truncated") : (a.container === "unitypackage" ? "not-applicable" : "unknown"),
+        completeness: listing ? (listing.complete ? "complete" : "truncated") : "unknown",
         truncated: listing ? listing.complete === false : null,
         stoppedReason: listing?.stoppedReason ?? null,
         flags: listing?.flags ?? [],
         contentReadLimited: !!listing?.contentReadLimited,
         mode: listing?.mode ?? null,
       };
+    } catch (e) { return fail(reply, e); }
+  });
+  /** 显式嵌套展开（原 GET 解包逻辑迁移；仅 POST，body {nested:string}）。 */
+  app.post("/api/assets/:id/tree", async (req, reply) => {
+    try {
+      const id = toInt((req.params as any).id, 0);
+      const a = repo.getAsset(id);
+      if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
+      const b = (req.body ?? {}) as any;
+      const nestedPath = typeof b.nested === "string" ? b.nested.trim() : "";
+      if (!nestedPath) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "需要 JSON body {nested:string}" } });
+      const { readArchiveEntry } = await import("../../../../packages/core/src/archive/list");
+      const tmp = join(tmpdir(), "av-nested-tree-" + process.pid + "-" + Date.now() + "-" + baseName(nestedPath).replace(/[^\w.\-]+/g, "_"));
+      try {
+        writeFileSync(tmp, await readArchiveEntry(a.path, nestedPath, 2 * 1024 * 1024 * 1024));
+        const listing = await listArchive(tmp, { maxEntries: 20000 });
+        return { container: "nested" as const, path: nestedPath, entries: listing.entries, truncated: listing.truncated, passwordProtected: listing.passwordProtected, cached: false };
+      } finally { try { unlinkSync(tmp); } catch { /* ignore */ } }
     } catch (e) { return fail(reply, e); }
   });
   /**
@@ -702,9 +756,9 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   });
   app.post("/api/import/paths", async (req, reply) => {
     try {
-      const paths: string[] = ((req.body as any)?.paths ?? []).map(String);
-      const jobs = paths.map((p) => repo.createJob("import_file", null, { path: p }, 5));
-      return { jobIds: jobs.map((j) => j.id) };
+      // P1-T5：委托 createImportPathJobs —— files 新形状（每文件带 expected，不递归）与
+      // paths 旧形状（legacy:true）都由同一实现决定，路由不再自己拼 job payload。
+      return createImportPathJobs({ repo }, (req.body ?? {}) as any);
     } catch (e) { return fail(reply, e); }
   });
   app.post("/api/scan", async (req, reply) => {
@@ -1276,7 +1330,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try { repo.deleteCollection(toInt((req.params as any).id, 0)); return { ok: true }; } catch (e) { return fail(reply, e); }
   });
 
-  /** 合并两条素材（例如同一商品的"模型包 + 材质包"）：资产/图片/模型/标签/更新历史全部归到目标条目，来源进回收站可恢复。 */
+  /** 合并两条素材（例如同一商品的"模型包 + 材质包"）：资产与模型关联/标签/更新历史/导入登记归到目标条目；图片不迁移（source 的图留在 source，target 无封面时只用 target 自己的第一张图补封面）；来源软删进回收站可恢复。 */
   app.post("/api/items/merge", async (req, reply) => {
     try {
       const b = (req.body ?? {}) as any;
@@ -1707,6 +1761,14 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const fileName: string | null = b.fileName ?? protocol?.fileName ?? null;
       if (!dlUrl) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "缺少 url/protocolUrl，或其 dlurl 不是合法的 https 下载地址" } });
       if (!isAllowedBoothUrl(dlUrl)) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "只接受 BOOTH 的 https 下载地址" } });
+      // P1-T5（spec §6.4）：stage=true 提前分支 —— 只下载 + 只读预检 + 发 token，
+      // 不建 item/images/tags/job；root 来自服务端可信配置（body 只能与之一致，不能改写）。
+      if (b.stage === true) {
+        return await stageDownload(
+          { repo, media, booth, codec: stageCodec, log: deps.log, dataDir: deps.dataDir, downloadRoot: downloadRootOf(repo, deps.dataDir) },
+          { url: dlUrl, itemId, fileName, downloadRoot: b.downloadRoot },
+        );
+      }
       const root = String(b.downloadRoot ?? downloadRootOf(repo, deps.dataDir));
       const destDir = join(root, itemId ? "b" + itemId : "b-unknown");
       const dl = await downloadBoothFile({ dlUrl, destDir, fileName, log: deps.log });
@@ -1972,4 +2034,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       return reply.header("content-disposition", 'attachment; filename="assetvault-items.json"').send({ exportedAt: new Date().toISOString(), items: repo.exportItems(), avatars: repo.listAvatars() });
     } catch (e) { return fail(reply, e); }
   });
+
+  // ---------- feature123 独立路由模块（P1-T5 接线）----------
+  // 三个模块各自只注册本 feature 的端点；这里只做一次注册，不复制业务。
+  // 模块反向 import 本文件的 fail（函数声明提升，仅请求期调用），root 可达性由
+  // test/http/feature123-wiring.test.ts 用真实 Fastify.inject 实测。
+  registerImportPrecheckRoutes(app, { repo, codec: stageCodec, media, booth, log: deps.log });
+  registerLoadoutRoutes(app, { repo, log: deps.log });
+  registerCleanupRoutes(app, { repo, log: deps.log });
 }

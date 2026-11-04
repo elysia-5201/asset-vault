@@ -220,8 +220,10 @@ export interface CategoryNode {
 export type AppErrorCode =
   | "NOT_FOUND" | "INVALID_INPUT" | "CONFLICT" | "INVALID_TRANSITION" | "UPSTREAM_ERROR"
   | "LOGIN_REQUIRED" | "NOT_AN_ARCHIVE" | "ARCHIVE_PASSWORD" | "READ_ONLY_SCOPE";
+/** 错误子码等附加信息（additive；不扩展 AppErrorCode 联合）。 */
+export interface AppErrorDetails { code?: string; [k: string]: unknown }
 export class AppError extends Error {
-  constructor(public code: AppErrorCode, message: string, public status = 400) { super(message); this.name = "AppError"; }
+  constructor(public code: AppErrorCode, message: string, public status = 400, public details?: AppErrorDetails) { super(message); this.name = "AppError"; }
 }
 
 

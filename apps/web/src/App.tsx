@@ -21,6 +21,8 @@ import { AvatarWorkbench } from "./components/AvatarWorkbench";
 import type { WorkbenchFocus } from "./workbench-focus";
 import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { LoadoutPanel } from "./components/LoadoutPanel";
+import { CleanupPanel } from "./components/CleanupPanel";
 import { CategoryBatchBar } from "./components/CategoryBatchBar";
 import { Spinner, ToastHost, useDebounced, type Toast } from "./components/ui";
 
@@ -80,6 +82,11 @@ export default function App() {
   const [workbenchFocus, setWorkbenchFocus] = useState<WorkbenchFocus | null>(null);
   /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
   const [settingsPanel, setSettingsPanel] = useState(false);
+  /** 整理待办面板（cleanup-todos §7.1：更多工具 → 整理待办）。 */
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  /** 搭配清单面板（avatar-loadouts §7.2：头像轨「搭配」入口，按选中模型打开）。 */
+  const [loadoutOpen, setLoadoutOpen] = useState(false);
+  const [loadoutAvatarId, setLoadoutAvatarId] = useState<number | null>(null);
   /** 右侧导入/作业侧栏：默认收起，按需打开；打开/关闭不丢筛选与头像选择。 */
   const [sideOpen, setSideOpen] = useState(false);
   const sideToggleRef = useRef<HTMLButtonElement | null>(null);
@@ -390,6 +397,16 @@ export default function App() {
     setSelectedAvatarIds([]);
   }, [filters]);
 
+  /** 搭配清单入口：只按用户显式选中的**恰好一个**模型打开；0/多选只提示，不猜。 */
+  const openLoadouts = useCallback(() => {
+    if (effAvatarIds.length !== 1) {
+      toast("info", "先在头像轨选中恰好一个模型，再打开搭配清单");
+      return;
+    }
+    setLoadoutAvatarId(effAvatarIds[0]);
+    setLoadoutOpen(true);
+  }, [effAvatarIds, toast]);
+
   const counts = health?.counts;
   const inFlight = jobs.filter((j) => ["queued", "resolving", "fetching", "materializing", "indexing", "matching", "releasing", "releasing_done"].includes(j.state)).length;
 
@@ -419,6 +436,7 @@ export default function App() {
                 <button role="menuitem" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => { closeMoreTools(); setDupPanel(true); }}>库级查重</button>
                 <button role="menuitem" title="分类管理：一级/二级分类与标签的增改、排序、启停、合并" onClick={() => { closeMoreTools(); setManagerOpen(true); }}>分类管理</button>
                 <button role="menuitem" title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）" onClick={() => { closeMoreTools(); setPreviewPanel(true); }}>扫描预览</button>
+                <button role="menuitem" title="整理待办：缺封面/缺来源/未关联模型/文件失联四类规则 + 忽略与保存筛选（GET /api/cleanup/todos）" onClick={() => { closeMoreTools(); setCleanupOpen(true); }}>整理待办</button>
                 <button role="menuitem" title="批量分类：在列表卡片上加复选框，批量设置主/子分类" onClick={() => { closeMoreTools(); setSelectMode((v) => !v); setSelectedIds([]); }}>{selectMode ? "退出批量选择" : "批量分类"}</button>
                 <div className="more-sep" />
                 <button role="menuitem" title="设置：库根 / 收件箱监听 / 下载与集成" onClick={() => { closeMoreTools(); setSettingsPanel(true); }}>设置</button>
@@ -436,6 +454,7 @@ export default function App() {
           avatars={avatars} loading={avatarsLoading} selected={effAvatarIds} onToggle={toggleAvatar}
           onClear={() => { setSelectedAvatarIds([]); setText((t) => t.replace(/@(?:"[^"]+"|'[^']+'|[^\s@]+)/g, "").replace(/\s+/g, " ").trim()); }}
           ownedOnly={ownedOnly} onOwnedOnly={setOwnedOnly} match={avatarMatch} onMatch={setAvatarMatch} hits={total}
+          onOpenLoadouts={openLoadouts}
         />
       </div>
 
@@ -529,7 +548,7 @@ export default function App() {
           <button className="btn tiny" onClick={closeSide} title="收起侧栏（Esc）" aria-label="收起侧栏">收起</button>
         </div>
         {sideTab === "import"
-          ? <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} />
+          ? <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} onOpenItem={setSelectedItemId} />
           : <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />}
       </aside>
 
@@ -589,12 +608,49 @@ export default function App() {
       {dupPanel && (
         <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
       )}
+      {cleanupOpen && (
+        <div className="backdrop" onClick={() => setCleanupOpen(false)}>
+          <div className="drawer" role="dialog" aria-label="整理待办" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head">
+              <h3>整理待办</h3>
+              <span className="spacer" />
+              <button className="btn" onClick={() => setCleanupOpen(false)}>关闭</button>
+            </div>
+            <div className="drawer-body" style={{ gridTemplateColumns: "1fr" }}>
+              <div className="left" style={{ borderRight: "none" }}>
+                <CleanupPanel onOpenItem={(id) => { setCleanupOpen(false); setSelectedItemId(id); }} onToast={toast} />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {loadoutOpen && loadoutAvatarId !== null && (
+        <div className="backdrop" onClick={() => setLoadoutOpen(false)}>
+          <div className="drawer" role="dialog" aria-label="搭配清单" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head">
+              <h3>搭配清单 · @{avatars.find((a) => a.id === loadoutAvatarId)?.name ?? "#" + loadoutAvatarId}</h3>
+              <span className="spacer" />
+              <button className="btn" onClick={() => setLoadoutOpen(false)}>关闭</button>
+            </div>
+            <div className="drawer-body" style={{ gridTemplateColumns: "1fr" }}>
+              <div className="left" style={{ borderRight: "none" }}>
+                <LoadoutPanel
+                  avatarId={loadoutAvatarId}
+                  onToast={toast}
+                  onChanged={() => { loadAvatars(); loadItems(); }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {selectedItemId !== null && (
         <ItemDetail
           itemId={selectedItemId} avatars={avatars} projects={projects} onClose={() => setSelectedItemId(null)}
           onChanged={loadItems} onToast={toast} importedIds={importedIds} onMarkImported={markImported}
           onOpenItem={setSelectedItemId}
           onOpenWorkbench={(focus) => { setWorkbenchFocus(focus); setWorkbenchOpen(true); }}
+          selectedAvatarId={effAvatarIds.length === 1 ? effAvatarIds[0] : null}
         />
       )}
 

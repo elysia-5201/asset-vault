@@ -21,6 +21,10 @@ import type {
   ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
+  PrecheckResponse, PrecheckResult, VersionLink,
+  Loadout, LoadoutDetail, LoadoutItem, LoadoutState,
+  CleanupFilter, CleanupFilterRow, CleanupIgnore, CleanupIgnoresResponse, CleanupRule,
+  CleanupTodosResponse, LocalSourcePolicy,
 } from "./types";
 export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse, ScanPreview, ScanPreviewCounts, ScanPreviewItem } from "./types";
 
@@ -49,7 +53,7 @@ export async function deleteScanPreview(id: number) { return request<{ deleted: 
 export const API_BASE = "/api";
 
 export class ApiError extends Error {
-  constructor(public code: AppErrorCode, message: string, public status: number) {
+  constructor(public code: AppErrorCode, message: string, public status: number, public details?: { code?: string }) {
     super(message);
     this.name = "ApiError";
   }
@@ -159,32 +163,41 @@ function fromMock<T>(method: string, path: string, body?: unknown): T {
   return out.body as T;
 }
 
-async function request<T>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number } = {}): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
   if (mode === "mock") return fromMock<T>(method, path, body);
   const t = timeoutSignal(opts.timeoutMs ?? 20000);
+  // 调用方取消（AbortSignal）与超时合并：任一触发都中止请求。旧调用不传 signal，行为不变。
+  const signal = opts.signal
+    ? (typeof AbortSignal.any === "function" ? AbortSignal.any([t.signal, opts.signal]) : opts.signal)
+    : t.signal;
   try {
     const res = await fetch(API_BASE + path, {
       method,
       headers: body === undefined ? undefined : { "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: t.signal,
+      signal,
     });
     if (!res.ok) {
       let code: AppErrorCode = "INVALID_INPUT";
       let message = method + " " + path + " → HTTP " + res.status;
+      let details: { code?: string } | undefined;
       try {
         const j = rec(await res.json());
         const e = rec(j.error);
         if (typeof e.code === "string") code = e.code as AppErrorCode;
         if (typeof e.message === "string") message = e.message;
+        // 子码等附加信息原样带出（不重建对象，保留 itemId/assetId 等附加字段）
+        if (e.details && typeof e.details === "object") details = e.details as { code?: string };
       } catch { /* 非 JSON 错误体，保留默认文案 */ }
-      throw new ApiError(code, message, res.status);
+      throw new ApiError(code, message, res.status, details);
     }
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
   } catch (e) {
     if (e instanceof ApiError) throw e;
     if (e instanceof MockHttpError) throw new ApiError(e.code, e.message, e.status);
+    // 调用方主动取消：不当作后端掉线（否则会误切 mock），也不触发健康探测。
+    if (opts.signal?.aborted) throw new ApiError("UPSTREAM_ERROR", "请求已取消", 499);
     // 网络层失败 —— 但先确认后端是不是真的死了。
     // 反例（实测踩过）：某个请求自己超时（大压缩包列目录、BOOTH 抓取、Unity 桥探测都可能是慢的），
     // 旧逻辑会当场把整个界面切成内置 mock 数据（"10 条目 / 9 资产"），而且再也切不回来 —— 看起来就是"卡住了"。
@@ -204,6 +217,8 @@ async function request<T>(method: string, path: string, body?: unknown, opts: { 
 /** 可读错误文案（含 409 状态机提示）。 */
 export function describeError(e: unknown): string {
   if (e instanceof ApiError) {
+    // 有子码时用「<message>（<code>）」；无子码保持既有输出（旧 helper 语义不变）
+    if (e.details?.code) return e.message + "（" + e.details.code + "）";
     if (e.code === "INVALID_TRANSITION") return "状态机拒绝（409 INVALID_TRANSITION）：" + e.message;
     if (e.code === "CONFLICT") return "冲突（409 CONFLICT）：" + e.message;
     if (e.code === "LOGIN_REQUIRED") return "需要 BOOTH 登录（401 LOGIN_REQUIRED）：" + e.message;
@@ -473,6 +488,20 @@ export function addImages(id: number, body: { paths?: string[]; url?: string; ro
 export function deleteImage(id: number, imageId: number): Promise<unknown> { return request("DELETE", "/items/" + id + "/images/" + imageId); }
 export function setCover(id: number, imageId: number): Promise<unknown> { return request("POST", "/items/" + id + "/images/" + imageId + "/cover"); }
 export function addAsset(id: number, path: string): Promise<AssetRow> { return request("POST", "/items/" + id + "/assets", { path }); }
+/**
+ * POST /items/:id/assets 的 expected 强验版本（import-precheck spec §6.3/§9.1）。
+ *
+ * 只登记用户刚在预检卡里看过的**单个文件**（path + expected），不提交原目录；
+ * 服务端在任何业务写入前重验 size/mtime（有 sha256 时强制重算）并过严格 owner 门：
+ * 陈旧 → 409 details.code=PRECHECK_STALE；属于另一个条目 → 409 PATH_OWNED_BY_OTHER_ITEM。
+ * 旧 addAsset(id, path) 的调用方/响应/legacy 行为保持不变。
+ */
+export async function addAssetWithExpected(
+  id: number, path: string, expected: PrecheckExpected,
+): Promise<{ added: number; assetIds: number[] }> {
+  const raw = rec(await request<unknown>("POST", "/items/" + id + "/assets", { path, expected }));
+  return { added: numOr(raw.added, 0), assetIds: arr<unknown>(raw.assetIds).map((x) => numOr(x, 0)) };
+}
 /** 套装/合集 */
 export function getCollections(): Promise<{ collections: { id: number; name: string; itemCount: number }[] }> { return request("GET", "/collections"); }
 export interface CollectionMember { id: number; title: string; status: ItemStatus; sourceSite: SourceSite }
@@ -619,8 +648,10 @@ export async function getAsset(id: number): Promise<AssetDetailResponse> {
   return { ...(raw as AssetDetailResponse), avatars: arr(raw?.avatars) };
 }
 export async function getAssetTree(id: number, opts: { nested?: string } = {}): Promise<AssetTreeResponse> {
-  const q = opts.nested ? "?nested=" + encodeURIComponent(opts.nested) : "";
-  const raw = await request<AssetTreeResponse>("GET", "/assets/" + id + "/tree" + q);
+  // root 目录只读 GET；嵌套展开是显式动作，走 POST（GET 不再解包/写临时文件）。
+  const raw = opts.nested
+    ? await request<AssetTreeResponse>("POST", "/assets/" + id + "/tree", { nested: opts.nested })
+    : await request<AssetTreeResponse>("GET", "/assets/" + id + "/tree");
   return {
     ...(raw as AssetTreeResponse),
     entries: arr<ArchiveEntry>(raw?.entries),
@@ -696,6 +727,141 @@ export async function importUrl(url: string, downloadImages = true): Promise<Job
 export async function importPaths(paths: string[]): Promise<JobIdResponse> {
   return jobIdResponse(await request<unknown>("POST", "/import/paths", { paths }));
 }
+
+// ---------------- feature123：导入预检 / 接受列表 / stage 下载 / 版本关系 ----------------
+// 只增量添加本模块已准端点：沿用 request/错误包装/请求头/API_BASE，不另造传输层。
+// 旧 legacy 入口（importPaths/importUrl）保持原样，不强行改返回形状。
+
+/** 导入时回传的 expected（spec §6.3）：size+mtime 必填，sha256 只在本次哈希成功时带。 */
+export interface PrecheckExpected { size: number; mtime: string; sha256?: string }
+
+/** POST /api/import/paths 的 files 元素：只带当前文件 + group，不带原目录 paths（执行阶段不递归）。 */
+export interface AcceptedFilePayload {
+  path: string;
+  expected: PrecheckExpected;
+  group?: { rootPath: string; rootId: number | null };
+}
+
+/** POST /api/import/precheck —— 只读预检（不写库/不建 job）。 */
+export async function precheckPaths(body: {
+  paths: string[];
+  source?: { site?: string; itemId?: string; title?: string };
+  budget?: { maxBytes?: number; maxMs?: number };
+}): Promise<PrecheckResponse> {
+  const raw = rec(await request<unknown>("POST", "/import/precheck", body, { timeoutMs: 60000 }));
+  const budget = rec(raw.budget);
+  return {
+    checkedAt: typeof raw.checkedAt === "string" ? raw.checkedAt : "",
+    budget: {
+      maxBytes: numOr(budget.maxBytes, 0), maxMs: numOr(budget.maxMs, 0),
+      usedBytes: numOr(budget.usedBytes, 0), usedMs: numOr(budget.usedMs, 0),
+      truncated: budget.truncated === true,
+    },
+    results: arr<PrecheckResult>(raw.results),
+  };
+}
+
+/** POST /api/import/paths 的新形状：只提交用户看过的 files（每项带 expected），不递归原目录。 */
+export async function importAcceptedFiles(files: AcceptedFilePayload[]): Promise<{ jobIds: number[]; duplicates: string[]; legacy: boolean }> {
+  const raw = rec(await request<unknown>("POST", "/import/paths", { files }));
+  return {
+    jobIds: arr<unknown>(raw.jobIds).map((x) => numOr(x, 0)),
+    duplicates: arr<unknown>(raw.duplicates).map((x) => String(x)),
+    legacy: raw.legacy === true,
+  };
+}
+
+export interface StageDownloadBody { url: string; itemId?: string | null; fileName?: string | null; downloadRoot?: string }
+
+/** stage=true 的同步响应（spec §6.4）：不返回可回传路径，只有不透明 stageToken。 */
+export interface StageDownloadResponse {
+  staged: true;
+  stageToken: string;
+  bytes: number;
+  fileName: string;
+  precheck: PrecheckResponse;
+  meta?: BoothItemMeta;
+}
+
+/**
+ * POST /api/import/download —— 主 UI 固定 stage=true。
+ * 旧 legacy 响应（{itemId,path,jobId}）不能冒充 stage：直接报错，不返回 jobId、不自动 commit。
+ */
+export async function stageDownload(body: StageDownloadBody, opts: { signal?: AbortSignal } = {}): Promise<StageDownloadResponse> {
+  const raw = rec(await request<unknown>("POST", "/import/download", { ...body, stage: true }, { timeoutMs: 300000, signal: opts.signal }));
+  if (raw.staged !== true || typeof raw.stageToken !== "string" || raw.stageToken === "") {
+    throw new ApiError("UPSTREAM_ERROR", "下载响应不是 stage 形状（缺少 staged/stageToken）：后端未启用 stage=true", 502);
+  }
+  const pre = rec(raw.precheck);
+  const budget = rec(pre.budget);
+  return {
+    staged: true,
+    stageToken: raw.stageToken,
+    bytes: numOr(raw.bytes, 0),
+    fileName: typeof raw.fileName === "string" ? raw.fileName : "",
+    precheck: {
+      checkedAt: typeof pre.checkedAt === "string" ? pre.checkedAt : "",
+      budget: {
+        maxBytes: numOr(budget.maxBytes, 0), maxMs: numOr(budget.maxMs, 0),
+        usedBytes: numOr(budget.usedBytes, 0), usedMs: numOr(budget.usedMs, 0),
+        truncated: budget.truncated === true,
+      },
+      results: arr<PrecheckResult>(pre.results),
+    },
+    meta: raw.meta === undefined || raw.meta === null ? undefined : (raw.meta as BoothItemMeta),
+  };
+}
+
+export interface StageCommitResponse {
+  replayed: boolean;
+  decision: "import" | "skip";
+  itemId: number | null;
+  assetId: number | null;
+  skipped: boolean;
+}
+
+/** POST /api/import/download/commit —— 公开 body 只有 {stageToken, decision}（不回传路径/token）。 */
+export async function commitStage(stageToken: string, decision: "import" | "skip"): Promise<StageCommitResponse> {
+  const raw = rec(await request<unknown>("POST", "/import/download/commit", { stageToken, decision }, { timeoutMs: 60000 }));
+  return {
+    replayed: raw.replayed === true,
+    decision: raw.decision === "skip" ? "skip" : "import",
+    itemId: raw.itemId === undefined || raw.itemId === null ? null : numOr(raw.itemId, 0),
+    assetId: raw.assetId === undefined || raw.assetId === null ? null : numOr(raw.assetId, 0),
+    skipped: raw.skipped === true,
+  };
+}
+
+export type VersionLinkRelation = VersionLink["relation"];
+export type VersionLinkBasis = VersionLink["basis"];
+export type VersionLinkState = VersionLink["state"];
+
+/** GET /api/items/:id/version-links —— 纯读；state 筛选 + 分页。 */
+export async function listVersionLinks(itemId: number, q: { state?: VersionLinkState; limit?: number; offset?: number } = {}): Promise<{ itemId: number; total: number; links: VersionLink[] }> {
+  const raw = rec(await request<unknown>("GET", "/items/" + itemId + "/version-links" + queryString({ state: q.state, limit: q.limit, offset: q.offset })));
+  return { itemId: numOr(raw.itemId, itemId), total: numOr(raw.total, 0), links: arr<VersionLink>(raw.links) };
+}
+
+/** POST /api/items/:id/version-links —— 建候选（人工声明，不冒充 proven）。 */
+export async function createVersionLink(itemId: number, body: {
+  assetAId: number; assetBId: number; relation: VersionLinkRelation; basis?: VersionLinkBasis; evidence?: unknown;
+}): Promise<VersionLink> {
+  return request<VersionLink>("POST", "/items/" + itemId + "/version-links", body);
+}
+
+/** PATCH /api/items/:id/version-links/:linkId —— 确认/更正/撤销；expectedVersion 必填（CAS）。 */
+export async function patchVersionLink(itemId: number, linkId: number, body: {
+  relation?: VersionLinkRelation; state?: VersionLinkState; expectedVersion: number;
+}): Promise<VersionLink> {
+  return request<VersionLink>("PATCH", "/items/" + itemId + "/version-links/" + linkId, body);
+}
+
+/** DELETE /api/items/:id/version-links/:linkId —— 删除记录（审计留痕）。 */
+export async function deleteVersionLink(itemId: number, linkId: number): Promise<{ deleted: boolean }> {
+  const raw = rec(await request<unknown>("DELETE", "/items/" + itemId + "/version-links/" + linkId));
+  return { deleted: raw.deleted === true };
+}
+
 export async function scan(body: { rootId?: number; path?: string; deep?: boolean }): Promise<JobIdResponse> {
   return jobIdResponse(await request<unknown>("POST", "/scan", body));
 }
@@ -1462,4 +1628,158 @@ export async function stagingCleanup(olderThanDays: number, dryRun: boolean): Pr
     bytes: numOr(s.bytes ?? s.removedBytes, 0),
     failed: numOr(s.failed, 0),
   };
+}
+
+// ---------------- media cache（托管缩略图缓存维护） ----------------
+export async function mediaCacheUsage(): Promise<import("./types").MediaCacheUsage> { return request("GET", "/media-cache"); }
+export async function mediaCachePreview(): Promise<import("./types").MediaCachePreview> { return request("POST", "/media-cache/preview", {}); }
+export async function mediaCacheCleanup(token: string): Promise<import("./types").MediaCacheCleanupResult> { return request("POST", "/media-cache/cleanup", { token, confirm: true }); }
+
+// ---------- 搭配清单（avatar-loadouts spec §6.1；P3-T4 增量，复用既有 request/ApiError/AbortSignal 约定） ----------
+// 只加本模块已准端点；不改旧调用行为、不建第二套传输层。
+// 注意：Loadout.version 在 list/detail 上可选（spec §5.1），真正 PATCH 必须传详情里的数值 version，
+// 这里不做 undefined/0 兜底 —— 由调用方（面板）从详情取，缺就拒绝提交。
+
+export interface LoadoutPatchBody {
+  name?: string;
+  note?: string | null;
+  sort?: number;
+  expectedVersion: number;
+}
+
+export interface LoadoutItemPatchBody {
+  state?: LoadoutState;
+  note?: string | null;
+  position?: number;
+  expectedVersion: number;
+}
+
+export function listAvatarLoadouts(avatarId: number): Promise<{ loadouts: Loadout[] }> {
+  return request("GET", "/avatars/" + avatarId + "/loadouts");
+}
+
+export function createLoadout(avatarId: number, body: { name: string; note?: string | null }): Promise<{ loadout: Loadout }> {
+  return request("POST", "/avatars/" + avatarId + "/loadouts", body);
+}
+
+/** 详情：includeTrashedItems 只指「item 当前在回收站」，墓碑行永不返回（spec §6.2）。 */
+export function getLoadout(
+  id: number,
+  q: { state?: LoadoutState; limit?: number; offset?: number; includeTrashedItems?: boolean } = {},
+): Promise<LoadoutDetail> {
+  return request("GET", "/loadouts/" + id + queryString({
+    state: q.state,
+    limit: q.limit,
+    offset: q.offset,
+    includeTrashedItems: q.includeTrashedItems === undefined ? undefined : q.includeTrashedItems ? 1 : 0,
+  }));
+}
+
+export function patchLoadout(id: number, body: LoadoutPatchBody): Promise<{ loadout: Loadout }> {
+  return request("PATCH", "/loadouts/" + id, body);
+}
+
+export function deleteLoadout(id: number): Promise<{ deleted: boolean }> {
+  return request("DELETE", "/loadouts/" + id);
+}
+
+export function addLoadoutItems(
+  id: number,
+  body: { itemIds: number[]; state?: LoadoutState; note?: string | null },
+): Promise<{ added: number; revived: number; existing: number; items: LoadoutItem[] }> {
+  return request("POST", "/loadouts/" + id + "/items", body);
+}
+
+export function patchLoadoutItem(id: number, itemId: number, body: LoadoutItemPatchBody): Promise<{ item: LoadoutItem }> {
+  return request("PATCH", "/loadouts/" + id + "/items/" + itemId, body);
+}
+
+export function removeLoadoutItem(id: number, itemId: number): Promise<{ removed: 0 | 1 }> {
+  return request("DELETE", "/loadouts/" + id + "/items/" + itemId);
+}
+
+export function reorderLoadoutItems(id: number, itemIds: number[]): Promise<{ items: LoadoutItem[] }> {
+  return request("POST", "/loadouts/" + id + "/items/reorder", { itemIds });
+}
+
+// ---------- 整理待办（cleanup-todos spec §6.1–§6.3；P4-T4 增量，复用既有 request/ApiError/AbortSignal） ----------
+// 只加本模块已准 8 端点；不改旧调用行为、不建第二套传输层。
+// localSourcePolicy 三个入口（todos/ignores/保存筛选）都必填：这里不做默认兜底，缺就由服务端 400
+// INVALID_INPUT + details.code=LOCAL_POLICY_REQUIRED；主 UI 默认 include_local 由面板显式传入。
+
+export interface CleanupTodosQuery {
+  rule?: CleanupRule;
+  ignored?: "hide" | "show" | "only";
+  q?: string;
+  /** UI 数组 → query 的 avatar CSV（命中任一）。 */
+  avatarIds?: number[];
+  /** UI 数组 → query 的 category CSV（命中任一）。 */
+  categoryIds?: string[];
+  sort?: "updated" | "title";
+  localSourcePolicy: LocalSourcePolicy;
+  limit?: number;
+  offset?: number;
+}
+
+/** GET /api/cleanup/todos —— 纯读；total 是当前列表行数，counts 是规则命中计数。 */
+export function listCleanupTodos(q: CleanupTodosQuery): Promise<CleanupTodosResponse> {
+  return request("GET", "/cleanup/todos" + queryString({
+    rule: q.rule,
+    ignored: q.ignored,
+    q: q.q,
+    avatar: q.avatarIds && q.avatarIds.length > 0 ? q.avatarIds.join(",") : undefined,
+    category: q.categoryIds && q.categoryIds.length > 0 ? q.categoryIds.join(",") : undefined,
+    sort: q.sort,
+    localSourcePolicy: q.localSourcePolicy,
+    limit: q.limit,
+    offset: q.offset,
+  }));
+}
+
+/** GET /api/cleanup/ignores —— 独立列出全部忽略行（含归档/回收站）；策略必填。 */
+export function listCleanupIgnores(q: {
+  resolved?: "any" | "true" | "false";
+  localSourcePolicy: LocalSourcePolicy;
+  limit?: number;
+  offset?: number;
+}): Promise<CleanupIgnoresResponse> {
+  return request("GET", "/cleanup/ignores" + queryString({
+    resolved: q.resolved,
+    localSourcePolicy: q.localSourcePolicy,
+    limit: q.limit,
+    offset: q.offset,
+  }));
+}
+
+/** POST /api/cleanup/ignore —— 幂等 upsert；返回行的 resolved 是 include_local 视图，调用方需按所选策略重拉。 */
+export function ignoreCleanupTodo(body: { itemId: number; rule: CleanupRule; note?: string | null }): Promise<{ ignore: CleanupIgnore }> {
+  return request("POST", "/cleanup/ignore", body);
+}
+
+/** DELETE /api/cleanup/ignore/:itemId/:rule —— 恢复=删忽略行；幂等 0/1，不 404。 */
+export function restoreCleanupIgnore(itemId: number, rule: CleanupRule): Promise<{ removed: 0 | 1 }> {
+  return request("DELETE", "/cleanup/ignore/" + itemId + "/" + rule);
+}
+
+/** GET /api/cleanup/filters —— 纯读。 */
+export function listCleanupFilters(): Promise<{ filters: CleanupFilterRow[] }> {
+  return request("GET", "/cleanup/filters");
+}
+
+/** POST /api/cleanup/filters —— 201 {filter}；同名 409；filter 严格校验（localSourcePolicy 必填）。 */
+export function createCleanupFilter(body: { name: string; filter: CleanupFilter }): Promise<{ filter: CleanupFilterRow }> {
+  return request("POST", "/cleanup/filters", body);
+}
+
+/** PATCH /api/cleanup/filters/:id —— expectedVersion 必填；CAS 失败/同名 409。 */
+export function updateCleanupFilter(
+  id: number,
+  body: { name?: string; filter?: CleanupFilter; expectedVersion: number },
+): Promise<{ filter: CleanupFilterRow }> {
+  return request("PATCH", "/cleanup/filters/" + id, body);
+}
+
+/** DELETE /api/cleanup/filters/:id —— 幂等 0/1，不 404。 */
+export function deleteCleanupFilter(id: number): Promise<{ deleted: 0 | 1 }> {
+  return request("DELETE", "/cleanup/filters/" + id);
 }

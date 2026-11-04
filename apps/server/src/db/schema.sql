@@ -565,3 +565,104 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   title, shop_name, author, description, notes, tags_text,
   tokenize='trigram'
 );
+
+-- ===== v10：导入预检/版本关系（import-precheck §5.1/§5.2/§5.4）=====
+-- 同一 item 内两个 asset 的版本/配套关系；规范顺序 asset_a_id < asset_b_id 避免 (A,B)/(B,A) 重复行
+CREATE TABLE IF NOT EXISTS asset_version_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  asset_a_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  asset_b_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  relation TEXT NOT NULL CHECK (relation IN ('a_newer','b_newer','same','companion')),
+  basis TEXT NOT NULL CHECK (basis IN ('filename','title','manual')),
+  evidence_json TEXT,
+  state TEXT NOT NULL DEFAULT 'candidate' CHECK (state IN ('candidate','confirmed','revoked')),
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  decided_at TEXT,
+  CHECK (asset_a_id < asset_b_id),
+  UNIQUE (asset_a_id, asset_b_id)
+);
+CREATE INDEX IF NOT EXISTS ix_avlink_item ON asset_version_links(item_id, state);
+CREATE INDEX IF NOT EXISTS ix_avlink_a ON asset_version_links(asset_a_id);
+CREATE INDEX IF NOT EXISTS ix_avlink_b ON asset_version_links(asset_b_id);
+
+-- 同一 item 的数据库级约束（CHECK 不能子查询；assets 无 (item_id,id) 唯一索引）
+CREATE TRIGGER IF NOT EXISTS trg_avlink_same_item_ins
+BEFORE INSERT ON asset_version_links
+FOR EACH ROW
+WHEN (SELECT item_id FROM assets WHERE id = NEW.asset_a_id) IS NOT NEW.item_id
+  OR (SELECT item_id FROM assets WHERE id = NEW.asset_b_id) IS NOT NEW.item_id
+BEGIN
+  SELECT RAISE(ABORT, 'asset_version_links: both assets must belong to item_id');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_avlink_same_item_upd
+BEFORE UPDATE OF item_id, asset_a_id, asset_b_id ON asset_version_links
+FOR EACH ROW
+WHEN (SELECT item_id FROM assets WHERE id = NEW.asset_a_id) IS NOT NEW.item_id
+  OR (SELECT item_id FROM assets WHERE id = NEW.asset_b_id) IS NOT NEW.item_id
+BEGIN
+  SELECT RAISE(ABORT, 'asset_version_links: both assets must belong to item_id');
+END;
+
+-- stage 回执表（技术回执：nonce 消费与已入库指针重放；不暴露产品 API）
+CREATE TABLE IF NOT EXISTS import_stage_commits (
+  nonce TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK (decision IN ('import','skip')),
+  item_id INTEGER REFERENCES items(id) ON DELETE SET NULL,
+  asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_stage_commits_created ON import_stage_commits(created_at);
+
+-- ===== v10：按模型搭配清单（avatar-loadouts §5.1/§5.2）=====
+CREATE TABLE IF NOT EXISTS loadouts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  avatar_id INTEGER NOT NULL REFERENCES avatars(id) ON DELETE CASCADE,
+  name TEXT NOT NULL COLLATE NOCASE,
+  note TEXT,
+  sort INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (avatar_id, name)
+);
+CREATE INDEX IF NOT EXISTS ix_loadouts_avatar ON loadouts(avatar_id, sort, id);
+
+CREATE TABLE IF NOT EXISTS loadout_items (
+  loadout_id INTEGER NOT NULL REFERENCES loadouts(id) ON DELETE CASCADE,
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  state TEXT NOT NULL DEFAULT 'planned' CHECK (state IN ('planned','imported','verified')),
+  note TEXT,
+  position INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  deleted_at TEXT,
+  PRIMARY KEY (loadout_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS ix_loadout_items_item ON loadout_items(item_id);
+CREATE INDEX IF NOT EXISTS ix_loadout_items_state ON loadout_items(loadout_id, state, position, item_id);
+CREATE INDEX IF NOT EXISTS ix_loadout_items_live ON loadout_items(loadout_id, deleted_at, position, item_id);
+
+-- ===== v10：整理待办（cleanup-todos §5.1/§5.2）=====
+CREATE TABLE IF NOT EXISTS cleanup_ignores (
+  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  rule TEXT NOT NULL CHECK (rule IN ('missing_cover','missing_source','unlinked_model','missing_file')),
+  note TEXT,
+  ignored_at TEXT NOT NULL,
+  PRIMARY KEY (item_id, rule)
+);
+CREATE INDEX IF NOT EXISTS ix_cleanup_ignores_rule ON cleanup_ignores(rule, ignored_at);
+
+CREATE TABLE IF NOT EXISTS cleanup_saved_filters (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  filter_json TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

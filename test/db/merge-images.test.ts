@@ -16,33 +16,32 @@ const imageCount = (itemId: number) => (t.db.prepare("SELECT COUNT(*) c FROM ite
 const imageExists = (id: number) => !!t.db.prepare("SELECT 1 x FROM item_images WHERE id=?").get(id);
 
 describe("mergeItems 后的封面引用（FK ON）", () => {
-  test("例1：target 无封面 → 继承 source 封面；source.cover 清空；删除该图成功", () => {
+  test("例1：target 无图 → 仍无图/无封面；source 图留在 source", () => {
     const target = addItem(t.db, { title: "target" });
     const source = addItem(t.db, { title: "source" });
     const sImg = repo.addImage(source, { role: "cover", origin: "booth" }).id;
     assert.equal(coverOf(source), sImg);
     const r = repo.mergeItems(source, target);
-    assert.equal(r.movedImages, 1);
-    assert.equal(coverOf(target), sImg, "目标无封面时借用来源封面");
-    assert.equal(coverOf(source), null, "来源封面必须清空，否则仍引用已迁走的图");
-    assert.equal(imageCount(source), 0);
-    repo.deleteImage(target, sImg);
+    assert.equal(r.movedImages, 0, "新规则：source 图不迁入 target");
+    assert.equal(coverOf(target), null, "target 原无图仍无封面");
+    assert.equal(imageCount(target), 0);
+    assert.equal(imageCount(source), 1, "source 图保留在原条目");
+    repo.deleteImage(source, sImg);
     assert.equal(imageExists(sImg), false);
-    assert.equal(coverOf(target), null);
   });
 
-  test("例2：target 已有封面 → 保留 target 封面；source.cover 清空；删除来源图成功", () => {
+  test("例2：target 已有封面 → 只保留 target 图；source 图留在 source", () => {
     const target = addItem(t.db, { title: "target" });
     const source = addItem(t.db, { title: "source" });
     const tImg = repo.addImage(target, { role: "cover", origin: "booth" }).id;
     const sImg = repo.addImage(source, { role: "cover", origin: "booth" }).id;
     repo.mergeItems(source, target);
     assert.equal(coverOf(target), tImg, "目标已有封面不应被覆盖");
-    assert.equal(coverOf(source), null);
-    assert.equal(imageCount(target), 2, "两张图都归 target");
-    repo.deleteImage(target, sImg);
+    assert.equal(imageCount(target), 1, "新规则：只保留 target 原有图片");
+    assert.equal(imageCount(source), 1, "source 图保留在原条目");
+    repo.deleteImage(source, sImg);
     assert.equal(imageExists(sImg), false);
-    assert.equal(coverOf(target), tImg, "删非封面图不影响封面");
+    assert.equal(coverOf(target), tImg, "删 source 图不影响 target 封面");
   });
 });
 

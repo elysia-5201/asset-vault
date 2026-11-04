@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   addRoot, addWatch, describeError, getSettings, listRoots, listWatches, removeRoot, removeWatch, scan,
-  stagingCleanup, stagingUsage, updateSettings,
+  mediaCacheCleanup, mediaCachePreview, mediaCacheUsage, stagingCleanup, stagingUsage, updateSettings,
 } from "../api";
 import type { LibraryRootRow, SettingsResponse, StagingCleanupResult, StagingUsage, WatchEntry } from "../types";
 import { formatBytes, shortenPath } from "../util";
@@ -32,6 +32,9 @@ export function SettingsPanel(props: {
   const [olderDays, setOlderDays] = useState(7);
   const [dryResult, setDryResult] = useState<StagingCleanupResult | null>(null);
   const [cleanResult, setCleanResult] = useState<StagingCleanupResult | null>(null);
+  const [mcUsage, setMcUsage] = useState<import("../types").MediaCacheUsage | null>(null);
+  const [mcPreview, setMcPreview] = useState<import("../types").MediaCachePreview | null>(null);
+  const [mcResult, setMcResult] = useState<import("../types").MediaCacheCleanupResult | null>(null);
 
   const reload = () => Promise.all([listRoots(), listWatches(), getSettings()])
     .then(([r, w, s]) => {
@@ -72,6 +75,10 @@ export function SettingsPanel(props: {
     loadStaging();
   });
 
+  const loadMc = () => mediaCacheUsage().then(setMcUsage).catch(() => setMcUsage(null));
+  useEffect(() => { loadMc(); }, []);
+  const doMcPreview = () => run("缓存预览", async () => { const r = await mediaCachePreview(); setMcPreview(r); setMcResult(null); props.onToast("info", "可清理 " + r.candidates.length + " 个文件"); });
+  const doMcCleanup = () => run("缓存清理", async () => { if (!mcPreview) return; if (!window.confirm("清理 " + mcPreview.candidates.length + " 个未引用的托管缩略图副本？")) return; const r = await mediaCacheCleanup(mcPreview.token); setMcResult(r); setMcPreview(null); props.onToast("ok", "已清理 " + r.deleted + " 个文件"); loadMc(); });
   const run = (label: string, fn: () => Promise<void>) => {
     if (busy) return;
     setBusy(label);
@@ -218,6 +225,19 @@ export function SettingsPanel(props: {
               </div>
             )}
             <div className="hint" style={{ marginTop: "4px" }}>dry-run 只统计不删除；「执行清理」会二次确认。</div>
+          </div>
+
+          <div className="section" data-testid="media-cache-panel" aria-label="托管缩略图缓存">
+            <h4>托管缩略图缓存</h4>
+            <div className="hint">只清理 dataDir/media 下 24h 前、无任何条目引用的托管副本；原资源/压缩包/其它缓存不动。</div>
+            {mcUsage?.blockedReason && <div className="err">该链接布局不支持清理（root/祖先为 symlink/reparse）</div>}
+            {mcUsage && <div className="hint">占用 {formatBytes(mcUsage.totalBytes)} · 文件 {mcUsage.totalFiles} · 候选 {mcUsage.candidates.length}（引用保护 {mcUsage.protected.referenced} / 近期 {mcUsage.protected.recent} / 未知 {mcUsage.protected.unknown} / 链接 {mcUsage.protected.symlink}）</div>}
+            <div className="row" style={{ gap: "6px", marginTop: "8px" }}>
+              <button className="btn" disabled={!!busy} onClick={doMcPreview}>预览可清理</button>
+              <button className="btn danger" disabled={!!busy || !mcPreview || mcPreview.candidates.length === 0} onClick={doMcCleanup}>执行清理</button>
+            </div>
+            {mcPreview && <div className="hint">预览：{mcPreview.candidates.length} 个文件 / {formatBytes(mcPreview.candidates.reduce((n, c) => n + c.size, 0))}；确认后仅删这些。</div>}
+            {mcResult && <div className="hint">已清理 {mcResult.deleted} 个 / {formatBytes(mcResult.bytesFreed)}；跳过 {mcResult.skipped}，失败 {mcResult.failed}。</div>}
           </div>
 
           <div className="section">

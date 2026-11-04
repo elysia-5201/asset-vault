@@ -1,0 +1,51 @@
+{
+  "schema": "av-exec-manifest/v1",
+  "appRoot": "E:\\tool\\asset-vault\\dist-desktop\\win-unpacked\\resources\\app",
+  "dataPrivate": "E:\\tool\\asset-vault\\.av-apply-private",
+  "releaseId": "a1b2c3d4",
+  "stamp": "20261103-224500",
+  "note": "FIXTURE ONLY — old/new/doNotWrite hashes are recomputed by fixture Set-Pins",
+  "payload": [
+    {
+      "rel": "apps/desktop/build/server.mjs",
+      "bytes": 1,
+      "old": "0000000000000000000000000000000000000000000000000000000000000000",
+      "new": "0000000000000000000000000000000000000000000000000000000000000000",
+      "action": "replace"
+    },
+    {
+      "rel": "apps/desktop/build/build-info.json",
+      "bytes": 1,
+      "old": "0000000000000000000000000000000000000000000000000000000000000000",
+      "new": "0000000000000000000000000000000000000000000000000000000000000000",
+      "action": "replace"
+    },
+    {
+      "rel": "apps/web/dist/assets/index-FIXTURE.js",
+      "bytes": 1,
+      "old": null,
+      "new": "0000000000000000000000000000000000000000000000000000000000000000",
+      "action": "add-new-exclusive"
+    },
+    {
+      "rel": "apps/web/dist/index.html",
+      "bytes": 1,
+      "old": "0000000000000000000000000000000000000000000000000000000000000000",
+      "new": "0000000000000000000000000000000000000000000000000000000000000000",
+      "action": "replace-LAST"
+    }
+  ],
+  "baselineOld": {
+    "apps/web/dist/assets/index-Bf2TnWaM.js": "e8b8ca9692899fb8721b1564c1dcb4199146deffa5f03d2e8a7a236d103d5857"
+  },
+  "doNotWrite": [
+    {
+      "rel": "apps/desktop/build/schema.sql",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "rel": "apps/web/dist/assets/index-DIJUKowW.css",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

@@ -6,7 +6,8 @@ import type { Repo } from "../db/repo";
 import type { MediaStore } from "./media";
 import { applyCategoryEvidence } from "./categories";
 
-export interface ImportOutcome { itemId: number; created: boolean; images: number; meta: BoothItemMeta; files: number }
+export interface ImageStats { requested: number; downloaded: number; added: number; reused: number; duplicates: number; failed: number }
+export interface ImportOutcome { itemId: number; created: boolean; images: number; meta: BoothItemMeta; files: number; imageStats: ImageStats }
 
 /** 从 BOOTH 元数据构造 items 字段（新建与关联共用同一套）。 */
 function buildFields(parsed: { itemId: string; canonicalUrl: string }, meta: BoothItemMeta, status: "active" | "inbox") {
@@ -21,31 +22,60 @@ function buildFields(parsed: { itemId: string; canonicalUrl: string }, meta: Boo
 }
 
 /** 抓图集 + 写快照（幂等：已存在同 source_url 的图会跳过）。 */
-async function attachImagesAndSnapshot(repo: Repo, media: MediaStore, client: BoothClient, itemId: number, meta: BoothItemMeta): Promise<{ images: number; files: number }> {
-  const urls = meta.images.slice(0, MAX_IMAGES);
-  const already = new Set(repo.listImages(itemId).map((i) => i.source_url ?? ""));
-  let images = 0;
-  const startPos = repo.listImages(itemId).length;
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i]!.original;
-    if (already.has(url)) continue;
+async function attachImagesAndSnapshot(repo: Repo, media: MediaStore, client: BoothClient, itemId: number, meta: BoothItemMeta): Promise<{ images: number; files: number; imageStats: ImageStats }> {
+  // requested = 去重后的 URL 数；重复 URL 同次只处理一次。
+  const urls = [...new Set(meta.images.slice(0, MAX_IMAGES).map((u) => u.original))];
+  const requested = urls.length;
+  // 媒体 I/O 在事务外：对每个 URL 真实下载验证可用（含已见 URL，避免 added=0 永久不清默认）。
+  const pending: { url: string; saved: Awaited<ReturnType<MediaStore["saveImage"]>> }[] = [];
+  for (const url of urls) {
     try {
       const { bytes } = await client.fetchImage(url);
       const saved = await media.saveImage(itemId, bytes, "jpg");
-      repo.addImage(itemId, {
-        role: repo.listImages(itemId).some((r) => r.role === "cover") ? "gallery" : "cover",
-        origin: "booth", source_url: url, file_path: saved.filePath, thumb_path: saved.thumbPath,
-        width: saved.width, height: saved.height, bytes: saved.bytes, sha256: saved.sha256, position: startPos + i,
-      });
-      images++;
+      pending.push({ url, saved });
     } catch { /* 单图失败不影响建档 */ }
+  }
+  const downloaded = pending.length;
+  const preexisting = new Set(repo.listImages(itemId).map((i) => i.sha256).filter(Boolean) as string[]);
+  let added = 0, reused = 0, duplicates = 0;
+  const ids = new Set<number>();
+  if (pending.length > 0) {
+    // 图片 DB 写（去重/新行/删默认/cover）原子提交；失败全部回滚。
+    repo.transaction(() => {
+      for (const p of pending) {
+        const dup = repo.findImageBySha(itemId, p.saved.sha256);
+        if (dup) {
+          if (preexisting.has(p.saved.sha256)) reused++; else duplicates++;
+          if (dup.origin === "user") {
+            // 用户手工图：保留 origin/role；仅在 source_url 为空时补 BOOTH 地址作为来源标记。
+            if (!dup.source_url) repo.updateImage(dup.id, { source_url: p.url });
+          } else {
+            repo.updateImage(dup.id, {
+              origin: "booth", source_url: p.url, role: ids.size === 0 ? "cover" : "gallery",
+              file_path: p.saved.filePath, thumb_path: p.saved.thumbPath, width: p.saved.width, height: p.saved.height, bytes: p.saved.bytes,
+            });
+          }
+          ids.add(dup.id);
+        } else {
+          const img = repo.addImage(itemId, {
+            role: ids.size === 0 ? "cover" : "gallery", origin: "booth", source_url: p.url,
+            file_path: p.saved.filePath, thumb_path: p.saved.thumbPath, width: p.saved.width, height: p.saved.height, bytes: p.saved.bytes, sha256: p.saved.sha256,
+          });
+          added++;
+          ids.add(img.id);
+        }
+      }
+      for (const img of repo.listImages(itemId)) if (img.origin === "archive") repo.deleteImage(itemId, img.id);
+      repo.setCover(itemId, [...ids][0]!);
+    });
   }
   const files = meta.variations.flatMap((v) => v.files.map((f) => ({ name: f.name, size: f.file_size ?? null, variation: v.id })));
   repo.addSnapshot(itemId, "booth", {
     jsonHash: sha256Text(JSON.stringify({ n: meta.title, p: meta.priceText, i: meta.images.map((x) => x.original), f: files })),
     files, priceText: meta.priceText, imageUrls: meta.images.map((x) => x.original),
   });
-  return { images, files: files.length };
+  const imageStats: ImageStats = { requested, downloaded, added, reused, duplicates, failed: requested - downloaded };
+  return { images: ids.size, files: files.length, imageStats };
 }
 
 const MAX_IMAGES = 12;
@@ -93,7 +123,7 @@ export async function importBoothUrl(
     repo.attachTags(targetId, meta.tags.map((t) => t.name), "auto");
     const outcome = await attachImagesAndSnapshot(repo, media, client, targetId, meta);
     classifyQuietly(repo, targetId);
-    return { itemId: targetId, created: false, images: outcome.images, meta, files: outcome.files };
+    return { itemId: targetId, created: false, images: outcome.images, meta, files: outcome.files, imageStats: outcome.imageStats };
   }
   const existing = owner;
   const fields = {
@@ -110,24 +140,33 @@ export async function importBoothUrl(
   else { const row = repo.createItem({ ...(fields as any), status: "active" }); itemId = row.id; created = true; }
   repo.attachTags(itemId, meta.tags.map((t) => t.name), "auto");
 
-  let images = 0;
-  const urls = meta.images.slice(0, MAX_IMAGES);
-  const already = new Set(repo.listImages(itemId).map((i) => i.source_url ?? ""));
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i]!.original;
-    if (already.has(url)) continue;
-    try {
-      const { bytes } = await client.fetchImage(url);
-      const saved = await media.saveImage(itemId, bytes, "jpg");
-      repo.addImage(itemId, { role: i === 0 ? "cover" : "gallery", origin: "booth", source_url: url, file_path: saved.filePath, thumb_path: saved.thumbPath, width: saved.width, height: saved.height, bytes: saved.bytes, sha256: saved.sha256, position: i });
-      images++;
-    } catch { /* 单图失败不影响建档 */ }
-  }
-  const files = meta.variations.flatMap((v) => v.files.map((f) => ({ name: f.name, size: f.file_size ?? null, variation: v.id })));
-  repo.addSnapshot(itemId, "booth", {
-    jsonHash: sha256Text(JSON.stringify({ n: meta.title, p: meta.priceText, i: meta.images.map((x) => x.original), f: files })),
-    files, priceText: meta.priceText, imageUrls: meta.images.map((x) => x.original),
-  });
+  const outcome = await attachImagesAndSnapshot(repo, media, client, itemId, meta);
   classifyQuietly(repo, itemId);
-  return { itemId, created, images, meta, files: files.length };
+  return { itemId, created, images: outcome.images, meta, files: outcome.files, imageStats: outcome.imageStats };
+}
+
+/**
+ * 提交后 attach-only（spec §6.4 / P3-6）：只给**已存在**的 item 附加 BOOTH 元数据/图片/标签/分类。
+ * 契约：禁止 createItem、禁止 moveAssets、禁止改 asset owner；失败由调用方 best-effort 处理。
+ * 不复用 importBoothUrl（它会建 item / 迁资产）。
+ */
+export async function attachBoothMetadata(
+  repo: Repo,
+  media: MediaStore,
+  client: BoothClient,
+  itemId: number,
+  meta: BoothItemMeta,
+): Promise<void> {
+  if (!repo.getItem(itemId)) {
+    throw Object.assign(new Error("attachBoothMetadata: item 不存在 #" + itemId), { code: "NOT_FOUND", status: 404 });
+  }
+  const parsed = parseBoothUrl(meta.url) ?? { itemId: meta.itemId, canonicalUrl: meta.url };
+  // attach-only：status 是生命周期字段，不在允许列表；保留既有 status（inbox/active/archived/trashed），
+  // 不能从 inbox 推断“本事务新建”再擅置 active（会复活 trashed/archived item）。
+  const fields = buildFields(parsed, meta, "active") as Record<string, unknown>;
+  delete fields.status;
+  repo.updateItem(itemId, fields as any);
+  repo.attachTags(itemId, meta.tags.map((t) => t.name), "auto");
+  await attachImagesAndSnapshot(repo, media, client, itemId, meta);
+  classifyQuietly(repo, itemId);
 }

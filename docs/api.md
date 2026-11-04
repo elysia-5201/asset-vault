@@ -382,3 +382,79 @@ v3 是 v2 之上的**增量**：一级分类 15 个（含系统分类「未分�
 v0.5.1 可打开 v5 库（多出的表/列被忽略），但不会消费 `index_tasks`；回滚前请备份
 `vault.db` + `vault.db-wal` + `vault.db-shm`（只复制主库会因 WAL 重放不一致）。
 
+## 导入预检 / 两阶段下载 / 版本关系（feature123，v10）
+
+本节只追加新端点；既有条目与响应形状不变。所有错误沿用 `{error:{code,message,details?}}`，
+子码只放 `details.code`（不新增外层 `AppErrorCode`）。
+
+### 导入预检（只读）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/import/precheck` `{paths[], source?, budget?}` | 只读预检：不写库、不建 job、不写缓存。返回 `{checkedAt, budget:{maxBytes,maxMs,usedBytes,usedMs,truncated}, results[]}`；每行含 `path/pathNorm/group/size/mtime/hash/match/summary/warnings`。`paths` 必须是绝对路径；目录会展开（深度/数量/字节/时间预算内），超预算 `truncated=true` 且未展示的文件不会被登记。 |
+
+### 接受列表导入
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/import/paths` `{files:[{path,expected:{size,mtime,sha256?},group?}]}` | 新形状：每个文件一个 `import_file` job（payload `{path,expected,group}`），**不递归**；目录 → 400 `DIRECTORY_NOT_ALLOWED_WITH_FILES`；缺 expected → 400 `EXPECTED_REQUIRED`；重复路径按 `path_norm` 去重进 `duplicates`。返回 `{jobIds,duplicates,legacy:false}`。 |
+| POST | `/import/paths` `{paths:[...]}` | 旧形状原样保留：目录递归、无 expected，payload 记 `legacy:true`。返回 `{jobIds,duplicates:[],legacy:true}`。 |
+
+执行期重验：`expected.sha256` 存在则当次强制重算并比对（`verified:"sha256"`），否则只比 size+mtime
+（`verified:"metadata"`，不冒充 exact）。任何不一致 → `PRECHECK_STALE`，不登记。
+
+### 两阶段下载（stage → commit）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/import/download` `{stage:true,url,itemId?,fileName?,downloadRoot?}` | 只下载 + 只读预检 + 发 token：**不建 item/images/tags/job**。下载根来自服务端配置（`download_root` 或 `<dataDir>/downloads`）；body `downloadRoot` 只能与之一致，不一致 400。返回 `{staged:true,stageToken,bytes,fileName,precheck,meta?}`。 |
+| POST | `/import/download/commit` `{stageToken,decision:"import"\|"skip"}` | token 校验/重算在事务外；回执优先（重放返回原指针）。`import` → 建/复用条目 + 登记资产；`skip` → 只消费 token，文件保留。子码：`STAGE_TOKEN_INVALID`(410) / `STAGE_TOKEN_EXPIRED`(410) / `STAGE_TOKEN_CONSUMED`(409) / `STAGE_FILE_CHANGED`(409) / `STAGE_COMMITTED_OBJECT_DELETED`(410)。 |
+| POST | `/import/download`（无 `stage`） | 旧一步式下载：行为与响应形状不变（`{itemId,path,bytes,fileName,images,assetId,jobId}`）。 |
+
+### 同步登记资产（expected 强验 + 严格 owner 门）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/items/:id/assets` `{path,expected?}` | 任何业务写入前：有 `expected` 先重验 size/mtime（有 sha256 强制重算）→ 不一致 409 `PRECHECK_STALE`；随后查 `path_norm` 归属 → 属于另一个条目 409 `PATH_OWNED_BY_OTHER_ITEM`（`details:{itemId,assetId}`），不登记、不迁 owner；同 owner 幂等（`added:0`）。无 `expected` 的 legacy 请求跳过重验，但 owner 门仍生效。返回 `{added,assetIds}`。 |
+
+### 版本关系
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/items/:id/version-links?state=&limit=&offset=` | `{itemId,total,links[]}`；每条含 `assets:{a,b}` 只读投影。 |
+| POST | `/items/:id/version-links` `{assetAId,assetBId,relation,basis?,evidence?}` | 人工建立的是 `candidate`（需确认），不冒充 proven；两个资产必须都属于该条目。 |
+| PATCH | `/items/:id/version-links/:linkId` `{state?,relation?,expectedVersion}` | CAS：`expectedVersion` 过期 409。 |
+| DELETE | `/items/:id/version-links/:linkId` | 删除关系记录（不动资产）。 |
+
+### 按模型搭配清单
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/avatars/:id/loadouts` | `{loadouts[]}`（含 `itemCount/stateCounts/trashedCount/version`）。 |
+| POST | `/avatars/:id/loadouts` `{name,note?}` | 201 `{loadout}`；同名 409 `LOADOUT_NAME_TAKEN`。 |
+| GET | `/loadouts/:id?state=&includeTrashedItems=0\|1&limit=&offset=` | 详情：`{loadout,total,stateCounts,visibleStateCounts,trashedCount,items[]}`；墓碑行永不返回。 |
+| PATCH | `/loadouts/:id` `{name?,note?,sort?,expectedVersion}` | 只保护 name/note/sort；CAS 失败 409 `LOADOUT_VERSION_CONFLICT`。 |
+| DELETE | `/loadouts/:id` | 只删清单与清单项，不删 item/asset/文件。 |
+| POST | `/loadouts/:id/items` `{itemIds[],state?,note?}` | 幂等添加：已有活跃行不覆盖；墓碑行复活到末尾。 |
+| POST | `/loadouts/:id/items/reorder` `{itemIds[],hiddenIds?}` | 只提交可见行；截断时 400。 |
+| PATCH | `/loadouts/:id/items/:itemId` `{state?,note?,position?,expectedVersion}` | 条目级 CAS 409 `LOADOUT_ITEM_VERSION_CONFLICT`。 |
+| DELETE | `/loadouts/:id/items/:itemId` | 墓碑删除（`removed:0\|1`，幂等）。 |
+
+### 整理待办
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/cleanup/todos?localSourcePolicy=&rule=&ignored=&q=&avatar=&category=&sort=&limit=&offset=` | 纯读派生；`localSourcePolicy` **必填**（缺失 400 `LOCAL_POLICY_REQUIRED`）。`total` 是当前列表行数，`counts` 是规则命中计数（不受 rule/ignored 过滤）。 |
+| GET | `/cleanup/ignores?localSourcePolicy=&resolved=&limit=&offset=` | 独立管理视图（含归档/回收站）；`resolved` 按请求策略单条求值。 |
+| POST | `/cleanup/ignore` `{itemId,rule,note?}` | 幂等 upsert；返回行的 `resolved` 是 include_local 视图，需按所选策略重拉。 |
+| DELETE | `/cleanup/ignore/:itemId/:rule` | 恢复 = 删忽略行；幂等 `{removed:0\|1}`，不 404。 |
+| GET | `/cleanup/filters` | `{filters[]}`。 |
+| POST | `/cleanup/filters` `{name,filter}` | 201；`filter.localSourcePolicy` 必填；同名 409。 |
+| PATCH | `/cleanup/filters/:id` `{name?,filter?,expectedVersion}` | name-only 不要求策略；替换 filter 必须自带策略；CAS 失败/同名 409。 |
+| DELETE | `/cleanup/filters/:id` | 幂等 `{deleted:0\|1}`。 |
+
+### 合并条目的事务扩展
+
+`POST /items/merge` 的响应在既有字段外追加 `loadoutMerge`（`{conflicts,revived,moved,bothTombstone,noop}`）
+与 `cleanupIgnoresMoved`（数字）。清单成员与整理忽略的迁移与资产/版本关系迁移在**同一事务**内完成：
+任一环节失败（CAS 0 行、审计写入失败、触发器 ABORT）整体回滚。

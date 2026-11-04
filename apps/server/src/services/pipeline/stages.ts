@@ -349,6 +349,14 @@ export async function stageThumbs(ctx: StageCtx, asset: AssetRow): Promise<Stage
   const st = safeStat(asset.path);
   if (!st) return { skipped: "file missing" };
   const itemId = asset.item_id;
+  // 来源优先：已有可用 BOOTH 商品图的条目，不再补 archive 默认图（避免扫描/索引把 BOOTH 图挤回默认图）。
+  const isBoothImageUrl = (u: string): boolean => {
+    try {
+      const h = new URL(u).hostname.toLowerCase();
+      return ["booth.pximg.net", "booth.pm"].some((a) => h === a || h.endsWith("." + a));
+    } catch { return false; }
+  };
+  if ((ctx.repo.listImages(itemId) as any[]).some((i) => i.origin === "booth" || (i.origin === "user" && isBoothImageUrl(String(i.source_url || ""))))) return { skipped: "booth images present" };
   const existing = new Set((ctx.repo.listImages(itemId) as any[]).map((i) => i.sha256).filter(Boolean));
   let saved = 0;
   let failed = 0;
