@@ -3,7 +3,7 @@ import type { AvatarMatch, CategoryNode, JobRow, LibraryRootRow, TagRow } from "
 import {
   apiMode, categoryApiMessage, checkAppUpdate, describeError, getCategories, getCategoryCounts, getHealth,
   listAvatars, listItems, listJobs, listProjects, listRoots, listTags,
-  onModeChange, patchItem, recordImport, retryConnect, jobAction as apiJobAction,
+  onModeChange, patchItem, recordImport, registerProject, retryConnect, unityStatus, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
 import type { AvatarCard, CategoryCounts, CategoryStats, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
@@ -16,9 +16,12 @@ import { ItemCardView } from "./components/ItemCardView";
 import { ItemDetail } from "./components/ItemDetail";
 import { JobsPanel } from "./components/JobsPanel";
 import { ImportPanel } from "./components/ImportPanel";
+import { GlobalDrop } from "./global-drop";
+import type { ExternalBatch } from "./file-intake";
 import { DuplicatesPanel } from "./components/DuplicatesPanel";
 import { AvatarWorkbench } from "./components/AvatarWorkbench";
 import type { WorkbenchFocus } from "./workbench-focus";
+import type { LoadoutWorkbenchScope } from "./loadout-workbench";
 import { ScanPreviewPanel } from "./components/ScanPreviewPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { LoadoutPanel } from "./components/LoadoutPanel";
@@ -38,6 +41,10 @@ export default function App() {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === "bad" ? 9000 : 4500);
   }, []);
 
+  // 全局拖入/粘贴批次（N2）：带单调 id 的队列。ImportPanel 按 id 消费，App 按 id CAS 移除，
+  // 因此同 tick 的 A+B 不会互相覆盖，清空回调也不会抹掉更晚的新批次。
+  const [externalBatches, setExternalBatches] = useState<ExternalBatch[]>([]);
+  const batchSeq = useRef(0);
   const [avatars, setAvatars] = useState<AvatarCard[]>([]);
   const [avatarsLoading, setAvatarsLoading] = useState(true);
   const [items, setItems] = useState<ItemCardWeb[]>([]);
@@ -68,7 +75,7 @@ export default function App() {
   const [managerOpen, setManagerOpen] = useState(false);
   /** 批量分类：选择模式（独立复选框，不复用整卡点击） */
   const [selectMode, setSelectMode] = useState(false);
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [batchSelection, setBatchSelection] = useState<{ scope: string; ids: number[] }>({ scope: "", ids: [] });
   const [selectedItemId, setSelectedItemId] = useState<number | null>(null);
   const [importedIds, setImportedIds] = useState<number[]>([]);
   const [sideTab, setSideTab] = useState<"import" | "jobs">("import");
@@ -76,14 +83,26 @@ export default function App() {
   const [dupPanel, setDupPanel] = useState(false);
   /** 扫描变更中心（M1）：先预览、确认后再写库。 */
   const [previewPanel, setPreviewPanel] = useState(false);
+  const [scanRootId, setScanRootId] = useState<number>();
+  const openScanPanel = (rootId?: number) => { setScanRootId(rootId); setPreviewPanel(true); };
   /** Avatar 素材工作台：选 Avatar → 素材清单 → 导入计划 → 执行状态（task-39）。 */
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   /** 从条目详情打开时的选包上下文（null = 顶部按钮打开，不预选）。 */
   const [workbenchFocus, setWorkbenchFocus] = useState<WorkbenchFocus | null>(null);
+  const [workbenchLoadout, setWorkbenchLoadout] = useState<LoadoutWorkbenchScope | null>(null);
   /** 设置面板：库根 / 收件箱监听 / 下载与集成。 */
   const [settingsPanel, setSettingsPanel] = useState(false);
   /** 整理待办面板（cleanup-todos §7.1：更多工具 → 整理待办）。 */
   const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupItemOpen, setCleanupItemOpen] = useState(false);
+  const [cleanupRefreshKey, setCleanupRefreshKey] = useState(0);
+  const closeItemDetail = () => {
+    setSelectedItemId(null);
+    if (cleanupItemOpen) {
+      setCleanupItemOpen(false);
+      setCleanupRefreshKey((key) => key + 1);
+    }
+  };
   /** 搭配清单面板（avatar-loadouts §7.2：头像轨「搭配」入口，按选中模型打开）。 */
   const [loadoutOpen, setLoadoutOpen] = useState(false);
   const [loadoutAvatarId, setLoadoutAvatarId] = useState<number | null>(null);
@@ -127,12 +146,26 @@ export default function App() {
       .catch((e) => { setCategories([]); setCatStats(null); setCatErr(categoryApiMessage(e, "加载分类")); });
   }, []);
 
+  const loadProjects = useCallback(async () => {
+    const { projects } = await listProjects();
+    setProjects(projects);
+  }, []);
+
+  const registerCurrentProject = useCallback(async () => {
+    const status = await unityStatus();
+    const path = status.ok ? status.editor?.projectPath?.trim() : "";
+    if (!path) throw new Error("请先打开目标 Unity 工程并连接 MCP for Unity");
+    const id = await registerProject(path, status.editor?.projectName?.trim() || undefined);
+    await loadProjects();
+    return id;
+  }, [loadProjects]);
+
   const loadMeta = useCallback(() => {
     getHealth().then(setHealth).catch(() => setHealth(null));
     listTags().then((r) => setTags(r.tags)).catch(() => setTags([]));
     listRoots().then((r) => setRoots(r.roots)).catch(() => setRoots([]));
-    listProjects().then((r) => setProjects(r.projects)).catch(() => setProjects([]));
-  }, []);
+    void loadProjects().catch(() => setProjects([]));
+  }, [loadProjects]);
 
   useEffect(() => { loadAvatars(); loadMeta(); loadJobs(); loadCategories(); }, [mode, loadAvatars, loadMeta, loadJobs, loadCategories]);
 
@@ -198,6 +231,15 @@ export default function App() {
     imported: (filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0) as 1 | 0 | undefined,
   }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.container, filters.favoriteOnly, filters.imported]);
 
+  const queryScope = JSON.stringify([commonQuery, catQuery, filters.pendingCategory]);
+  const batchScope = JSON.stringify([text, queryScope]);
+  const [itemsScope, setItemsScope] = useState("");
+  useEffect(() => {
+    if (batchSelection.scope === batchScope || !batchSelection.ids.length) return;
+    setBatchSelection({ scope: batchScope, ids: [] });
+    toast("info", "筛选已变化，已清空批量选择");
+  }, [batchSelection, batchScope, toast]);
+
   /**
    * 列表分页：首屏 120 条，之后按 offset 累加（无限滚动 + 「加载更多」按钮兜底）。
    * - token 防串台：筛选一变，旧请求的响应直接丢弃（否则慢请求会把新结果覆盖回去）；
@@ -225,6 +267,7 @@ export default function App() {
     })
       .then((r) => {
         if (token !== loadToken.current) return;      // 过期响应：筛选已变
+        setItemsScope(queryScope);
         setTotal(r.total);
         setItems((prev) => {
           if (!append) { itemsRef.current = r.items; return r.items; }
@@ -236,7 +279,7 @@ export default function App() {
       })
       .catch((e) => { if (token === loadToken.current) setItemsErr(describeError(e)); })
       .finally(() => { if (token !== loadToken.current) return; setItemsLoading(false); setLoadingMore(false); });
-  }, [commonQuery, catQuery, filters.pendingCategory, filters.sort]);
+  }, [commonQuery, catQuery, filters.pendingCategory, filters.sort, queryScope]);
   const loadMore = useCallback(() => loadItems({ append: true }), [loadItems]);
   useEffect(() => { loadItems(); }, [loadItems]);
 
@@ -261,6 +304,10 @@ export default function App() {
       .catch(() => setCatCounts(null));
   }, [commonQuery]);
   useEffect(() => { loadCounts(); }, [loadCounts, mode]);
+  const refreshLibrary = () => { loadItems(); loadJobs(); loadMeta(); loadAvatars(); loadCategories(); loadCounts(); };
+  const refreshAfterScan = useCallback(() => { loadItems(); loadMeta(); loadCounts(); }, [loadItems, loadMeta, loadCounts]);
+  const refreshCategoryResults = useRef({ loadItems, loadCounts });
+  useEffect(() => { refreshCategoryResults.current = { loadItems, loadCounts }; }, [loadItems, loadCounts]);
 
   useEffect(() => {
     if (!jobsAuto) return;
@@ -290,7 +337,19 @@ export default function App() {
   // 本地登记只用于卡片徽标（ItemCard 无 imported 字段）。
   const shownItems = items;
 
-  const toggleSelect = (id: number) => setSelectedIds((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const batchReady = text === debounced && itemsScope === queryScope && !itemsErr;
+  const visibleIds = useMemo(() => new Set(items.map((item) => item.id)), [items]);
+  const selectedIds = batchReady && batchSelection.scope === batchScope
+    ? batchSelection.ids.filter((id) => visibleIds.has(id))
+    : [];
+  const clearBatchSelection = () => setBatchSelection({ scope: batchScope, ids: [] });
+  const toggleSelect = (id: number) => {
+    if (!batchReady || !visibleIds.has(id)) return;
+    setBatchSelection((before) => {
+      const ids = before.scope === batchScope ? before.ids.filter((key) => visibleIds.has(key)) : [];
+      return { scope: batchScope, ids: ids.includes(id) ? ids.filter((key) => key !== id) : [...ids, id] };
+    });
+  };
   /** 选中项里「未分类」的（cat_id IS NULL）——「仅对未分类批量」用 */
   const uncategorizedSelected = useMemo(
     () => items.filter((i) => selectedIds.includes(i.id) && !(i.category?.categoryId)).map((i) => i.id),
@@ -384,7 +443,8 @@ export default function App() {
    * 因此登记后按 Esc 等价于无操作；模态关闭即出栈，原来的 Esc 层级照常工作
    * （关掉详情后按 Esc 仍会关侧栏/分类弹层并把焦点还给对应入口）。
    */
-  const modalOpen = selectedItemId !== null || workbenchOpen;
+  const modalOpen = selectedItemId !== null || workbenchOpen || managerOpen || dupPanel
+    || previewPanel || settingsPanel || cleanupOpen || loadoutOpen || !!updateInfo;
   useEffect(() => {
     if (!modalOpen) return;
     pushEscLayer("foreground-modal");
@@ -397,15 +457,10 @@ export default function App() {
     setSelectedAvatarIds([]);
   }, [filters]);
 
-  /** 搭配清单入口：只按用户显式选中的**恰好一个**模型打开；0/多选只提示，不猜。 */
   const openLoadouts = useCallback(() => {
-    if (effAvatarIds.length !== 1) {
-      toast("info", "先在头像轨选中恰好一个模型，再打开搭配清单");
-      return;
-    }
-    setLoadoutAvatarId(effAvatarIds[0]);
+    setLoadoutAvatarId(effAvatarIds.length === 1 ? effAvatarIds[0] : null);
     setLoadoutOpen(true);
-  }, [effAvatarIds, toast]);
+  }, [effAvatarIds]);
 
   const counts = health?.counts;
   const inFlight = jobs.filter((j) => ["queued", "resolving", "fetching", "materializing", "indexing", "matching", "releasing", "releasing_done"].includes(j.state)).length;
@@ -433,19 +488,24 @@ export default function App() {
             <details className="more-tools" ref={moreToolsRef} open={moreToolsOpen} onToggle={(e) => setMoreToolsOpen(e.currentTarget.open)}>
               <summary className="btn tiny" aria-haspopup="menu" title="低频工具与设置">更多工具 ▾</summary>
               <div className="more-menu" role="menu">
-                <button role="menuitem" title="库级查重：按资产内容签名聚类疑似重复（GET /api/duplicates）" onClick={() => { closeMoreTools(); setDupPanel(true); }}>库级查重</button>
-                <button role="menuitem" title="分类管理：一级/二级分类与标签的增改、排序、启停、合并" onClick={() => { closeMoreTools(); setManagerOpen(true); }}>分类管理</button>
-                <button role="menuitem" title="扫描变更中心：先落库一份「这次会变成什么」的清单，勾选确认后再应用（不移动/不删除源文件）" onClick={() => { closeMoreTools(); setPreviewPanel(true); }}>扫描预览</button>
-                <button role="menuitem" title="整理待办：缺封面/缺来源/未关联模型/文件失联四类规则 + 忽略与保存筛选（GET /api/cleanup/todos）" onClick={() => { closeMoreTools(); setCleanupOpen(true); }}>整理待办</button>
-                <button role="menuitem" title="批量分类：在列表卡片上加复选框，批量设置主/子分类" onClick={() => { closeMoreTools(); setSelectMode((v) => !v); setSelectedIds([]); }}>{selectMode ? "退出批量选择" : "批量分类"}</button>
-                <div className="more-sep" />
-                <button role="menuitem" title="设置：库根 / 收件箱监听 / 下载与集成" onClick={() => { closeMoreTools(); setSettingsPanel(true); }}>设置</button>
-                <button role="menuitem" disabled={updateBusy} title="检查应用更新（GET /api/update-check?force=1，查 GitHub Releases）" onClick={() => { closeMoreTools(); doCheckUpdate(); }}>{updateBusy ? "检查中…" : "检查更新"}</button>
-                {mode === "mock" && (
-                  <button role="menuitem" title="立刻再探一次后端（后台每 4 秒也会自动重连）" onClick={() => { closeMoreTools(); void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
-                )}
-                <div className="more-sep" />
-                <button role="menuitem" onClick={() => { closeMoreTools(); loadItems(); loadJobs(); loadMeta(); }}>全部刷新</button>
+                <div role="group" aria-label="库维护">
+                  <div className="more-menu-label" aria-hidden="true">库维护</div>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); openScanPanel(); }}>扫描库</button>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); setDupPanel(true); }}>库级查重</button>
+                </div>
+                <div role="group" aria-label="素材整理">
+                  <div className="more-menu-label" aria-hidden="true">素材整理</div>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); setCleanupOpen(true); }}>整理待办</button>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); setManagerOpen(true); }}>分类与标签</button>
+                </div>
+                <div role="group" aria-label="应用">
+                  <div className="more-menu-label" aria-hidden="true">应用</div>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); setSettingsPanel(true); }}>设置</button>
+                  <button role="menuitem" onClick={() => { closeMoreTools(); refreshLibrary(); }}>全部刷新</button>
+                  {mode === "mock" && (
+                    <button role="menuitem" onClick={() => { closeMoreTools(); void retryConnect().then((m) => { if (m === "mock") toast("bad", "还是连不上后端，继续每 4 秒重试…"); }); }}>重连</button>
+                  )}
+                </div>
               </div>
             </details>
           </div>
@@ -463,6 +523,7 @@ export default function App() {
           <h1>素材库</h1>
           <span className="hint main-head-sub">浏览为主 · 素材总览</span>
           <span className="spacer" />
+          {!selectMode && <button className="btn tiny" onClick={() => { clearBatchSelection(); setSelectMode(true); }}>批量分类</button>}
           <button
             ref={sideToggleRef}
             type="button"
@@ -490,10 +551,17 @@ export default function App() {
             uncategorizedIds={uncategorizedSelected}
             categories={categories}
             catErr={catErr}
-            onClearSelection={() => setSelectedIds([])}
-            onExitSelectMode={() => { setSelectMode(false); setSelectedIds([]); }}
+            onClearSelection={clearBatchSelection}
+            onExitSelectMode={() => { setSelectMode(false); clearBatchSelection(); }}
             onToast={toast}
-            onDone={() => { loadItems(); loadCategories(); setSelectedIds([]); }}
+            onDone={(failedIds) => {
+              refreshCategoryResults.current.loadItems();
+              refreshCategoryResults.current.loadCounts();
+              loadCategories();
+              setBatchSelection((before) => before.scope === batchScope
+                ? { scope: batchScope, ids: before.ids.filter((id) => failedIds.includes(id)) }
+                : before);
+            }}
           />
         )}
         <div className="col-scroll">
@@ -506,7 +574,7 @@ export default function App() {
           )}
           {itemsLoading && !shownItems.length && <div className="empty"><Spinner /> 载入条目…</div>}
           <div className="grid">
-            {shownItems.map((it) => (
+            {(!selectMode || batchReady) && shownItems.map((it) => (
               <ItemCardView
                 key={it.id} item={it} onOpen={setSelectedItemId} onToggleFavorite={toggleFavorite}
                 imported={importedIds.includes(it.id) || filters.imported === "yes"}
@@ -515,6 +583,7 @@ export default function App() {
               />
             ))}
           </div>
+          {selectMode && !batchReady && !itemsErr && <div className="empty"><Spinner /> 加载当前筛选的素材…</div>}
           {shownItems.length < total && (
             <div ref={sentinelRef} style={{ display: "flex", justifyContent: "center", padding: "2px 12px 14px" }}>
               <button className="btn tiny" disabled={loadingMore} onClick={loadMore}>
@@ -544,17 +613,34 @@ export default function App() {
             <button className={sideTab === "jobs" ? "on" : ""} onClick={() => setSideTab("jobs")}>作业 {inFlight ? "(" + inFlight + ")" : ""}</button>
           </div>
           <span className="spacer" />
-          <button className="btn tiny" onClick={() => { loadItems(); loadJobs(); loadMeta(); }}>全部刷新</button>
+          <button className="btn tiny" onClick={refreshLibrary}>全部刷新</button>
           <button className="btn tiny" onClick={closeSide} title="收起侧栏（Esc）" aria-label="收起侧栏">收起</button>
         </div>
-        {sideTab === "import"
-          ? <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} onOpenItem={setSelectedItemId} />
-          : <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />}
+        {/* H2：两个面板都常驻，切 tab 只切 display——切到「作业」再回来，草稿/预检卡/勾选/在飞门都还在。 */}
+        <div style={{ display: sideTab === "import" ? "flex" : "none", flexDirection: "column", flex: 1, minHeight: 0 }}>
+          <ImportPanel roots={roots} onToast={toast} onJobsChanged={loadJobs} onDataChanged={() => { loadItems(); loadMeta(); }} mode={mode} onOpenItem={setSelectedItemId} onOpenScan={() => openScanPanel()}
+            externalBatches={externalBatches} onExternalPathsConsumed={(id) => setExternalBatches((prev) => prev.filter((b) => b.id !== id))} />
+        </div>
+        <div style={{ display: sideTab === "jobs" ? "flex" : "none", flexDirection: "column", flex: 1, minHeight: 0 }}>
+          <JobsPanel jobs={jobs} loading={jobsLoading} auto={jobsAuto} onAuto={setJobsAuto} onRefresh={loadJobs} onAction={doJobAction} onToast={toast} />
+        </div>
       </aside>
+
+      {/* App 级单例：任意页拖入/粘贴都走同一入口（G1 C4）。 */}
+      <GlobalDrop
+        onPaths={(paths) => {
+          // F8/N2：追加带 id 的批次而不是替换（连续拖入不丢 A）；并切到「导入」tab + 打开侧栏。
+          const id = ++batchSeq.current;
+          setExternalBatches((prev) => [...prev, { id, paths }]);
+          setSideTab("import");
+          setSideOpen(true);
+        }}
+        onToast={toast}
+      />
 
       {/* 有更新才弹的居中面板：当前版本 → 最新版本 + Release 链接 + notes 前 500 字 + 资产文件名/大小 */}
       {updateInfo && (
-        <div className="backdrop" onClick={() => setUpdateInfo(null)}>
+        <div className="backdrop app-update-backdrop" onClick={() => setUpdateInfo(null)}>
           <div className="drawer update-panel" role="dialog" aria-label="发现新版本" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
               <h3>发现新版本</h3>
@@ -600,16 +686,17 @@ export default function App() {
 
       {/* 查重面板先渲染：点条目打开详情时，详情（后渲染、同 z-index）盖在它上面，关掉详情即回到面板 */}
       {settingsPanel && (
-        <SettingsPanel onClose={() => setSettingsPanel(false)} onToast={toast} onChanged={() => { loadMeta(); loadItems(); }} />
+        <SettingsPanel hidden={previewPanel || !!updateInfo} onClose={() => setSettingsPanel(false)} onToast={toast} onChanged={() => { loadMeta(); loadItems(); }}
+          onOpenScan={openScanPanel} onCheckUpdate={doCheckUpdate} checkingUpdate={updateBusy} />
       )}
       {previewPanel && (
-        <ScanPreviewPanel roots={roots} onClose={() => setPreviewPanel(false)} onToast={toast} onChanged={() => { loadItems(); loadMeta(); }} />
+        <ScanPreviewPanel roots={roots} initialRootId={scanRootId} onJobsChanged={loadJobs} onClose={() => setPreviewPanel(false)} onToast={toast} onChanged={refreshAfterScan} />
       )}
       {dupPanel && (
         <DuplicatesPanel onClose={() => setDupPanel(false)} onOpenItem={setSelectedItemId} onToast={toast} />
       )}
       {cleanupOpen && (
-        <div className="backdrop" onClick={() => setCleanupOpen(false)}>
+        <div className="backdrop" hidden={cleanupItemOpen} onClick={() => setCleanupOpen(false)}>
           <div className="drawer" role="dialog" aria-label="整理待办" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
               <h3>整理待办</h3>
@@ -618,27 +705,43 @@ export default function App() {
             </div>
             <div className="drawer-body" style={{ gridTemplateColumns: "1fr" }}>
               <div className="left" style={{ borderRight: "none" }}>
-                <CleanupPanel onOpenItem={(id) => { setCleanupOpen(false); setSelectedItemId(id); }} onToast={toast} />
+                <CleanupPanel refreshKey={cleanupRefreshKey} onOpenItem={(id) => { setCleanupItemOpen(true); setSelectedItemId(id); }} onToast={toast} />
               </div>
             </div>
           </div>
         </div>
       )}
-      {loadoutOpen && loadoutAvatarId !== null && (
-        <div className="backdrop" onClick={() => setLoadoutOpen(false)}>
+      {loadoutOpen && (
+        <div className="backdrop" style={workbenchOpen ? { display: "none" } : undefined} onClick={() => setLoadoutOpen(false)}>
           <div className="drawer" role="dialog" aria-label="搭配清单" onClick={(e) => e.stopPropagation()}>
             <div className="drawer-head">
-              <h3>搭配清单 · @{avatars.find((a) => a.id === loadoutAvatarId)?.name ?? "#" + loadoutAvatarId}</h3>
+              <h3>搭配清单</h3>
+              <select
+                aria-label="搭配模型"
+                value={loadoutAvatarId ?? ""}
+                onChange={(e) => setLoadoutAvatarId(e.target.value === "" ? null : Number(e.target.value))}
+              >
+                <option value="">选择模型</option>
+                {avatars.map((avatar) => <option key={avatar.id} value={avatar.id}>{avatar.name}</option>)}
+              </select>
               <span className="spacer" />
               <button className="btn" onClick={() => setLoadoutOpen(false)}>关闭</button>
             </div>
             <div className="drawer-body" style={{ gridTemplateColumns: "1fr" }}>
               <div className="left" style={{ borderRight: "none" }}>
-                <LoadoutPanel
-                  avatarId={loadoutAvatarId}
-                  onToast={toast}
-                  onChanged={() => { loadAvatars(); loadItems(); }}
-                />
+                {loadoutAvatarId === null ? (
+                  <div className="hint">{avatarsLoading ? "正在读取模型…" : avatars.length ? "选择模型后即可查看搭配或新建清单。" : "还没有模型。"}</div>
+                ) : (
+                  <LoadoutPanel
+                    key={loadoutAvatarId}
+                    avatarId={loadoutAvatarId}
+                    projects={projects}
+                    onRegisterCurrentProject={registerCurrentProject}
+                    onToast={toast}
+                    onChanged={() => { loadAvatars(); loadItems(); }}
+                    onOpenWorkbench={(scope) => { setWorkbenchLoadout(scope); setWorkbenchOpen(true); }}
+                  />
+                )}
               </div>
             </div>
           </div>
@@ -646,19 +749,26 @@ export default function App() {
       )}
       {selectedItemId !== null && (
         <ItemDetail
-          itemId={selectedItemId} avatars={avatars} projects={projects} onClose={() => setSelectedItemId(null)}
+          key={"item-detail:" + selectedItemId}
+          hidden={workbenchOpen}
+          itemId={selectedItemId} avatars={avatars} projects={projects} onClose={closeItemDetail}
           onChanged={loadItems} onToast={toast} importedIds={importedIds} onMarkImported={markImported}
           onOpenItem={setSelectedItemId}
           onOpenWorkbench={(focus) => { setWorkbenchFocus(focus); setWorkbenchOpen(true); }}
           selectedAvatarId={effAvatarIds.length === 1 ? effAvatarIds[0] : null}
+          onAvatarRegistered={() => { loadAvatars(); }}
         />
       )}
 
-      {/* 工作台必须**后于**详情渲染：两者同 z-index(.backdrop)，后渲染的在上面；否则详情会盖住工作台 */}
+      {/* 保留来源窗口的状态，工作台打开时只显示工作台的遮罩。 */}
       {workbenchOpen && (
         <AvatarWorkbench
+          key={workbenchLoadout ? "workbench:loadout:" + workbenchLoadout.id : "workbench:" + (workbenchFocus?.itemId ?? "library")}
           focus={workbenchFocus}
-          onClose={() => { setWorkbenchOpen(false); setWorkbenchFocus(null); }}
+          loadout={workbenchLoadout}
+          projects={projects}
+          initialAvatarId={effAvatarIds.length === 1 ? effAvatarIds[0] : null}
+          onClose={() => { setWorkbenchOpen(false); setWorkbenchFocus(null); setWorkbenchLoadout(null); }}
           onToast={toast}
         />
       )}

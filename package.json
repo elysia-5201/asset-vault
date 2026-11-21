@@ -54,6 +54,7 @@
     ],
     "files": [
       "apps/desktop/main.mjs",
+      "apps/desktop/preload.cjs",
       "apps/desktop/build/**",
       "apps/server/src/**",
       "apps/web/dist/**",

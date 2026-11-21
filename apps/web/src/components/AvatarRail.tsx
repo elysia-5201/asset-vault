@@ -16,7 +16,7 @@ export function AvatarRail(props: {
   match: AvatarMatch;
   onMatch: (m: AvatarMatch) => void;
   hits: number;
-  /** 打开「搭配清单」面板（父决定：需恰好选中一个模型；未传时按钮禁用）。 */
+  /** 打开搭配清单，未传时禁用。 */
   onOpenLoadouts?: () => void;
 }) {
   const sel = new Set(props.selected);
@@ -31,7 +31,7 @@ export function AvatarRail(props: {
           className="btn tiny"
           disabled={!props.onOpenLoadouts}
           onClick={props.onOpenLoadouts}
-          title="按当前选中的模型打开搭配清单（需恰好选中一个模型）"
+          title="打开搭配清单并选择模型"
         >搭配</button>
       </div>
       <div className="pane-body" style={{ display: "flex", flexDirection: "column", gap: "8px", borderBottom: "1px solid var(--line)" }}>

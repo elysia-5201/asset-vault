@@ -19,6 +19,8 @@ import { registerRoutes } from "../../apps/server/src/http/routes";
 import { resolveLimits } from "../../apps/server/src/services/pipeline/limits";
 import { redactUrlCredentials, unityMcpBoundary } from "../../apps/server/src/services/unity";
 
+const originalFetch = globalThis.fetch;
+
 let t: TempDb; let repo: Repo; let rootId: number; let dir: string;
 beforeEach(() => { t = openTempDb(); repo = new Repo(t.db); rootId = addRoot(t.db, "/lib"); dir = mkdtempSync(join(tmpdir(), "av-guard-fix1-")); });
 afterEach(() => { try { t.close(); } catch { /* ignore */ } rmSync(dir, { recursive: true, force: true }); });
@@ -33,6 +35,23 @@ const app = () => {
 };
 
 describe("P1-1: Unity 连接错误脱敏（query token / 旧库 userinfo）", () => {
+  // G2/G5：该错误路径测试作用域封闭出站 fetch；默认候选 8080/14523 及任何 URL 一律失败，
+  // 不触碰真实 Unity。guardCalls 记录实际被 Connect 调用的 URL；afterEach 恢复并断言。
+  const realFetch = originalFetch;
+  const guardCalls: string[] = [];
+  beforeEach(() => {
+    guardCalls.length = 0;
+    globalThis.fetch = (async (input: any) => {
+      const raw = input instanceof Request ? input.url : String(input);
+      guardCalls.push(raw);
+      throw new Error("test guard: outbound fetch blocked");
+    }) as typeof globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    assert.equal(globalThis.fetch, realFetch, "fetch guard must be restored after the test");
+  });
+
   test("回环地址带 ?token 保存后，/unity/status 的错误文本不回显 token", async () => {
     repo.setSetting("unity_mcp_url", "http://127.0.0.1:9/mcp?token=SECRET");
     const res = await app().inject({ method: "GET", url: "/api/unity/status" });
@@ -42,6 +61,10 @@ describe("P1-1: Unity 连接错误脱敏（query token / 旧库 userinfo）", ()
     assert.ok(!res.body.includes("SECRET"), "连接错误不得回显 query token：" + res.body);
     assert.ok(!String(body.error ?? "").includes("token="), "错误文本不得保留查询串");
     assert.ok(String(body.error ?? "").includes("127.0.0.1"), "脱敏后仍要能看出试过哪个端点（排障）");
+    assert.notEqual(globalThis.fetch, realFetch, "guard must be installed during the test");
+    assert.ok(guardCalls.some((u) => u.includes("127.0.0.1:9")), "Connect must call the guard for the saved endpoint");
+    assert.ok(guardCalls.some((u) => u.includes("127.0.0.1:8080")), "Connect must call the guard for default 8080");
+    assert.ok(guardCalls.some((u) => u.includes("127.0.0.1:14523")), "Connect must call the guard for default 14523");
   });
 
   test("旧库脏值（userinfo）进不了可连接端点，status 也不回显凭据", async () => {
@@ -75,6 +98,17 @@ describe("P1-1: Unity 连接错误脱敏（query token / 旧库 userinfo）", ()
     assert.ok(safe.includes("127.0.0.1"), safe);
     assert.equal(redactUrlCredentials("没有 URL 的普通错误"), "没有 URL 的普通错误");
   });
+});
+
+test("G5 negative: own fake fetch fails before any network", async () => {
+  const saved = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error("negative: no network"); }) as typeof globalThis.fetch;
+  try {
+    await assert.rejects(fetch("http://127.0.0.1:8080/mcp"), /negative: no network/);
+  } finally {
+    globalThis.fetch = saved;
+  }
+  assert.equal(globalThis.fetch, saved, "negative fake fetch must be restored");
 });
 
 describe("P2-5: PUT /api/settings 先校验后写（400 不部分落库）", () => {
@@ -136,27 +170,26 @@ describe("P2-6: unityMcpAllowRemote 走既有设置 API（默认关闭）", () =
 describe("P1-2/P2-3/P2-4/P3-7: 前端防回退（源码级）", () => {
   const read = (rel: string) => readFileSync(fileURLToPath(new URL("../../" + rel, import.meta.url)), "utf8");
 
-  test("头像工作台渲染在条目详情之后（同 z-index 时后者盖上面 → 必须后渲染）", () => {
+  test("工作台打开时隐藏详情遮罩，两个面板的键互不冲突", () => {
     const src = read("apps/web/src/App.tsx");
-    const detail = src.indexOf("{selectedItemId !== null && (");
-    const workbench = src.indexOf("{workbenchOpen && (");
-    assert.ok(detail >= 0, "App.tsx 必须渲染 ItemDetail");
-    assert.ok(workbench >= 0, "App.tsx 必须渲染 AvatarWorkbench");
-    assert.ok(workbench > detail, "AvatarWorkbench 必须在 ItemDetail 之后渲染，否则被详情抽屉遮挡");
+    assert.match(src, /<ItemDetail\s+key=\{"item-detail:"\s*\+\s*selectedItemId\}\s+hidden=\{workbenchOpen\}/);
+    assert.match(src, /<AvatarWorkbench\s+key=\{"workbench:"\s*\+/);
     assert.match(src, /<AvatarWorkbench[^>]*focus=/, "工作台必须接收详情页传来的选包上下文");
+    assert.match(read("apps/web/src/components/ItemDetail.tsx"), /className: "backdrop item-detail-backdrop", hidden: props\.hidden/);
+    assert.match(read("apps/web/src/styles.css"), /\.backdrop\[hidden\]\s*\{\s*display:\s*none/);
   });
 
   test("详情页不再有 unityErrors 死状态；选包语义与按钮一致（不再 disabled 误导）", () => {
     const src = read("apps/web/src/components/ItemDetail.tsx");
     assert.equal(src.includes("unityErrors"), false, "unityErrors 的写入方已删，死状态必须清除");
     assert.ok(!/disabled=\{!unityPicked\.size\}/.test(src), "勾选是带入清单的上下文，不再是打开工作台的前置条件");
-    assert.match(src, /onOpenWorkbench\(focus\)/, "详情页必须把选包上下文（focus）传给工作台");
+    assert.match(src, /onOpenWorkbench\?\.\(\{\s*itemId,/, "详情页必须把条目传给工作台");
   });
 
   test("dropped 提示在「已连接」与「没连上」两个分支都可见", () => {
-    const src = read("apps/web/src/components/ItemDetail.tsx");
-    const dropped = src.indexOf("!!unity?.dropped");
-    const offline = src.indexOf("没连上 Unity");
+    const src = read("apps/web/src/components/AvatarWorkbench.tsx");
+    const dropped = src.indexOf("!!editor?.dropped");
+    const offline = src.indexOf('page !== "result" && !matchesEditor');
     assert.ok(dropped > 0 && offline > 0);
     assert.ok(dropped > offline, "dropped 提示必须移到连接分支之外（排障时也要看得到）");
   });

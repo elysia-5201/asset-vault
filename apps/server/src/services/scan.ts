@@ -396,7 +396,16 @@ export function planFromFiles(rootPath: string, files: ScannedFile[]): ScanPlanI
 export function registerAssets(repo: Repo, rootId: number, path: string, itemId: number, f: ScannedFile, discoveredBy: "scan" | "watch" | "download" | "manual"): { id: number; created: boolean; changed: boolean } {
   const pn = normalizePath(f.path);
   const before = repo.getAssetByPathNorm(pn);
-  const changed = !!before && (Number(before.size) !== Number(f.size) || String(before.mtime ?? "") !== String(f.mtime ?? ""));
+  const sameContent = !!before && Number(before.size) === Number(f.size) && String(before.mtime ?? "") === String(f.mtime ?? "");
+  // Repeated discovery of an unchanged, present asset needs no upsert. Still verify it
+  // was seen this run so a complete walk can safely distinguish it from a missing file.
+  if (before && before.item_id === itemId && before.status === "present" && sameContent) {
+    repo.touchAsset(before.id);
+    void extOf; void extractItemIds; void path; void basename;
+    return { id: before.id, created: false, changed: false };
+  }
+  // A restored missing asset is a real state change even when its bytes are unchanged.
+  const changed = !!before && (!sameContent || before.status !== "present");
   const r = repo.upsertAsset({
     item_id: itemId, kind: f.kind, container: f.container, path: f.path,
     path_norm: pn, root_id: rootId, size: f.size, mtime: f.mtime, discovered_by: discoveredBy,

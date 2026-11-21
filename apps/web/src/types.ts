@@ -7,6 +7,9 @@ import type {
   BoothItemMeta, CategoryLevel, CategoryNode, ContainerKind, ImageRow, ItemCard, ItemRow, ItemStatus, JobEventRow,
   JobRow, LibraryRootRow, SourceSite, TagRow, UnityPackageAsset, UpdateKind,
 } from "@core/contracts";
+// 仅类型引用（编译期擦除，无运行时循环）：Unity 安装探测的 editor 形状由 api.ts 的既有导出定义，
+// 这里不复制 9 个字段、也不搬动既有公共类型。
+import type { UnityEditorInfoWeb } from "./api";
 
 export type {
   ArchiveEntry, AssetAvatarRow, AssetRow, AvatarAliasRow, AvatarKind, AvatarMatch,
@@ -393,7 +396,7 @@ export interface ScanPreview {
   counts: ScanPreviewCounts | null; scan: { readability?: unknown; missingProposed?: boolean; reasons?: string[] } | null;
   error: string | null; apply_job_id: number | null;
   created_at: string; finished_at: string | null; expires_at: string | null;
-  itemCounts: { total: number; accepted: number; applied: number; pending: number };
+  itemCounts: { total: number; accepted: number; applied: number; pending: number; failed?: number; byChange?: Record<string, number>; selectionToken?: string };
 }
 
 /** GET /api/tags 的一条：TagRow + 被多少条目使用（契约 §4 补 itemCount）。 */
@@ -660,6 +663,9 @@ export interface WorkbenchItem {
   containerPath: string | null;
   avatarId: number | null;
   avatarName: string | null;
+  avatarMatches?: { id: number; name: string; level: string }[];
+  variantIds?: string[];
+  assetStatus?: string | null;
   kind: string | null;
   level: WorkbenchLevel;
   evidence: WorkbenchEvidence | null;
@@ -675,7 +681,7 @@ export interface WorkbenchItem {
   error: { code: string; message: string } | null;
 }
 
-/** GET /api/workbench/units 的查询参数（后端只认这几个；q/category 由前端本地筛）。 */
+/** GET /api/workbench/units 的查询参数。 */
 export interface WorkbenchItemQuery {
   itemId?: number;
   avatarId?: number;
@@ -686,6 +692,7 @@ export interface WorkbenchItemQuery {
   itemStatus?: string;
   confirmedOnly?: boolean;
   limit?: number;
+  offset?: number;
 }
 export interface WorkbenchItemsResponse {
   items: WorkbenchItem[];
@@ -699,6 +706,7 @@ export interface ImportPlanUnit {
   assetId: number | null;
   title: string;
   packagePath: string | null;
+  relPath?: string | null;
   policy: WorkbenchPolicy;
   mixed: boolean;
   suggested: boolean;
@@ -776,6 +784,7 @@ export interface ImportPlan {
   id: number;
   /** 计划所属条目（后端 import_plans.item_id）；跨条目建计划时后端按 item 拆成多个 PlanView。 */
   itemId: number | null;
+  itemTitle?: string | null;
   state: string;
   avatarId: number | null;
   avatarName: string | null;
@@ -1036,5 +1045,100 @@ export interface CleanupFilterRow {
   version: number;
   createdAt: string;
   updatedAt: string;
+}
+
+// ---------- Unity 一键安装（spec 2026-11-05-unity-mcp-install-design §7-§10） ----------
+
+/** 目标依赖相对当前 manifest 的变化（spec §7）。 */
+export type UnityInstallChange = "add" | "replace" | "none" | "conflict";
+
+/** 前置条件（缺失给可操作提示；不自动安装 Python/uv）。 */
+export interface UnityInstallPrerequisite {
+  id: "unity_version" | "uv" | "git" | "writable" | "editor";
+  status: "ok" | "missing" | "unknown" | "mismatch";
+  detail: string;
+}
+
+/** POST /api/unity/install/preview 响应（只读预览，不写工程）。 */
+export interface UnityInstallPreview {
+  previewId: string;
+  expiresAt: string;
+  project: {
+    path: string;
+    pathNorm: string;
+    name: string;
+    unityVersion: string;
+    manifestPath: string;
+    manifestHash: string;
+    projectVersionPath: string;
+  };
+  package: {
+    id: string;
+    targetVersion: string;
+    targetUrl: string;
+    current: null | { value: string; version: string | null; source: "git" | "local" | "registry" | "unknown" };
+    change: UnityInstallChange;
+  };
+  diff: string;
+  backup: { dir: string; files: Array<{ path: string; sha256: string; bytes: number }> };
+  prerequisites: UnityInstallPrerequisite[];
+  warnings: string[];
+  previewHash: string;
+}
+
+/** POST /api/unity/install/apply 响应；config_applied ≠ UPM/编译/桥接就绪。 */
+export interface UnityInstallApplyResult {
+  operationId: string | null;
+  status: "already_installed" | "config_applied";
+  manifestHash: string;
+  backupDir: string | null;
+  warnings: string[];
+}
+
+/** 安装操作记录（GET /api/unity/install/operations/:id）。 */
+export interface UnityInstallOperation {
+  operationId: string;
+  projectPath: string;
+  projectPathNorm: string;
+  packageId: string;
+  targetVersion: string;
+  targetUrl: string;
+  status: "previewed" | "applying" | "rolling_back" | "config_applied" | "failed" | "conflict" | "rolled_back" | "interrupted" | "cancelled";
+  createdAt: string;
+  updatedAt: string;
+  beforeHash: string;
+  afterHash: string | null;
+  plannedAfterHash: string | null;
+  backupDir: string;
+  steps: { config: string; upm: string; compile: string; bridge: string; tool: string; server: string };
+  error?: string;
+}
+
+/** GET /api/unity/install/status：只读磁盘与上次探测结果。 */
+export interface UnityInstallStatus {
+  projectPath: string;
+  projectName: string;
+  unityVersion: string;
+  packageId: string;
+  targetVersion: string;
+  config: "applied" | "not_applied" | "conflict";
+  upm: "resolved" | "pending" | "unknown";
+  compile: "ok" | "errors" | "unknown";
+  bridge: "connected" | "editor_not_open" | "project_mismatch" | "unknown";
+  tool: "compatible" | "incompatible" | "unknown";
+  server: "connected" | "unreachable" | "unknown";
+  warnings: string[];
+}
+
+/** POST /api/unity/install/probe：显式探测（工程来自已校验的 preview/op）。 */
+export interface UnityInstallProbe {
+  projectPath: string;
+  editor: UnityEditorInfoWeb | null;
+  projectMatch: boolean;
+  compile: "ok" | "errors" | "unknown";
+  bridge: "connected" | "editor_not_open" | "project_mismatch" | "unknown";
+  tool: "compatible" | "incompatible" | "unknown";
+  server: "connected" | "unreachable" | "unknown";
+  warnings: string[];
 }
 

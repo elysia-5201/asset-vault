@@ -224,8 +224,8 @@ export async function generateScanPreview(
 
 export interface ApplyPlan {
   files: string[];
-  missingIds: number[];
-  items: { id: number; pathNorm: string; change: string }[];
+  missingIds: { id: number; pathNorm: string }[];
+  items: { id: number; pathNorm: string; change: string; assetId?: number }[];
   stale: { id: number; path: string; reason: string }[];
   requested: number;
 }
@@ -234,8 +234,8 @@ export interface ApplyPlan {
  * 应用前重验：逐条重新 stat，与预览快照（size + mtime）不一致 → stale（不写库，要求重新预览）。
  * 只做元数据核对：size+mtime 一致不等于内容绝对没变（首版不额外哈希，避免大量 IO）。
  */
-export function buildApplyPlan(repo: Repo, previewId: number): ApplyPlan {
-  const items = repo.scanPreviewItemsForApply(previewId);
+export function buildApplyPlan(repo: Repo, previewId: number, opts: { itemKeys?: string[]; retryFailedOnly?: boolean } = {}): ApplyPlan {
+  const items = repo.scanPreviewItemsForApply(previewId, { keys: opts.itemKeys, retryFailedOnly: opts.retryFailedOnly });
   const plan: ApplyPlan = { files: [], missingIds: [], items: [], stale: [], requested: items.length };
   for (const it of items) {
     if (it.change === "missing") {
@@ -244,7 +244,18 @@ export function buildApplyPlan(repo: Repo, previewId: number): ApplyPlan {
         plan.stale.push({ id: it.id, path: it.path, reason: "文件又出现了（预览已过期）" });
         continue;
       }
-      if (it.asset_id) plan.missingIds.push(Number(it.asset_id));
+      if (it.asset_id) {
+        const asset = repo.getAsset(Number(it.asset_id));
+        // A retained asset ID may have been explicitly relocated since this
+        // preview. Never let the old path decision affect its new location.
+        if (!asset || asset.status !== "present" || normalizePath(asset.path) !== normalizePath(it.path_norm)) {
+          plan.stale.push({ id: it.id, path: it.path, reason: "素材路径或状态已变化，预览已过期" });
+          continue;
+        }
+        plan.missingIds.push({ id: Number(it.asset_id), pathNorm: it.path_norm });
+        plan.items.push({ id: it.id, pathNorm: it.path_norm, change: it.change, assetId: Number(it.asset_id) });
+        continue;
+      }
       plan.items.push({ id: it.id, pathNorm: it.path_norm, change: it.change });
       continue;
     }
@@ -267,15 +278,23 @@ export function buildApplyPlan(repo: Repo, previewId: number): ApplyPlan {
  */
 export function finalizeApplyRun(
   repo: Repo,
-  payload: { applyRunId: number; previewId: number; applyItems?: { id: number; pathNorm: string; change: string }[]; staleCount?: number },
+  payload: { applyRunId: number; previewId: number; applyItems?: { id: number; pathNorm: string; change: string; assetId?: number }[]; staleCount?: number },
   visibleFailures: { kind: string; target: string; message: string }[],
   log: (m: string) => void = () => {},
 ): { applied: number; failed: number; state: string } {
   const failedAssets = new Set(visibleFailures.filter((f) => f.target.startsWith("asset:"))
     .map((f) => Number(f.target.slice("asset:".length))).filter((n) => Number.isFinite(n)));
+  const failedPreviewItems = new Set(visibleFailures.filter((f) => f.target.startsWith("scan_preview_item:"))
+    .map((f) => Number(f.target.slice("scan_preview_item:".length))).filter((n) => Number.isFinite(n)));
   let applied = 0; let failed = 0;
   for (const it of payload.applyItems ?? []) {
-    if (it.change === "missing") { repo.setScanPreviewItemResult(it.id, true, null); applied++; continue; }
+    if (it.change === "missing") {
+      if (failedPreviewItems.has(it.id) || (it.assetId && failedAssets.has(it.assetId))) {
+        repo.setScanPreviewItemResult(it.id, false, "缺失决策未应用：路径或扫描范围已变化");
+        failed++;
+      } else { repo.setScanPreviewItemResult(it.id, true, null); applied++; }
+      continue;
+    }
     const a = repo.getAssetByPathNorm(it.pathNorm);
     if (a && !failedAssets.has(a.id)) { repo.setScanPreviewItemResult(it.id, true, null); applied++; }
     else {

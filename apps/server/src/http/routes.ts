@@ -5,13 +5,14 @@ import { listArchive } from "../../../../packages/core/src/archive/list";
 import { listUnityPackage, readUnityPackageAsset } from "../../../../packages/core/src/unitypackage";
 import { basename, extname } from "node:path";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
-import { normKey } from "../../../../packages/core/src/contracts";
+import { normKey, type AssetRow } from "../../../../packages/core/src/contracts";
 import { BoothClient, parseBoothUrl } from "../../../../packages/core/src/source/booth";
 import { walkCandidates, registerAssets } from "../services/scan";
 import { matchItem } from "../services/match";
 import { productKeysOf } from "../../../../packages/core/src/related";
 import { indexAsset } from "../services/indexing";
 import { buildApplyPlan } from "../services/scanpreview";
+import { scanItemAssets } from "../services/item-asset-scan";
 import { createImportPlan, createImportPlanBatch, confirmImportPlan, getPlanView, precheckImportPlanWithRisk, applyPlanRisk, getRunView, cancelImportRun, sweepStaging } from "../services/structure";
 import { unityMcpBoundary, unityEndpointPlan, validateUnityMcpUrl, publicMcpUrl, sanitizeMcpUrl, isLoopbackMcpUrl, redactUrlCredentials } from "../services/unity";
 import type { ItemQuery, Repo } from "../db/repo";
@@ -41,6 +42,10 @@ import { stageDownload } from "../services/stage-commit";
 import { registerImportPrecheckRoutes } from "./routes/import-precheck";
 import { registerLoadoutRoutes } from "./routes/loadouts";
 import { registerCleanupRoutes } from "./routes/cleanup";
+import { registerMissingAssetRoutes } from "./routes/missing-assets";
+import { registerAvatarRegistrationRoutes } from "./routes/avatar-registration";
+import { registerBoothCorrectionRoutes } from "./routes/booth-correction";
+import { registerUnityInstallRoutes } from "./routes/unity-install";
 
 export interface RouteDeps {
   repo: Repo; media: MediaStore; booth: BoothClient; runner: JobRunner; watcher?: InboxWatcher;
@@ -240,6 +245,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
   setUnityLogger(deps.log);
   const { repo, media, booth } = deps;
+  const itemAssetScans = new Map<number, ReturnType<typeof scanItemAssets>>();
   /** P1-T5：stage 下载与 commit 共用同一 codec（进程内一次构造；epoch 随进程变化）。 */
   const stageCodec = deps.stageCodec ?? createStageTokenCodec(randomBytes(32), randomUUID());
 
@@ -425,6 +431,22 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     } catch (e) { return fail(reply, e); }
   });
 
+  app.post("/api/items/:id/assets/scan", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const itemId = Number(id);
+    if (!/^\d+$/.test(id) || !Number.isSafeInteger(itemId) || itemId < 1) {
+      return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "素材条目 ID 无效" } });
+    }
+    try {
+      let scan = itemAssetScans.get(itemId);
+      if (!scan) {
+        scan = scanItemAssets(repo, itemId).finally(() => { itemAssetScans.delete(itemId); });
+        itemAssetScans.set(itemId, scan);
+      }
+      return await scan;
+    } catch (e) { return fail(reply, e); }
+  });
+
   app.post("/api/items/:id/avatars", async (req, reply) => {
     try {
       const itemId = toInt((req.params as any).id, 0);
@@ -504,7 +526,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   // ---------- assets ----------
   app.get("/api/assets/:id", async (req, reply) => {
     try {
-      const a = repo.getAsset(toInt((req.params as any).id, 0));
+      const a = repo.getActiveAsset(toInt((req.params as any).id, 0));
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       return { asset: a, avatars: repo.listAssetAvatars(a.id) };
     } catch (e) { return fail(reply, e); }
@@ -516,7 +538,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.get("/api/assets/:id/tree", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const nestedPath = String((req.query as any).nested ?? "");
       if (nestedPath) {
@@ -573,7 +595,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/assets/:id/tree", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const b = (req.body ?? {}) as any;
       const nestedPath = typeof b.nested === "string" ? b.nested.trim() : "";
@@ -595,7 +617,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.get("/api/assets/:id/unitypackage", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       let assets: any[] = [];
       const packages: { label: string; source: string; size: number; assets: number; note?: string }[] = [];
@@ -626,7 +648,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
             } catch { packages.push({ label: c.label, source: src, size: c.size, assets: 0 }); }
           }
           if (assets.length > 20000) assets = assets.slice(0, 20000);
-          if (idx.size) { upkgIndex.set(id, idx); }   // 预览直接复用，不用再解一次
+          rememberPackageIndex(a, idx);
         }
       }
 
@@ -639,13 +661,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       const id = toInt((req.params as any).id, 0);
       const p = String((req.query as any).path ?? "");
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       if (!p) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "path 必填" } });
       const ct = contentTypeFor(p);
       // unitypackage 里是 <guid>/asset 的 tar 结构：先按 pathname 反查 guid 再读（本体与压缩包里的都支持）
       if (a.container === "unitypackage" || a.container === "zip" || a.container === "7z" || a.container === "rar") {
-        const idx = await upkgIndexFor(id, a.item_id);
+        const idx = await upkgIndexFor(a);
         const hit = idx.get(p);
         if (hit) {
           const buf = await readUnityPackageAsset(hit.pkgFile, hit.guid, 64 * 1024 * 1024);
@@ -661,7 +683,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/assets/:id/reindex", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const r = await indexAsset(repo, media, id, { hashMaxBytes: 8 * 1024 * 1024 * 1024 });
       await matchItem(repo, a.item_id, {});
@@ -853,12 +875,10 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (!["ready", "partial"].includes(p.state)) return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "预览当前状态不可修改: " + p.state } });
       const b = (req.body ?? {}) as any;
       const decision = b.decision === "skip" ? "skip" : b.decision === "pending" ? "pending" : "accept";
-      let keys: string[] = Array.isArray(b.keys) ? b.keys.map(String) : [];
-      if (keys.length === 0 && b.change) {
-        const rows = repo.listScanPreviewItems(id, { limit: 500, change: String(b.change) });
-        keys = rows.items.map((x: any) => x.item_key);
-      }
-      const changed = repo.setScanPreviewDecisions(id, keys, decision);
+      const keys: string[] = Array.isArray(b.keys) ? b.keys.map(String) : [];
+      const changed = keys.length === 0 && b.change
+        ? repo.setScanPreviewDecisionsByChange(id, String(b.change) === "changes" ? ["new", "changed"] : String(b.change).split(","), decision)
+        : repo.setScanPreviewDecisions(id, keys, decision);
       return { updated: changed, itemCounts: repo.scanPreviewItemCounts(id) };
     } catch (e) { return fail(reply, e); }
   });
@@ -879,10 +899,12 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       }
       const idem = b.idempotencyKey ? String(b.idempotencyKey) : null;
       if (idem) { const run = repo.findScanApplyRunByKey(id, idem); if (run) return { previewId: id, applyRunId: run.id, jobId: run.job_id, existing: true }; }
+      if (b.selectionToken !== undefined && (b.mode === "all" || Array.isArray(b.itemKeys)
+        || b.selectionToken !== repo.scanPreviewItemCounts(id).selectionToken)) {
+        return reply.status(409).send({ error: { code: "STALE_PREVIEW", message: "已勾选的变化发生变动，请刷新预览后确认" } });
+      }
       if (b.mode === "all") {
-        const rows = repo.listScanPreviewItems(id, { limit: 500 });
-        const keys = rows.items.filter((x: any) => ["new", "changed", "duplicate_suspected", "missing"].includes(x.change)).map((x: any) => x.item_key);
-        repo.setScanPreviewDecisions(id, keys, "accept");
+        repo.setScanPreviewDecisionsByChange(id, ["new", "changed", "duplicate_suspected", "missing"], "accept");
       } else if (Array.isArray(b.itemKeys) && b.itemKeys.length) {
         repo.setScanPreviewDecisions(id, b.itemKeys.map(String), "accept");
       }
@@ -932,14 +954,14 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       const p = previewOr404(id);
       if (!p) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "预览不存在" } });
       // FIX-01 门禁：只允许 ready/partial（applying 且 job 已死会被上面的 sweep 变成 failed，不可重试）
-      if (!["ready", "partial"].includes(p.state)) {
+      if (!["ready", "partial", "partially_applied", "failed"].includes(p.state)) {
         return reply.status(409).send({ error: { code: "PREVIEW_NOT_READY", message: "当前状态不可重试: " + p.state } });
       }
-      const rows = repo.listScanPreviewItems(id, { limit: 500 });
-      const keys = rows.items.filter((x: any) => x.applied === 0 && x.error && ["new", "changed", "duplicate_suspected", "missing"].includes(x.change)).map((x: any) => x.item_key);
+      const rows = repo.listFailedScanPreviewItems(id);
+      const keys = rows.map((x: any) => x.item_key);
       if (keys.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "没有可重试的条目" } });
       repo.setScanPreviewDecisions(id, keys, "accept");
-      const plan = buildApplyPlan(repo, id);
+      const plan = buildApplyPlan(repo, id, { retryFailedOnly: true });
       for (const s of plan.stale) repo.setScanPreviewItemResult(s.id, false, "stale: " + s.reason);
       if (plan.files.length === 0 && plan.missingIds.length === 0) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "可重试的条目都已过期（文件变化），请重新扫描" } });
       const run = repo.createScanApplyRun({ previewId: id, idempotencyKey: null, requested: plan.requested });
@@ -949,7 +971,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       }, 5);
       repo.updateScanApplyRun(run.id, { job_id: job.id });
       repo.updateScanPreview(id, { state: "applying", apply_job_id: job.id });
-      return reply.status(202).send({ previewId: id, applyRunId: run.id, jobId: job.id, files: plan.files.length, missing: plan.missingIds.length, stale: plan.stale.length, requested: plan.requested, retried: keys.length });
+      return reply.status(202).send({ previewId: id, applyRunId: run.id, jobId: job.id, files: plan.files.length, missing: plan.missingIds.length, stale: plan.stale.length, requested: plan.requested, retried: plan.items.length });
     } catch (e) { return fail(reply, e); }
   });
 
@@ -970,6 +992,13 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   // ---------- jobs ----------
   app.get("/api/jobs", async (req, reply) => {
     try { const q = req.query as any; return { jobs: repo.listJobs(q.state, toInt(q.limit, 100)) }; } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/jobs/:id", async (req, reply) => {
+    try {
+      const job = repo.getJob(toInt((req.params as any).id, 0));
+      if (!job) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "job not found" } });
+      return { job };
+    } catch (e) { return fail(reply, e); }
   });
   app.get("/api/jobs/:id/events", async (req, reply) => {
     try { return { events: repo.listJobEvents(toInt((req.params as any).id, 0)) }; } catch (e) { return fail(reply, e); }
@@ -1064,7 +1093,7 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   app.post("/api/pipeline/assets/:id/reindex", async (req, reply) => {
     try {
       const id = toInt((req.params as any).id, 0);
-      const a = repo.getAsset(id);
+      const a = repo.getActiveAsset(id);
       if (!a) return reply.status(404).send({ error: { code: "NOT_FOUND", message: "资产不存在" } });
       const priority = toInt((req.body as any)?.priority, 100);
       if (deps.pipeline) {
@@ -1201,40 +1230,42 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
    * unitypackage 里的资产路径 → {已落地的包文件, guid}。
    * 预览"包里的某个文件"时要按 pathname 反查 guid，压缩包还得先解出内层包 —— 所以缓存一份。
    */
-  const upkgIndex = new Map<number, Map<string, { pkgFile: string; guid: string }>>();
+  type PackageIndex = Map<string, { pkgFile: string; guid: string }>;
+  const upkgIndex = new Map<number, { path: string; mtime: string | null; entries: PackageIndex }>();
   const UPKG_INDEX_MAX = 32;
 
-  async function upkgIndexFor(assetId: number, itemId: number): Promise<Map<string, { pkgFile: string; guid: string }>> {
+  function rememberPackageIndex(asset: AssetRow, entries: PackageIndex) {
+    if (!entries.size) return;
+    upkgIndex.set(asset.id, { path: asset.path, mtime: asset.mtime, entries });
+    if (upkgIndex.size > UPKG_INDEX_MAX) { const oldest = upkgIndex.keys().next().value; if (oldest !== undefined) upkgIndex.delete(oldest); }
+  }
+
+  async function upkgIndexFor(a: AssetRow): Promise<PackageIndex> {
+    const { id: assetId, item_id: itemId } = a;
     const cached = upkgIndex.get(assetId);
-    if (cached) return cached;
-    const map = new Map<string, { pkgFile: string; guid: string }>();
-    const a = repo.getAsset(assetId);
-    if (a) {
-      if (a.container === "unitypackage") {
-        let rows = repo.getUnityPackageAssets(assetId) as any[];
-        if (!rows.length) {
-          const listing = await listUnityPackage(a.path, { maxAssets: 20000 });
-          repo.replaceUnityPackageAssets(assetId, listing.assets);
-          rows = repo.getUnityPackageAssets(assetId) as any[];
-        }
-        for (const r of rows) map.set(String(r.assetPath), { pkgFile: a.path, guid: String(r.guid) });
-      } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
-        const stagingDir = join(deps.dataDir, "unity-staging");
-        const cands = (await listUnityPackageCandidates(repo, itemId)).packages.filter((c) => c.assetId === assetId).slice(0, 6);
-        for (const c of cands) {
-          try {
-            const staged = await stageUnityPackage(c, stagingDir);
-            const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
-            for (const x of listing.assets) map.set(String(x.assetPath), { pkgFile: staged.path, guid: String(x.guid) });
-          } catch { /* 单个包失败不影响其他的 */ }
-        }
+    if (cached && cached.path === a.path && cached.mtime === a.mtime) return cached.entries;
+    const map: PackageIndex = new Map();
+    if (a.container === "unitypackage") {
+      let rows = repo.getUnityPackageAssets(assetId) as any[];
+      if (!rows.length) {
+        const listing = await listUnityPackage(a.path, { maxAssets: 20000 });
+        repo.replaceUnityPackageAssets(assetId, listing.assets);
+        rows = repo.getUnityPackageAssets(assetId) as any[];
+      }
+      for (const r of rows) map.set(String(r.assetPath), { pkgFile: a.path, guid: String(r.guid) });
+    } else if (a.container === "zip" || a.container === "7z" || a.container === "rar") {
+      const stagingDir = join(deps.dataDir, "unity-staging");
+      const cands = (await listUnityPackageCandidates(repo, itemId)).packages.filter((c) => c.assetId === assetId).slice(0, 6);
+      for (const c of cands) {
+        try {
+          const staged = await stageUnityPackage(c, stagingDir);
+          const listing = await listUnityPackage(staged.path, { maxAssets: 20000 });
+          for (const x of listing.assets) map.set(String(x.assetPath), { pkgFile: staged.path, guid: String(x.guid) });
+        } catch { /* 单个包失败不影响其他的 */ }
       }
     }
     // 空结果不缓存：偶发读失败（网络盘/杀软占用）不该让这个资产"永远解析不出文件"
-    if (map.size > 0) {
-      upkgIndex.set(assetId, map);
-      if (upkgIndex.size > UPKG_INDEX_MAX) { const oldest = upkgIndex.keys().next().value; if (oldest !== undefined) upkgIndex.delete(oldest); }
-    }
+    rememberPackageIndex(a, map);
     return map;
   }
 
@@ -1863,12 +1894,15 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       if (!itemId || !repo.getItem(itemId)) {
         return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "itemId 无效或条目不存在" } });
       }
+      const active = repo.findInflightStructureJob(itemId);
+      if (active) return reply.status(202).send({ jobId: active.id, itemId, state: active.state, reused: true });
       let job: any;
       try {
         job = repo.createJob("structure", itemId, { itemId, refresh: b.refresh === true }, 20);
       } catch (e) {
         if (String((e as any)?.code ?? "").includes("SQLITE_CONSTRAINT")) {
-          return reply.status(409).send({ error: { code: "CONFLICT", message: "该条目已有结构分析作业在跑" } });
+          const existing = repo.findInflightStructureJob(itemId);
+          if (existing) return reply.status(202).send({ jobId: existing.id, itemId, state: existing.state, reused: true });
         }
         throw e;
       }
@@ -1906,18 +1940,24 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
       policy: q.policy ? String(q.policy) : undefined,
       level: q.level ? String(q.level) : undefined,
       itemStatus: q.itemStatus ? String(q.itemStatus) : undefined,
-      limit: q.limit ? toInt(q.limit, 1000) : 1000,
+      q: q.q ? String(q.q).slice(0, 200) : undefined,
+      limit: q.limit ? Math.min(2000, toInt(q.limit, 1000)) : 1000,
+      offset: q.offset ? Math.max(0, toInt(q.offset, 0)) : 0,
     });
     const safe = (t: any) => { try { return JSON.parse(String(t ?? "null")); } catch { return null; } };
+    const variants = repo.listUnitVariantIds(rows.map((u) => Number(u.id)));
     return rows.map((u) => ({
       id: Number(u.id), assetId: Number(u.asset_id), itemId: u.item_id ?? null,
       relPath: String(u.rel_path), format: String(u.format), kind: String(u.kind), name: String(u.name),
       size: Number(u.size) || 0, fingerprint: u.fingerprint ?? null,
-      policy: String(u.policy), importable: !!u.importable, mixed: u.policy === "mixed_unitypackage",
+      policy: String(u.policy), importable: !!u.importable && String(u.asset_status ?? "present") === "present", mixed: u.policy === "mixed_unitypackage",
+      variantIds: variants.get(Number(u.id)) ?? [],
       parseState: String(u.parse_state), parseError: u.parse_error ?? null,
       avatars: safe(u.avatar_json) ?? [], evidence: safe(u.evidence_json),
       item: u.item_id ? { id: Number(u.item_id), title: u.item_title ?? "", status: u.item_status ?? null } : null,
-      asset: { id: Number(u.asset_id), path: u.asset_path ?? "", kind: u.asset_kind ?? null, container: u.asset_container ?? null, size: Number(u.asset_size) || 0 },
+      coverImageId: u.cover_image_id ?? u.first_image_id ?? null,
+      asset: { id: Number(u.asset_id), path: u.asset_path ?? "", kind: u.asset_kind ?? null, container: u.asset_container ?? null, size: Number(u.asset_size) || 0, status: u.asset_status ?? null },
+      available: String(u.asset_status ?? "present") === "present",
       updatedAt: u.updated_at,
     }));
   });
@@ -1942,6 +1982,15 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
         } else plans.push(p);
       }
       return reply.status(201).send({ plans });
+    } catch (e) { return fail(reply, e); }
+  });
+
+  app.get("/api/import-plans", async (req, reply) => {
+    try {
+      const q = req.query as any;
+      const itemId = q.itemId ? toInt(q.itemId, 0) || undefined : undefined;
+      const rows = repo.listImportPlans(q.limit ? toInt(q.limit, 50) : 50, itemId);
+      return { plans: rows.map((p) => getPlanView(repo, Number(p.id))).filter(Boolean), total: rows.length };
     } catch (e) { return fail(reply, e); }
   });
 
@@ -2036,10 +2085,17 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   });
 
   // ---------- feature123 独立路由模块（P1-T5 接线）----------
-  // 三个模块各自只注册本 feature 的端点；这里只做一次注册，不复制业务。
+  // 四个模块各自只注册本 feature 的端点；这里只做一次注册，不复制业务。
   // 模块反向 import 本文件的 fail（函数声明提升，仅请求期调用），root 可达性由
   // test/http/feature123-wiring.test.ts 用真实 Fastify.inject 实测。
   registerImportPrecheckRoutes(app, { repo, codec: stageCodec, media, booth, log: deps.log });
   registerLoadoutRoutes(app, { repo, log: deps.log });
   registerCleanupRoutes(app, { repo, log: deps.log });
+  registerMissingAssetRoutes(app, repo);
+  registerAvatarRegistrationRoutes(app, { repo, log: deps.log });
+  registerBoothCorrectionRoutes(app, { repo, booth, log: deps.log });
+
+  // ---------- Unity 一键安装（T3）：只读 probe/status + 预览/应用/回滚 ----------
+  // 独立模块；loopback 双门与 id/客户端路径校验都在模块内，root 只做一次注册。
+  registerUnityInstallRoutes(app, { repo, dataDir: deps.dataDir, log: deps.log });
 }

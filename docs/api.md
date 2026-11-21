@@ -20,6 +20,10 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | DELETE | `/items/:id/images/:imageId` | 删图 |
 | POST | `/items/:id/images/:imageId/cover` | 设为封面 |
 | POST | `/items/:id/assets` `{path}` | 挂本地文件/目录（自动识别容器，登记到 assets） |
+| POST | `/items/:id/assets/scan` | 核对本条登记的路径，更新已确认的存在状态。返回 `{files:[{assetId,path,state,changed,reason?}]}`，状态为 `present`、`missing` 或 `unavailable`。 |
+| GET | `/assets/:id/relocation-candidates` | 对已标记缺失的文件按 SHA-256 和大小查找已登记的副本，返回 `{candidates:[{assetId,itemId,title,path}],reason?}`。 |
+| POST | `/assets/:id/relocate` | 提交 `{expectedPath,expectedItemId,candidateId,expectedCandidatePath,expectedCandidateItemId}`。复核旧路径和候选文件内容，保留原文件编号，将所选副本的路径归到原卡片。 |
+| POST | `/assets/:id/remove-missing` | 提交 `{expectedPath,expectedItemId}`。复核旧路径后移除文件登记，保留磁盘文件和导入历史。两项操作成功均返回 `{ok:true}`。 |
 | POST | `/items/:id/avatars` `{avatarIds: number[], match?: AvatarMatch}` | 手工标注适配模型 |
 | DELETE | `/items/:id/avatars/:avatarId` | |
 | POST | `/items/:id/check-update` | 起 check_update 作业 → `{jobId}` |
@@ -157,6 +161,22 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 - 压缩包内的包会先"落地"到 `<dataDir>/unity-staging/<assetId>/`，再交给 Unity（`AssetDatabase.ImportPackage` 只吃磁盘上的文件）。
 - 当前工程会自动登记进 `projects`（`unity_version` 由编辑器上报）并写 `project_imports`。
 - WSL 里跑服务也能用：路径会自动翻译成 `/mnt/c/...`→`C:\...`、其余→`\\wsl.localhost\<distro>\...`。
+
+### Unity MCP 一键安装（additive）
+
+只改目标工程 `Packages/manifest.json` 的目标依赖；预览只读，应用才写；`packages-lock.json` 只备份作证据，不编辑、不恢复。`config_applied` 只表示配置已写入，不等于 UPM 已解析、已编译、bridge 已连接或工具兼容。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/unity/install/preview` `{projectPath}` | 只读预览：返回 `previewId/expiresAt/project/package/diff/backup/prerequisites/warnings/previewHash`；`package.change` 为 `add/replace/none/conflict`；TTL 10 分钟 |
+| POST | `/unity/install/apply` `{previewId, confirm:true, confirmReplace?}` | 只接受服务端预览；body 不接受客户端 `projectPath/package`；返回 `{operationId,status,manifestHash,backupDir,warnings}`；同版本 `already_installed` 不写文件 |
+| GET | `/unity/install/status?projectPath=` | 只读 manifest / `packages-lock.json` / 上次 probe 结果；**零 Unity 调用**；`compile/bridge/tool/server` 取不到时为 `unknown` |
+| POST | `/unity/install/probe` `{previewId?\|operationId?}` | 显式只读探测；工程来自服务端 preview/op；先取 Editor 工程路径再匹配；错工程不查编译；不 ImportPackage |
+| GET | `/unity/install/operations/:id` | 读取操作记录（`config_applied/rolled_back/interrupted/conflict` 等） |
+| POST | `/unity/install/operations/:id/rollback` `{confirm:true}` | 仅当前 manifest hash == 本次 `afterHash` 时恢复原字节；不恢复 lock；外改返回 409 并给当前 diff |
+| POST | `/unity/install/previews/:previewId/cancel` | 失效未应用的预览；不写工程、不回滚 |
+
+错误：外层复用 `INVALID_INPUT`/`NOT_FOUND`/`CONFLICT`/`UPSTREAM_ERROR`；422 固定 `INVALID_INPUT`；具体子码在 `error.details.code = UNITY_INSTALL_*`（如 `UNITY_INSTALL_PROJECT_INVALID`、`UNITY_INSTALL_PREVIEW_STALE`、`UNITY_INSTALL_REPLACE_NOT_CONFIRMED`、`UNITY_INSTALL_ROLLBACK_CONFLICT`、`UNITY_INSTALL_LOOPBACK_ONLY`）。不新增外层 enum。
 
 ## 工程实际引用（素材是不是**真的**被工程用到）
 

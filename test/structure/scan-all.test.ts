@@ -89,6 +89,24 @@ describe("POST /api/workbench/scan-all", () => {
   });
 });
 
+test("单条结构分析复用该条目的作业，按 ID 可读取状态", async () => {
+  const one = addArchiveItem("one");
+  const other = addArchiveItem("other");
+  const app = routeApp();
+  const scan = (itemId: number) => app.inject({ method: "POST", url: "/api/workbench/scan", payload: { itemId } });
+  const first = await scan(one.itemId);
+  const repeated = await scan(one.itemId);
+  const second = await scan(other.itemId);
+  assert.equal(first.statusCode, 202);
+  assert.equal(repeated.statusCode, 202);
+  assert.ok(repeated.json().reused);
+  assert.equal(first.json().jobId, repeated.json().jobId);
+  assert.notEqual(first.json().jobId, second.json().jobId);
+  const status = await app.inject({ url: "/api/jobs/" + first.json().jobId });
+  assert.equal(status.json().job.item_id, one.itemId);
+  await app.close();
+});
+
 describe("runner scan-all", () => {
   test("遍历目标、写 progress 事件、单项失败不中断", async () => {
     const pkg = join(FIX, "B_mixed.unitypackage");

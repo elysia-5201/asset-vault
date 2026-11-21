@@ -1,11 +1,15 @@
 import type Database from "better-sqlite3";
-import { now, uid, ftsPhrase } from "../util";
+import { now, uid, ftsPhrase, sha256Text } from "../util";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { AppError, normKey, type AssetRow, type AvatarAliasRow, type AvatarKind, type AvatarMatch, type AvatarRow, type CategoryAssignment, type CategoryNode, type CategoryRefSource, type CategorySuggestion, type ImageOrigin, type ImageRole, type ImageRow, type ItemCard, type ItemDetail, type ItemRow, type ItemStatus, type JobEvent, type JobKind, type JobRow, type JobState, type RootMode, type SourceSite, type UpdateKind } from "../../../../packages/core/src/contracts";
 import { UNCATEGORIZED_ID, type CategoryDef } from "../../../../packages/core/src/categories/taxonomy";
 import { resolveTransition } from "../../../../packages/core/src/contracts";
 import { mergeLoadoutItemsTx, type MergeLoadoutItemsResult } from "./loadouts";
 import { mergeCleanupIgnoresTx } from "./cleanup";
+
+const ACTIVE_UNIT_RELATIONS = `FROM unit_relations r
+  JOIN asset_units fu ON fu.id=r.from_unit_id JOIN assets fa ON fa.id=fu.asset_id AND fa.status<>'trashed'
+  JOIN asset_units tu ON tu.id=r.to_unit_id JOIN assets ta ON ta.id=tu.asset_id AND ta.status<>'trashed'`;
 
 export interface ItemQuery {
   q?: string; avatarIds?: number[]; avatarMatch?: "any" | "all"; ownedOnly?: boolean;
@@ -402,6 +406,10 @@ export class Repo {
   // B1：这三处是扫描热路径（registerAssets 每个文件都走）。每次 prepare 会产生 GC 不回收的 RSS 增长
   // （实测 getAssetByPathNorm 1 万次 +141MB，registerAssets 1 万 +513MB），统一走 stmt 缓存。
   getAsset(id: number): AssetRow | null { return (this.stmt("SELECT * FROM assets WHERE id=?").get(id) as AssetRow) ?? null; }
+  getActiveAsset(id: number): AssetRow | null {
+    const asset = this.getAsset(id);
+    return asset?.status === "trashed" ? null : asset;
+  }
   getAssetByPathNorm(p: string): AssetRow | null { return (this.stmt("SELECT * FROM assets WHERE path_norm=?").get(p) as AssetRow) ?? null; }
   /**
    * 资产归属变更的共享检查（import-precheck spec §9.1）：同 owner 幂等；带 asset_version_links
@@ -718,21 +726,60 @@ export class Repo {
    * 批量标缺失。SQLite 变量上限 32766：必须分块，否则大库（>3.2 万资产）整轮 scan 在写完资产后失败（verifier A4）。
    * 单事务 + 每块 500：原子且不会长时间持有写锁。
    */
-  markAssetsMissing(ids: number[], fence?: JobFence): void {
-    if (ids.length === 0) return;
+  markAssetsMissing(ids: number[], fence?: JobFence): Set<number> {
+    if (ids.length === 0) return new Set();
     const unique = [...new Set(ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
-    if (unique.length === 0) return;
+    if (unique.length === 0) return new Set();
     const CHUNK = 500;
     const tx = this.db.transaction(() => {
+      const updated = new Set<number>();
       for (let i = 0; i < unique.length; i += CHUNK) {
         const part = unique.slice(i, i + CHUNK);
         const ph = part.map(() => "?").join(",");
         // FIX-07：有 fence 时只有 jobs 行仍属该 holder+token 才允许标缺失（接管后 0 行）
-        if (fence) this.stmt(`UPDATE assets SET status='missing' WHERE id IN (${ph})` + JOB_FENCE_SQL).run(...part as any[], fence.jobId, fence.holder, fence.token);
-        else this.stmt(`UPDATE assets SET status='missing' WHERE id IN (${ph})`).run(...part);
+        const args = fence ? [...part, fence.jobId, fence.holder, fence.token] : part;
+        const changed = this.stmt(`UPDATE assets SET status='missing' WHERE status='present' AND id IN (${ph})`
+          + (fence ? JOB_FENCE_SQL : "") + " RETURNING id, item_id").all(...args) as { id: number; item_id: number }[];
+        for (const row of changed) updated.add(row.id);
+        const itemIds = [...new Set(changed.map((row) => row.item_id))];
+        if (itemIds.length) {
+          this.stmt("UPDATE items SET updated_at=? WHERE id IN (" + itemIds.map(() => "?").join(",") + ")").run(now(), ...itemIds);
+        }
       }
+      return updated;
     });
-    tx();
+    return tx();
+  }
+  /** 旧扫描预览只可修改仍占用预览路径的文件。 */
+  markAssetsMissingAtPaths(decisions: { id: number; pathNorm: string }[], fence?: JobFence): Set<number> {
+    if (!decisions.length) return new Set();
+    const tx = this.db.transaction(() => {
+      const ids = [...new Set(decisions.filter((d) => Number.isFinite(d.id) && d.id > 0 && !!d.pathNorm)
+        .filter((d) => {
+          const asset = this.getAsset(d.id);
+          return !!asset && asset.status === "present" && normalizePath(asset.path) === normalizePath(d.pathNorm);
+        }).map((d) => d.id))];
+      if (!ids.length) return new Set<number>();
+      return this.markAssetsMissing(ids, fence);
+    });
+    return tx();
+  }
+  /** 路径检查在事务外进行。只写入仍属于原条目且保持原快照的资产。 */
+  applyAssetPathChecks(checks: { asset: AssetRow; status: "present" | "missing" }[]): Set<number> {
+    if (checks.length === 0) return new Set();
+    const update = this.stmt(`UPDATE assets SET status = ?
+      WHERE id = ? AND item_id = ? AND path = ? AND root_id = ?
+        AND status = ? AND size = ? AND mtime IS ? AND last_verified_at IS ?
+        AND EXISTS (SELECT 1 FROM items WHERE id = assets.item_id AND status <> 'trashed')`);
+    return this.db.transaction(() => {
+      const updated = new Set<number>();
+      for (const { asset, status } of checks) {
+        const { changes } = update.run(status, asset.id, asset.item_id, asset.path, asset.root_id,
+          asset.status, asset.size, asset.mtime, asset.last_verified_at);
+        if (changes) updated.add(asset.id);
+      }
+      return updated;
+    })();
   }
   touchAsset(id: number): void { this.stmt("UPDATE assets SET last_verified_at=? WHERE id=?").run(now(), id); }
   setAssetSha(id: number, sha: string | null, state: "ok" | "error" | "pending"): void { this.stmt("UPDATE assets SET sha256=?, sha256_state=? WHERE id=?").run(sha, state, id); }
@@ -1626,20 +1673,31 @@ export class Repo {
     for (const r of this.stmt("SELECT change, COUNT(*) c FROM scan_preview_items WHERE preview_id=? GROUP BY change").all(previewId) as any[]) out[r.change] = r.c;
     return out;
   }
-  scanPreviewItemCounts(previewId: number): { total: number; accepted: number; applied: number; pending: number } {
+  scanPreviewItemCounts(previewId: number) {
     const one = (sql: string) => (this.stmt(sql).get(previewId) as any).c as number;
+    const acceptedRows = this.stmt(`SELECT id, change FROM scan_preview_items
+      WHERE preview_id=? AND decision='accept' AND applied=0 AND change IN ('new','changed','duplicate_suspected','missing')
+      ORDER BY id`).all(previewId) as { id: number; change: string }[];
+    const byChange: Record<string, number> = {};
+    for (const row of acceptedRows) byChange[row.change] = (byChange[row.change] ?? 0) + 1;
     return {
       total: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=?"),
-      accepted: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND decision='accept'"),
+      accepted: acceptedRows.length,
+      byChange,
+      selectionToken: sha256Text(acceptedRows.map((row) => row.id).join(",")),
       applied: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND applied=1"),
       pending: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND applied=0 AND decision<>'skip'"),
+      failed: one("SELECT COUNT(*) c FROM scan_preview_items WHERE preview_id=? AND applied=0 AND error IS NOT NULL AND error NOT LIKE 'stale:%' AND change IN ('new','changed','duplicate_suspected','missing')"),
     };
   }
   /** 分页读预览条目（keyset 分页：cursor = 上一页最后一条 id）。 */
   listScanPreviewItems(previewId: number, opts: { cursor?: number; limit?: number; change?: string } = {}): { items: any[]; nextCursor: number | null } {
     const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
     const w = ["preview_id = ?"]; const p: unknown[] = [previewId];
-    if (opts.change) { w.push("change = ?"); p.push(opts.change); }
+    if (opts.change) {
+      const changes = opts.change === "changes" ? ["new", "changed"] : opts.change.split(",").filter(Boolean);
+      w.push("change IN (" + changes.map(() => "?").join(",") + ")"); p.push(...changes);
+    }
     if (opts.cursor && opts.cursor > 0) { w.push("id > ?"); p.push(opts.cursor); }
     const rows = this.stmt("SELECT * FROM scan_preview_items WHERE " + w.join(" AND ") + " ORDER BY id LIMIT ?").all(...p as any[], limit + 1) as any[];
     const more = rows.length > limit;
@@ -1659,11 +1717,28 @@ export class Repo {
     return tx();
   }
 
+  setScanPreviewDecisionsByChange(previewId: number, changes: string[], decision: "accept" | "skip" | "pending"): number {
+    const allowed = changes.filter((c) => ["new", "unchanged", "changed", "missing", "duplicate_suspected", "unreadable", "error"].includes(c));
+    if (!allowed.length) return 0;
+    return this.stmt("UPDATE scan_preview_items SET decision=? WHERE preview_id=? AND applied=0 AND change IN (" + allowed.map(() => "?").join(",") + ")")
+      .run(decision, previewId, ...allowed).changes;
+  }
+
+  listFailedScanPreviewItems(previewId: number): any[] {
+    return this.stmt("SELECT * FROM scan_preview_items WHERE preview_id=? AND applied=0 AND error IS NOT NULL AND error NOT LIKE 'stale:%' AND change IN ('new','changed','duplicate_suspected','missing') ORDER BY id").all(previewId) as any[];
+  }
+
   /** 待应用的条目：decision=accept 且尚未应用，且变化类型可应用（new/changed/missing）。 */
-  scanPreviewItemsForApply(previewId: number): any[] {
-    return this.stmt(
-      "SELECT * FROM scan_preview_items WHERE preview_id=? AND decision='accept' AND applied=0 AND change IN ('new','changed','duplicate_suspected','missing') ORDER BY id"
-    ).all(previewId) as any[];
+  scanPreviewItemsForApply(previewId: number, opts: { keys?: string[]; retryFailedOnly?: boolean } = {}): any[] {
+    const base = "SELECT * FROM scan_preview_items WHERE preview_id=? AND decision='accept' AND applied=0 AND change IN ('new','changed','duplicate_suspected','missing')";
+    if (opts.retryFailedOnly) {
+      return this.stmt(base + " AND error IS NOT NULL AND error NOT LIKE 'stale:%' ORDER BY id").all(previewId) as any[];
+    }
+    if (opts.keys) {
+      if (!opts.keys.length) return [];
+      return this.stmt(base + " AND item_key IN (" + opts.keys.map(() => "?").join(",") + ") ORDER BY id").all(previewId, ...opts.keys) as any[];
+    }
+    return this.stmt(base + " ORDER BY id").all(previewId) as any[];
   }
 
   setScanPreviewItemResult(itemId: number, applied: boolean, error: string | null): void {
@@ -2281,12 +2356,13 @@ export class Repo {
     tx();
   }
 
-  listUnits(f: { itemId?: number; assetId?: number; avatarId?: number; policy?: string; level?: string; itemStatus?: string; limit?: number } = {}): any[] {
-    const w: string[] = ["1=1"]; const p: unknown[] = [];
+  listUnits(f: { itemId?: number; assetId?: number; avatarId?: number; policy?: string; level?: string; itemStatus?: string; q?: string; limit?: number; offset?: number } = {}): any[] {
+    const w: string[] = ["(i.id IS NULL OR i.status<>'trashed')", "(a.id IS NULL OR a.status<>'trashed')"]; const p: unknown[] = [];
     if (f.itemId) { w.push("au.item_id=?"); p.push(f.itemId); }
     if (f.assetId) { w.push("au.asset_id=?"); p.push(f.assetId); }
     if (f.policy) { w.push("au.policy=?"); p.push(f.policy); }
     if (f.itemStatus) { w.push("i.status=?"); p.push(f.itemStatus); }
+    if (f.q?.trim()) { const needle = "%" + f.q.trim().replace(/[\\%_]/g, "\\$&") + "%"; w.push("(au.name LIKE ? ESCAPE '\\' OR au.rel_path LIKE ? ESCAPE '\\' OR i.title LIKE ? ESCAPE '\\' OR a.path LIKE ? ESCAPE '\\')"); p.push(needle, needle, needle, needle); }
     if (f.avatarId) {
       w.push("EXISTS (SELECT 1 FROM json_each(au.avatar_json) je WHERE CAST(json_extract(je.value,'$.avatarId') AS INTEGER)=?)"); p.push(f.avatarId);
     }
@@ -2295,11 +2371,26 @@ export class Repo {
     }
     const limit = Math.min(2000, Math.max(1, Math.floor(f.limit ?? 1000)));
     return this.stmt(
-      "SELECT au.*, a.path AS asset_path, a.kind AS asset_kind, a.container AS asset_container, a.size AS asset_size, " +
+      "SELECT au.*, a.path AS asset_path, a.kind AS asset_kind, a.container AS asset_container, a.size AS asset_size, a.status AS asset_status, i.cover_image_id, " +
+      "(SELECT im.id FROM item_images im WHERE im.item_id=i.id ORDER BY im.position, im.id LIMIT 1) AS first_image_id, " +
       "i.title AS item_title, i.status AS item_status FROM asset_units au " +
       "LEFT JOIN assets a ON a.id=au.asset_id LEFT JOIN items i ON i.id=au.item_id " +
-      "WHERE " + w.join(" AND ") + " ORDER BY i.title, au.asset_id, au.rel_path LIMIT ?"
-    ).all(...p as any[], limit) as any[];
+      "WHERE " + w.join(" AND ") + " ORDER BY i.title, au.asset_id, au.rel_path LIMIT ? OFFSET ?"
+    ).all(...p as any[], limit, Math.max(0, Math.floor(f.offset ?? 0))) as any[];
+  }
+  listUnitVariantIds(unitIds: number[]): Map<number, number[]> {
+    const ids = [...new Set(unitIds.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
+    const out = new Map<number, number[]>(ids.map((id) => [id, []]));
+    if (!ids.length) return out;
+    const ph = ids.map(() => "?").join(",");
+    const rows = this.stmt(`SELECT r.from_unit_id, r.to_unit_id ${ACTIVE_UNIT_RELATIONS}
+      WHERE r.type='optional_variant' AND (r.from_unit_id IN (${ph}) OR r.to_unit_id IN (${ph}))`).all(...ids, ...ids) as any[];
+    for (const r of rows) {
+      const from = Number(r.from_unit_id), to = Number(r.to_unit_id);
+      if (out.has(from) && out.get(from)!.indexOf(to) < 0) out.get(from)!.push(to);
+      if (out.has(to) && out.get(to)!.indexOf(from) < 0) out.get(to)!.push(from);
+    }
+    return out;
   }
   getUnitsByIds(ids: number[]): any[] {
     const unique = [...new Set(ids.map(Number).filter((n) => Number.isFinite(n) && n > 0))];
@@ -2318,11 +2409,14 @@ export class Repo {
     const base = "SELECT DISTINCT i.id FROM items i JOIN assets a ON a.item_id=i.id " +
       "WHERE i.status<>'trashed' AND a.status<>'trashed' AND (a.kind IN ('archive','unitypackage') OR a.container IN ('zip','7z','rar','unitypackage'))";
     if (!onlyMissing) return (this.stmt(base + " ORDER BY i.id").all() as any[]).map((r) => Number(r.id));
-    return (this.stmt(base + " AND NOT EXISTS (SELECT 1 FROM asset_units u WHERE u.item_id=i.id) ORDER BY i.id").all() as any[]).map((r) => Number(r.id));
+    return (this.stmt(base + " AND NOT EXISTS (SELECT 1 FROM asset_units u JOIN assets ua ON ua.id=u.asset_id WHERE u.item_id=i.id AND ua.status<>'trashed') ORDER BY i.id").all() as any[]).map((r) => Number(r.id));
   }
   /** 是否已有 scan-all 的 structure 作业在跑（item_id IS NULL + payload.all=1）。 */
   findInflightStructureAllJob(): any {
     return this.stmt("SELECT * FROM jobs WHERE kind='structure' AND item_id IS NULL AND json_extract(payload,'$.all')=1 AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1").get() ?? null;
+  }
+  findInflightStructureJob(itemId: number): JobRow | null {
+    return (this.stmt("SELECT * FROM jobs WHERE kind='structure' AND item_id=? AND state IN (" + ACTIVE_JOB_STATES_SQL + ") ORDER BY id DESC LIMIT 1").get(itemId) as JobRow) ?? null;
   }
 
   workbenchAvatarCounts(itemId?: number): { avatar: { id: number; name: string }; counts: { confirmed: number; probable: number; unknown: number; mixed: number } }[] {
@@ -2359,7 +2453,7 @@ export class Repo {
     const p: unknown[] = [...unique]; if (type) p.push(type);
     return this.stmt(
       "SELECT r.*, fu.name AS from_name, tu.name AS to_name, tu.asset_id AS to_asset_id, tu.policy AS to_policy, tu.importable AS to_importable " +
-      "FROM unit_relations r JOIN asset_units fu ON fu.id=r.from_unit_id JOIN asset_units tu ON tu.id=r.to_unit_id WHERE " + w
+      ACTIVE_UNIT_RELATIONS + " WHERE " + w
     ).all(...p as any[]) as any[];
   }
 
@@ -2370,7 +2464,14 @@ export class Repo {
         input.sourceSnapshot === undefined ? null : JSON.stringify(input.sourceSnapshot), now());
     return this.getImportPlan(Number(info.lastInsertRowid));
   }
-  getImportPlan(id: number): any { return this.stmt("SELECT * FROM import_plans WHERE id=?").get(id) ?? null; }
+  getImportPlan(id: number): any {
+    return this.stmt("SELECT p.*, i.title AS item_title FROM import_plans p LEFT JOIN items i ON i.id=p.item_id WHERE p.id=?").get(id) ?? null;
+  }
+  listImportPlans(limit = 50, itemId?: number): any[] {
+    const cap = Math.min(100, Math.max(1, Math.floor(limit)));
+    if (itemId) return this.stmt("SELECT * FROM import_plans WHERE item_id=? AND status IN ('planned','ready','needs_confirmation','executing','executed','failed','blocked') ORDER BY id DESC LIMIT ?").all(itemId, cap) as any[];
+    return this.stmt("SELECT * FROM import_plans WHERE status IN ('planned','ready','needs_confirmation','executing','executed','failed','blocked') ORDER BY id DESC LIMIT ?").all(cap) as any[];
+  }
   listImportPlanItems(planId: number): any[] {
     return this.stmt(
       "SELECT pi.*, au.rel_path, au.kind AS unit_kind, au.name AS unit_name, au.parse_state, au.avatar_json, au.evidence_json, " +

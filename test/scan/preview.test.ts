@@ -13,6 +13,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { mkdirSync, writeFileSync, rmSync, truncateSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrate, SCHEMA_VERSION } from "../../apps/server/src/db/migrate";
 import { Repo } from "../../apps/server/src/db/repo";
@@ -20,7 +21,7 @@ import { classifyPreview, buildApplyPlan } from "../../apps/server/src/services/
 import { scannedFileOf } from "../../apps/server/src/services/scan";
 import { normalizePath } from "../../packages/core/src/pathnorm";
 
-const TMP = join("/tmp", "av-m1-test-" + process.pid);
+const TMP = join(tmpdir(), "av-m1-test-" + process.pid);
 mkdirSync(TMP, { recursive: true });
 const freshRepo = () => { const db = new Database(":memory:"); db.pragma("foreign_keys = ON"); migrate(db); return { db, repo: new Repo(db) }; };
 const mkFile = (name: string, bytes: number) => {
@@ -113,6 +114,45 @@ describe("classifyPreview：变化分类", () => {
   });
 });
 
+describe("preview bulk decisions and retry scope", () => {
+  test("bulk-selects every matching row beyond 500 and pages the exact full change set", () => {
+    const { db, repo } = freshRepo();
+    const p = repo.createScanPreview({ rootId: null, path: TMP, deep: false });
+    repo.updateScanPreview(p.id, { state: "ready" });
+    repo.replaceScanPreviewItems(p.id, Array.from({ length: 637 }, (_, i) => ({ path: "/x/" + i + ".zip", path_norm: "/x/" + i + ".zip", change: i % 3 === 0 ? "changed" : "new" })));
+    const updated = repo.setScanPreviewDecisionsByChange(p.id, ["new", "changed"], "accept");
+    assert.equal(updated, 637);
+    let cursor: number | undefined; let seen = 0;
+    do { const page = repo.listScanPreviewItems(p.id, { limit: 100, cursor, change: "changes" }); seen += page.items.length; cursor = page.nextCursor ?? undefined; } while (cursor);
+    assert.equal(seen, 637);
+    assert.equal(repo.scanPreviewItemCounts(p.id).accepted, 637);
+    db.close();
+  });
+
+  test("retry scope includes all real failures but excludes unrelated accepts and stale rows", () => {
+    const { db, repo } = freshRepo();
+    const p = repo.createScanPreview({ rootId: null, path: TMP, deep: false });
+    repo.updateScanPreview(p.id, { state: "partially_applied" });
+    const rows = [
+      ...Array.from({ length: 503 }, (_, i) => ({ path: TMP + "/failed-" + i, path_norm: TMP + "/failed-" + i, change: "new" })),
+      { path: TMP + "/unrelated", path_norm: TMP + "/unrelated", change: "changed" },
+      { path: TMP + "/stale", path_norm: TMP + "/stale", change: "new" },
+    ];
+    repo.replaceScanPreviewItems(p.id, rows);
+    const first = repo.listScanPreviewItems(p.id, { limit: 500 });
+    const second = repo.listScanPreviewItems(p.id, { limit: 500, cursor: first.nextCursor ?? undefined });
+    const all = [...first.items, ...second.items];
+    repo.setScanPreviewDecisionsByChange(p.id, ["new", "changed"], "accept");
+    for (const row of all.slice(0, 503)) repo.setScanPreviewItemResult(row.id, false, "index failed");
+    repo.setScanPreviewItemResult(all[504].id, false, "stale: path changed");
+    assert.equal(repo.listFailedScanPreviewItems(p.id).length, 503);
+    assert.equal(repo.scanPreviewItemCounts(p.id).failed, 503);
+    assert.equal(repo.scanPreviewItemsForApply(p.id, { retryFailedOnly: true }).length, 503);
+    assert.equal(repo.scanPreviewItemsForApply(p.id).length, 505, "normal Apply retains its accepted scope");
+    db.close();
+  });
+});
+
 describe("buildApplyPlan：应用前重验（stale）", () => {
   const mkPreviewWith = (repo: Repo, rows: any[], path: string) => {
     const p = repo.createScanPreview({ rootId: null, path, deep: false });
@@ -143,11 +183,26 @@ describe("buildApplyPlan：应用前重验（stale）", () => {
     const p = mkPreviewWith(repo, [{ path: f.path, path_norm: f.path, change: "missing", assetId: a.id, prevSize: f.size, prevMtime: f.mtime }], TMP);
     rmSync(f.path);
     const plan = buildApplyPlan(repo, p.id);
-    assert.deepEqual(plan.missingIds, [a.id]);
+    assert.deepEqual(plan.missingIds, [{ id: a.id, pathNorm: f.path }]);
     writeFileSync(f.path, Buffer.alloc(20, 3));      // 文件又出现
     const plan2 = buildApplyPlan(repo, p.id);
     assert.equal(plan2.missingIds.length, 0);
     assert.match(plan2.stale[0].reason, /又出现/);
+    db.close();
+  });
+  test("missing apply plan rejects a retained asset relocated after preview", () => {
+    const { db, repo } = freshRepo();
+    const root = repo.ensureRoot(TMP);
+    const f = scannedFileOf(mkFile("plan-relocated.zip", 20))!;
+    const a = seedAsset(repo, f, root.id).asset;
+    const p = mkPreviewWith(repo, [{ path: f.path, path_norm: f.path, change: "missing", assetId: a.id, prevSize: f.size, prevMtime: f.mtime }], TMP);
+    rmSync(f.path);
+    const relocated = join(TMP, "plan-relocated-new.zip");
+    writeFileSync(relocated, Buffer.alloc(20, 4));
+    db.prepare("UPDATE assets SET path=? WHERE id=?").run(relocated, a.id);
+    const plan = buildApplyPlan(repo, p.id);
+    assert.deepEqual(plan.missingIds, []);
+    assert.ok(plan.stale.length > 0);
     db.close();
   });
 });

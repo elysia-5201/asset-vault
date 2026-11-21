@@ -102,6 +102,7 @@ describe("createImportPlan", () => {
     assert.equal(withSug.plan.status, "needs_confirmation");
     const confirmed = confirmImportPlan(repo, withSug.plan.id);
     assert.equal(confirmed.plan.user_confirmed, 1);
+    assert.throws(() => confirmImportPlan(repo, withSug.plan.id), (e: any) => e?.code === "PLAN_NOT_CONFIRMABLE");
     assert.ok(confirmed.items.every((i: any) => i.status !== "suggested"), "确认后建议项转 pending");
     void a1;
   });

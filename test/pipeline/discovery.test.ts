@@ -136,6 +136,7 @@ describe("runner 流式消费（批量 + 不累积 + 可重放）", () => {
       assert.equal(calls.single, 0, "不得逐条 enqueue");
 
       // 重放：同一路径再扫一遍 → 不新增条目/资产，全部 created=0（幂等）
+      t.db.prepare("UPDATE items SET updated_at='2000-01-01T00:00:00.000Z'").run();
       const job2 = repo.createJob("scan", null, { path: root, deep: true, indexWaitMs: 0 }, 5);
       await runJob(deps, job2.id);
       assert.equal(repo.getJob(job2.id)!.state, "done");
@@ -143,6 +144,33 @@ describe("runner 流式消费（批量 + 不累积 + 可重放）", () => {
       assert.equal(count(t.db, "assets"), 5);
       assert.equal(tempRows(t.db, "scan_seen"), 5);
       assert.equal(calls.bulk, 3, "未变化的资产不重复入队");
+      const itemTimes = (t.db.prepare("SELECT id, updated_at FROM items ORDER BY id").all() as any[]).map((r) => [r.id, r.updated_at]);
+      const restoredPath = join(root, "d0", "item_1_素材.zip");
+      const restoredAssetId = (t.db.prepare("SELECT id FROM assets WHERE path=?").get(restoredPath) as any).id;
+      const restoredItemId = (t.db.prepare("SELECT item_id FROM assets WHERE id=?").get(restoredAssetId) as any).item_id;
+      repo.markAssetsMissing([restoredAssetId]);
+      const missingState = (t.db.prepare("SELECT updated_at FROM items WHERE id=?").get(restoredItemId) as any).updated_at;
+      assert.notEqual(missingState, itemTimes.find(([id]) => id === restoredItemId)![1], "marking a file missing updates its card");
+      t.db.prepare("UPDATE items SET updated_at=? WHERE id=?").run("2002-01-01T00:00:00.000Z", restoredItemId);
+      repo.markAssetsMissing([restoredAssetId]);
+      assert.equal((t.db.prepare("SELECT updated_at FROM items WHERE id=?").get(restoredItemId) as any).updated_at, "2002-01-01T00:00:00.000Z", "repeat missing checks do not update its card");
+      const nestedFile = join(root, "d0", "item_0_素材.zip");
+      writeFileSync(nestedFile, Buffer.alloc(2, 9));
+      const job3 = repo.createJob("scan", null, { path: root, deep: true, indexWaitMs: 0 }, 5);
+      await runJob(deps, job3.id);
+      assert.equal(repo.getJob(job3.id)!.state, "done");
+      assert.equal(calls.bulkIds, 7, "changed and restored sources must be queued");
+      const changedItemId = (t.db.prepare("SELECT item_id FROM assets WHERE path=?").get(nestedFile) as any).item_id;
+      const previousChangedTime = itemTimes.find(([id]) => id === changedItemId)![1];
+      assert.notEqual((t.db.prepare("SELECT updated_at FROM items WHERE id=?").get(changedItemId) as any).updated_at, previousChangedTime,
+        "a real nested-file change must still update its card");
+      const previousRestoredTime = "2002-01-01T00:00:00.000Z";
+      assert.notEqual((t.db.prepare("SELECT updated_at FROM items WHERE id=?").get(restoredItemId) as any).updated_at, previousRestoredTime,
+        "restoring a missing asset must update its card");
+      for (const [id, updatedAt] of itemTimes.filter(([id]) => id !== changedItemId && id !== restoredItemId)) {
+        assert.equal((t.db.prepare("SELECT updated_at FROM items WHERE id=?").get(id) as any).updated_at, updatedAt,
+          "no-op items must keep their card timestamp");
+      }
     } finally { t.close(); rmSync(root, { recursive: true, force: true }); }
   });
 

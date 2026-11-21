@@ -368,11 +368,11 @@ function summaryOf(match: PrecheckMatch, hash: PrecheckHashState): PrecheckSumma
  */
 function findAssetByPathNorm(repo: Repo, rawPath: string, pathNorm: string): AssetRow | null {
   const exact = repo.getAssetByPathNorm(pathNorm);
-  if (exact) return exact;
+  if (exact && exact.status !== "trashed") return exact;
   if (pathNorm === rawPath) return null;
   const row = repo.connection
-    .prepare("SELECT * FROM assets WHERE path_norm = ? COLLATE NOCASE LIMIT 1")
-    .get(pathNorm) as AssetRow | undefined;
+    .prepare("SELECT * FROM assets WHERE status<>'trashed' AND (path_norm=? COLLATE NOCASE OR path_norm=? COLLATE NOCASE) ORDER BY id LIMIT 1")
+    .get(pathNorm, rawPath) as AssetRow | undefined;
   return row ?? null;
 }
 
@@ -473,7 +473,7 @@ function companionMarkers(path: string): string[] {
 function nameSizeHint(repo: Repo, path: string, size: number): PrecheckWeakMatch | null {
   const name = coreBasename(path);
   const rows = repo.connection
-    .prepare("SELECT * FROM assets WHERE size=? ORDER BY id")
+    .prepare("SELECT * FROM assets WHERE size=? AND status<>'trashed' ORDER BY id")
     .all(size) as AssetRow[];
   const hit = rows.find((a) => coreBasename(a.path) === name);
   return hit ? { reason: "name_size_hint", assetId: hit.id } : null;
@@ -492,7 +492,7 @@ async function evaluateExact(
   const push = (a: AssetRow): void => { if (!candidates.some((c) => c.id === a.id)) candidates.push(a); };
   if (collision) push(collision);
   const rows = repo.connection
-    .prepare("SELECT * FROM assets WHERE sha256=? AND sha256_state='ok' ORDER BY id")
+    .prepare("SELECT * FROM assets WHERE sha256=? AND sha256_state='ok' AND status<>'trashed' ORDER BY id")
     .all(incoming) as AssetRow[];
   for (const r of rows) push(r);
 

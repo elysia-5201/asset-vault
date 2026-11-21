@@ -86,14 +86,12 @@ interface RawRow {
   b_mtime: string | null;
 }
 
+const LINK_TABLES = " FROM asset_version_links l JOIN assets a ON a.id=l.asset_a_id JOIN assets b ON b.id=l.asset_b_id";
 const SELECT_SQL =
   "SELECT l.id, l.item_id, l.asset_a_id, l.asset_b_id, l.relation, l.basis, l.evidence_json, " +
   "l.state, l.version, l.created_at, l.updated_at, l.decided_at, " +
   "a.path AS a_path, a.size AS a_size, a.mtime AS a_mtime, " +
-  "b.path AS b_path, b.size AS b_size, b.mtime AS b_mtime " +
-  "FROM asset_version_links l " +
-  "JOIN assets a ON a.id = l.asset_a_id " +
-  "JOIN assets b ON b.id = l.asset_b_id";
+  "b.path AS b_path, b.size AS b_size, b.mtime AS b_mtime" + LINK_TABLES;
 
 function parseEvidence(raw: string | null): unknown {
   if (raw === null) return null;
@@ -156,7 +154,7 @@ export function createVersionLink(repo: Repo, itemId: number, input: CreateVersi
   const db = repo.connection;
   return repo.transaction(() => {
     if (!db.prepare("SELECT 1 FROM items WHERE id=?").get(item)) throw notFound("条目不存在");
-    const rows = db.prepare("SELECT id, item_id FROM assets WHERE id IN (?,?)").all(assetAId, assetBId) as { id: number; item_id: number }[];
+    const rows = db.prepare("SELECT id, item_id FROM assets WHERE id IN (?,?) AND status<>'trashed'").all(assetAId, assetBId) as { id: number; item_id: number }[];
     if (rows.length !== 2) throw notFound("资产不存在");
     for (const r of rows) if (r.item_id !== item) throw invalid("两个资产必须属于同一 item");
     const at = now();
@@ -252,9 +250,9 @@ export function listVersionLinks(repo: Repo, itemId: number, q: VersionLinkQuery
   const limit = clampInt(q.limit, 50, 1, 200, "limit");
   const offset = clampInt(q.offset, 0, 0, Number.MAX_SAFE_INTEGER, "offset");
   const db = repo.connection;
-  const where = " WHERE l.item_id=?" + (state !== undefined ? " AND l.state=?" : "");
+  const where = " WHERE l.item_id=? AND a.status<>'trashed' AND b.status<>'trashed'" + (state !== undefined ? " AND l.state=?" : "");
   const params: unknown[] = state !== undefined ? [item, state] : [item];
-  const total = Number((db.prepare("SELECT COUNT(*) AS n FROM asset_version_links l" + where).get(...(params as never[])) as { n: number }).n);
+  const total = Number((db.prepare("SELECT COUNT(*) AS n" + LINK_TABLES + where).get(...(params as never[])) as { n: number }).n);
   const rows = db.prepare(SELECT_SQL + where + " ORDER BY l.updated_at DESC, l.id DESC LIMIT ? OFFSET ?")
     .all(...(params as never[]), limit, offset) as RawRow[];
   return { total, links: rows.map(toRow) };

@@ -1,9 +1,17 @@
 import { useEffect, useState } from "react";
 import {
-  addRoot, addWatch, describeError, getSettings, listRoots, listWatches, removeRoot, removeWatch, scan,
+  addRoot, addWatch, describeError, getSettings, listRoots, listWatches, removeRoot, removeWatch,
   mediaCacheCleanup, mediaCachePreview, mediaCacheUsage, stagingCleanup, stagingUsage, updateSettings,
+  unityInstallApply, unityInstallCancelPreview, unityInstallOperation, unityInstallPreview, unityInstallProbe,
+  unityInstallRollback, unityInstallStatus,
 } from "../api";
-import type { LibraryRootRow, SettingsResponse, StagingCleanupResult, StagingUsage, WatchEntry } from "../types";
+import {
+  createUnityInstallHandlers, installApplyBody, installCanApply, installChangeLabel, installStepLabel,
+} from "../unity-install-view";
+import type {
+  LibraryRootRow, SettingsResponse, StagingCleanupResult, StagingUsage, UnityInstallOperation,
+  UnityInstallPreview, UnityInstallProbe, UnityInstallStatus, WatchEntry,
+} from "../types";
 import { formatBytes, shortenPath } from "../util";
 import { Badge, Spinner } from "./ui";
 
@@ -16,6 +24,10 @@ export function SettingsPanel(props: {
   onClose: () => void;
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
   onChanged: () => void;
+  hidden?: boolean;
+  onOpenScan: (rootId: number) => void;
+  onCheckUpdate: () => void;
+  checkingUpdate: boolean;
 }) {
   const [roots, setRoots] = useState<LibraryRootRow[]>([]);
   const [watches, setWatches] = useState<WatchEntry[]>([]);
@@ -35,6 +47,15 @@ export function SettingsPanel(props: {
   const [mcUsage, setMcUsage] = useState<import("../types").MediaCacheUsage | null>(null);
   const [mcPreview, setMcPreview] = useState<import("../types").MediaCachePreview | null>(null);
   const [mcResult, setMcResult] = useState<import("../types").MediaCacheCleanupResult | null>(null);
+  // Unity 一键安装：工程路径初始为空（不自动填充、不猜工程）
+  const [uiProject, setUiProject] = useState("");
+  const [uiPreview, setUiPreview] = useState<UnityInstallPreview | null>(null);
+  const [uiOperation, setUiOperation] = useState<UnityInstallOperation | null>(null);
+  const [uiStatus, setUiStatus] = useState<UnityInstallStatus | null>(null);
+  const [uiProbe, setUiProbe] = useState<UnityInstallProbe | null>(null);
+  const [uiError, setUiError] = useState("");
+  const [uiReplace, setUiReplace] = useState(false);
+  const [uiBusy, setUiBusy] = useState("");
 
   const reload = () => Promise.all([listRoots(), listWatches(), getSettings()])
     .then(([r, w, s]) => {
@@ -85,6 +106,27 @@ export function SettingsPanel(props: {
     fn().catch((e) => props.onToast("bad", label + "失败：" + describeError(e))).finally(() => setBusy(""));
   };
 
+  /** Unity 安装 handler：真实逻辑在 unity-install-view，这里只接 state 与传输。 */
+  const uiHandlers = createUnityInstallHandlers({
+    api: {
+      preview: unityInstallPreview, apply: unityInstallApply, operation: unityInstallOperation,
+      rollback: unityInstallRollback, cancelPreview: unityInstallCancelPreview,
+      status: unityInstallStatus, probe: unityInstallProbe,
+    },
+    getProjectPath: () => uiProject,
+    getPreview: () => uiPreview,
+    getReplaceConfirmed: () => uiReplace,
+    getOperationId: () => uiOperation?.operationId ?? null,
+    setPreview: setUiPreview,
+    setOperation: setUiOperation,
+    setStatus: setUiStatus,
+    setProbe: setUiProbe,
+    setError: setUiError,
+    setBusy: setUiBusy,
+    onToast: props.onToast,
+    describeError,
+  });
+
   const doAddRoot = () => run("添加库根", async () => {
     const p = newRoot.trim();
     if (!p) { props.onToast("bad", "先填库根路径"); return; }
@@ -98,11 +140,6 @@ export function SettingsPanel(props: {
     await removeRoot(r.id);
     props.onToast("info", "已删除库根 #" + r.id);
     await reload(); props.onChanged();
-  });
-
-  const doScan = (r: LibraryRootRow) => run("扫描", async () => {
-    const j = await scan({ rootId: r.id });
-    props.onToast("ok", "已起扫描作业 #" + j.jobId + "（可在右侧「作业」里看进度）");
   });
 
   const doAddWatch = () => run("添加监听", async () => {
@@ -133,7 +170,7 @@ export function SettingsPanel(props: {
   });
 
   return (
-    <div className="backdrop" onClick={props.onClose}>
+    <div className="backdrop" hidden={props.hidden} onClick={props.onClose}>
       <div className="drawer" role="dialog" aria-label="设置" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-head">
           <h3>设置</h3>
@@ -156,7 +193,7 @@ export function SettingsPanel(props: {
                 <span className="mono p" title={r.path} style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{shortenPath(r.path, 72)}</span>
                 <Badge tone={r.mode === "managed" ? "busy" : "muted"}>{r.mode === "managed" ? "托管" : "就地索引"}</Badge>
                 {r.enabled ? null : <Badge tone="warn">已停用</Badge>}
-                <button className="btn tiny" disabled={!!busy} onClick={() => doScan(r)}>扫描</button>
+                <button className="btn tiny" disabled={!!busy} onClick={() => props.onOpenScan(r.id)}>扫描库…</button>
                 <button className="btn tiny" disabled={!!busy} onClick={() => doDelRoot(r)}>删除</button>
               </div>
             ))}
@@ -268,7 +305,95 @@ export function SettingsPanel(props: {
             <div className="hint" style={{ marginTop: "4px" }}>token 只进不出：保存后接口只回「是否已配置」，不会回显值。</div>
             <div className="row" style={{ gap: "6px", marginTop: "10px" }}>
               <button className="btn" disabled={!!busy} onClick={doSave}>保存设置</button>
+              <button className="btn" disabled={props.checkingUpdate} onClick={props.onCheckUpdate}>
+                {props.checkingUpdate ? "检查中…" : "检查更新"}
+              </button>
             </div>
+          </div>
+
+          <div className="section" data-testid="unity-install-section" aria-label="Unity 一键安装">
+            <h4>Unity 一键安装</h4>
+            <div className="hint">
+              只改工程 <span className="mono">Packages/manifest.json</span> 的目标依赖；不装 Python/uv、不下载 zip、不调用 Unity。
+              预览只读工程；应用前请先保存并暂时关闭 Unity 工程（哈希校验不是原子 CAS）。
+            </div>
+            <label className="hint" style={{ display: "block", marginTop: "6px" }}>Unity 工程路径（需含 Packages/manifest.json）</label>
+            <input
+              data-testid="unity-install-project"
+              style={{ width: "100%" }}
+              value={uiProject}
+              onChange={(e) => setUiProject(e.target.value)}
+              placeholder="例如 E:\MyUnityProject"
+            />
+            <div className="row wrap" style={{ gap: "6px", marginTop: "6px" }}>
+              <button className="btn" data-testid="unity-install-preview" disabled={!!uiBusy} onClick={() => void uiHandlers.preview()}>预览（只读）</button>
+              <button className="btn" data-testid="unity-install-status" disabled={!!uiBusy} onClick={() => void uiHandlers.status()}>读取状态</button>
+              <button className="btn" data-testid="unity-install-probe" disabled={!!uiBusy} onClick={() => void uiHandlers.probe()}>显式探测</button>
+              <button className="btn tiny" data-testid="unity-install-cancel" disabled={!!uiBusy || !uiPreview} onClick={() => void uiHandlers.cancel()}>取消预览</button>
+              <button className="btn tiny danger" data-testid="unity-install-rollback" disabled={!!uiBusy || !uiOperation?.operationId} onClick={() => void uiHandlers.rollback()}>回滚配置</button>
+            </div>
+            {uiError && <div className="notice bad">{uiError}</div>}
+
+            {uiPreview && (
+              <div style={{ marginTop: "8px" }}>
+                <div className="hint">
+                  工程：<span className="mono">{uiPreview.project.path}</span>（{uiPreview.project.name} · Unity {uiPreview.project.unityVersion}）
+                  <br />目标：{uiPreview.package.id}@{uiPreview.package.targetVersion} · 变化：{installChangeLabel(uiPreview.package.change)}
+                  <br />manifest：<span className="mono">{uiPreview.project.manifestPath}</span>（before {uiPreview.project.manifestHash.slice(0, 12)}）
+                  <br />备份目录：<span className="mono">{uiPreview.backup.dir}</span> · 预览过期：{uiPreview.expiresAt}
+                </div>
+                <pre className="mono" style={{ margin: "4px 0", padding: "6px", background: "var(--bg-hi)", borderRadius: "6px", fontSize: "11px", whiteSpace: "pre-wrap" }}>{uiPreview.diff}</pre>
+                {uiPreview.prerequisites.length > 0 && (
+                  <div className="hint">
+                    前置：{uiPreview.prerequisites.map((p) => p.id + "=" + p.status + (p.detail ? "（" + p.detail + "）" : "")).join(" · ")}
+                  </div>
+                )}
+                {uiPreview.warnings.length > 0 && (
+                  <div className="hint" style={{ color: "var(--warn)" }}>警告：{uiPreview.warnings.join("；")}</div>
+                )}
+                {uiPreview.package.change === "replace" && (
+                  <label className="chk" style={{ marginTop: "4px" }}>
+                    <input type="checkbox" checked={uiReplace} onChange={(e) => setUiReplace(e.target.checked)} />
+                    确认替换同包不同版本（会改写目标依赖）
+                  </label>
+                )}
+                <div className="row wrap" style={{ gap: "6px", marginTop: "6px", alignItems: "center" }}>
+                  <button
+                    className="btn"
+                    data-testid="unity-install-apply"
+                    disabled={!!uiBusy || !installCanApply(uiPreview, uiReplace)}
+                    onClick={() => void uiHandlers.apply()}
+                  >应用配置</button>
+                  <span className="hint">确认请求：{JSON.stringify(installApplyBody(uiPreview.previewId, uiReplace))}</span>
+                </div>
+                <div className="hint" style={{ marginTop: "2px" }}>
+                  应用只写 manifest；<b>config_applied 不等于 UPM 解析/编译/桥接/工具就绪</b>，这些要显式探测。
+                </div>
+              </div>
+            )}
+
+            {uiStatus && (
+              <div className="hint" style={{ marginTop: "6px" }}>
+                状态：config={uiStatus.config} · upm={uiStatus.upm} · compile={uiStatus.compile} · bridge={uiStatus.bridge} · tool={uiStatus.tool} · server={uiStatus.server}
+                <br />unknown 一律不当作成功；config=applied 只表示 manifest 已含目标依赖。
+              </div>
+            )}
+
+            {uiOperation && (
+              <div className="hint" style={{ marginTop: "6px" }}>
+                操作 {uiOperation.operationId}：{uiOperation.status} · before {uiOperation.beforeHash.slice(0, 12)} · after {(uiOperation.afterHash ?? "—").slice(0, 12)}
+                <br />步骤：{Object.entries(uiOperation.steps).map(([k, v]) => installStepLabel(k) + "=" + v).join(" · ")}
+              </div>
+            )}
+
+            {uiProbe && (
+              <div className="hint" style={{ marginTop: "6px" }}>
+                探测：projectMatch={String(uiProbe.projectMatch)} · compile={uiProbe.compile} · bridge={uiProbe.bridge} · tool={uiProbe.tool} · server={uiProbe.server}
+                <br />{uiProbe.editor
+                  ? "Editor：" + uiProbe.editor.projectName + "（" + uiProbe.editor.unityVersion + "）"
+                  : "Editor：未连接（unknown 不当作成功）"}
+              </div>
+            )}
           </div>
         </div>
       </div>

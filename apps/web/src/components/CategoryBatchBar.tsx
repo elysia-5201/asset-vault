@@ -17,8 +17,8 @@ export function CategoryBatchBar(props: {
   onClearSelection: () => void;
   onExitSelectMode: () => void;
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
-  /** 任一批量操作成功后：刷新列表 + 清空选择 */
-  onDone: () => void;
+  /** 结果中未成功的条目可留在选择中重试。 */
+  onDone: (failedIds: number[]) => void;
 }) {
   const [catId, setCatId] = useState("");
   const [subId, setSubId] = useState("");
@@ -34,31 +34,33 @@ export function CategoryBatchBar(props: {
   }, [tops, catId]);
 
   const targets = onlyUncat ? props.uncategorizedIds : props.selectedIds;
+  const category = tops.find((c) => c.id === catId);
+  const subCategory = subs.find((c) => c.id === subId);
 
-  const run = (mode: "set" | "clear_sub" | "resuggest") => {
-    if (!targets.length) { props.onToast("info", "没有可处理的条目" + (onlyUncat ? "（选中项里没有未分类的）" : "")); return; }
-    if (mode === "set" && !catId && !window.confirm("把选中的 " + targets.length + " 条**清除分类归属**（→ 未分类）？")) return;
-    if (mode === "set" && catId) {
-      const label = tops.find((t) => t.id === catId)?.name ?? catId;
-      const subLabel = subs.find((c) => c.id === subId)?.name;
-      if (!window.confirm("将把 " + targets.length + " 条设为「" + label + (subLabel ? " › " + subLabel : "") + "」？\n（来源记为 manual；手动/已采纳的分类永不被自动任务覆盖）")) return;
-    }
-    if (mode === "clear_sub" && !window.confirm("将把 " + targets.length + " 条的**子分类**移除（保留主分类）？")) return;
-    if (mode === "resuggest" && !window.confirm("将为 " + targets.length + " 条重新生成分类建议？\n（高置信度自动应用；已有手动/已采纳归属的只写建议，不覆盖）")) return;
+  const run = (action: "set" | "clear_category" | "clear_sub" | "resuggest") => {
+    if (busy || !targets.length || (action === "set" && (!category || (subId && !subCategory)))) return;
+    const name = action === "set" ? "设置分类"
+      : action === "clear_category" ? "清除分类归属"
+      : action === "clear_sub" ? "移除子分类" : "重新生成分类建议";
+    const targetName = category?.name + (subCategory ? " › " + subCategory.name : "");
+    const prompt = action === "set" ? "将 " + targets.length + " 条素材设为「" + targetName + "」？"
+      : action === "clear_category" ? "将 " + targets.length + " 条素材设为未分类？"
+      : action === "clear_sub" ? "移除 " + targets.length + " 条素材的子分类，保留主分类？"
+      : "为 " + targets.length + " 条素材重新生成分类建议？现有分类会保留。";
+    if (!window.confirm(prompt)) return;
     setBusy(true); setFailed(null); setNote("");
     batchSetItemCategory({
       itemIds: targets,
-      categoryId: mode === "set" ? (catId || null) : undefined,
-      subCategoryId: mode === "set" ? (subId || null) : undefined,
-      mode,
+      categoryId: action === "clear_category" ? null : action === "set" ? category!.id : undefined,
+      subCategoryId: action === "clear_category" ? null : action === "set" ? subCategory?.id ?? null : undefined,
+      mode: action === "clear_category" ? "set" : action,
     })
       .then((r) => {
         setFailed(r.failed);
         setNote("请求 " + r.requested + " 条 · 成功 " + r.updated + " 条 · 失败 " + r.failed.length + " 条");
         props.onToast(r.failed.length ? "bad" : "ok",
-          (mode === "set" ? "批量设置分类" : mode === "clear_sub" ? "批量移除子分类" : "批量重新生成建议")
-          + "：成功 " + r.updated + " / " + r.requested + (r.failed.length ? "，失败 " + r.failed.length + " 条（见下方明细）" : ""));
-        props.onDone();
+          name + "：成功 " + r.updated + " / " + r.requested + (r.failed.length ? "，失败 " + r.failed.length + " 条（见下方明细）" : ""));
+        props.onDone(r.failed.map((f) => f.itemId));
       })
       .catch((e) => props.onToast("bad", categoryApiMessage(e, "批量分类")))
       .finally(() => setBusy(false));
@@ -70,36 +72,42 @@ export function CategoryBatchBar(props: {
         <b>批量分类</b>
         <span className="hint">已选 {props.selectedIds.length} 条{props.uncategorizedIds.length ? "（其中未分类 " + props.uncategorizedIds.length + " 条）" : ""}</span>
         <span className="spacer" />
-        <button className="btn tiny" onClick={props.onClearSelection} disabled={!props.selectedIds.length}>清空选择</button>
-        <button className="btn tiny" onClick={props.onExitSelectMode}>退出选择模式</button>
+        <button className="btn tiny" onClick={props.onClearSelection} disabled={busy || !props.selectedIds.length}>清空选择</button>
+        <button className="btn tiny" onClick={props.onExitSelectMode} disabled={busy}>退出批量分类</button>
       </div>
 
       {props.catErr && <div className="err" style={{ marginTop: "5px" }}>{props.catErr}</div>}
 
       <div className="row wrap" style={{ gap: "6px", alignItems: "flex-end", marginTop: "6px" }}>
         <label className="cat-field">主分类
-          <select value={catId} onChange={(e) => { setCatId(e.target.value); setSubId(""); }}>
-            <option value="">（清除归属）</option>
+          <select value={catId} disabled={busy} onChange={(e) => { setCatId(e.target.value); setSubId(""); }}>
+            <option value="">选择主分类</option>
             {tops.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
           </select>
         </label>
         <label className="cat-field">子分类
-          <select value={subId} onChange={(e) => setSubId(e.target.value)} disabled={!catId}>
+          <select value={subId} onChange={(e) => setSubId(e.target.value)} disabled={busy || !category}>
             <option value="">（不指定）</option>
             {subs.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         </label>
         <label className="row" style={{ gap: "4px", alignItems: "center", cursor: "pointer" }} title="只处理选中项里尚未归属任何分类的条目">
-          <input type="checkbox" checked={onlyUncat} onChange={(e) => setOnlyUncat(e.target.checked)} />
+          <input type="checkbox" checked={onlyUncat} disabled={busy} onChange={(e) => setOnlyUncat(e.target.checked)} />
           <span className="hint">仅对未分类（{props.uncategorizedIds.length} 条）</span>
         </label>
       </div>
 
       <div className="row wrap" style={{ gap: "5px", alignItems: "center", marginTop: "6px" }}>
         <span className="hint">将影响 <b style={{ color: "var(--fg)" }}>{targets.length}</b> 条</span>
-        <button className="btn tiny" disabled={busy || !targets.length} onClick={() => run("set")}>批量设置主/子分类</button>
-        <button className="btn tiny" disabled={busy || !targets.length} onClick={() => run("clear_sub")} title="只移除子分类，保留主分类">批量移除子分类</button>
-        <button className="btn tiny" disabled={busy || !targets.length} onClick={() => run("resuggest")} title="POST /api/items/category/batch { mode: resuggest }">批量重新生成建议</button>
+        <button className="btn tiny primary" disabled={busy || !targets.length || !category || (!!subId && !subCategory)} onClick={() => run("set")}>设置分类</button>
+        <details className="batch-secondary">
+          <summary>其他分类操作</summary>
+          <div className="row wrap">
+            <button className="btn tiny" disabled={busy || !targets.length} onClick={() => run("resuggest")}>重新生成建议</button>
+            <button className="btn tiny" disabled={busy || !targets.length} onClick={() => run("clear_sub")}>仅移除子分类</button>
+            <button className="btn tiny danger" disabled={busy || !targets.length} onClick={() => run("clear_category")}>清除分类归属</button>
+          </div>
+        </details>
         {busy && <span className="spin" />}
       </div>
 

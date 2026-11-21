@@ -136,15 +136,16 @@ describe("apply 范围（AUD-08）", () => {
       writeFileSync(join(dir, "on-disk-1.zip"), Buffer.alloc(4, 1));
       writeFileSync(join(dir, "on-disk-2.zip"), Buffer.alloc(4, 2));
       const gonePath = join(dir, "gone.zip");
-      const a = addAsset(t.db, itemId, rootId, gonePath);
+      const scanRootId = repo.ensureRoot(dir).id;
+      const a = addAsset(t.db, itemId, scanRootId, gonePath);
       const before = (t.db.prepare("SELECT COUNT(*) c FROM assets WHERE status<>'trashed'").get() as any).c;
-      const p = repo.createScanPreview({ rootId, path: dir, deep: false });
+      const p = repo.createScanPreview({ rootId: scanRootId, path: dir, deep: false });
       repo.replaceScanPreviewItems(p.id, [{ path: gonePath, path_norm: normalizePath(gonePath), change: "missing", assetId: a }]);
       const item = (repo.listScanPreviewItems(p.id, { limit: 10 }).items[0]) as any;
       repo.updateScanPreview(p.id, { state: "applying" });
       const run = repo.createScanApplyRun({ previewId: p.id, requested: 1 });
       const job = repo.createJob("scan", null, {
-        mode: "apply", previewId: p.id, applyRunId: run.id, path: dir, rootId, deep: false,
+        mode: "apply", previewId: p.id, applyRunId: run.id, path: dir, rootId: scanRootId, deep: false,
         files: [], markMissing: [a], applyItems: [{ id: item.id, pathNorm: normalizePath(gonePath), change: "missing" }], staleCount: 0,
       }, 5);
       repo.updateScanApplyRun(run.id, { job_id: job.id });
@@ -157,6 +158,34 @@ describe("apply 范围（AUD-08）", () => {
       assert.equal(after, before, "missing-only apply 不得把目录里的文件登记成新资产");
       assert.equal(repo.getScanPreview(p.id).state, "applied");
       assert.equal(repo.getScanApplyRun(run.id).state, "done");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test("queued missing decisions preserve relocated assets for both payload shapes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "av-missing-relocate-"));
+    try {
+      for (const legacy of [false, true]) {
+        const gonePath = join(dir, `gone-${legacy}.zip`);
+        const scanRootId = repo.ensureRoot(dir).id;
+        const a = addAsset(t.db, itemId, scanRootId, gonePath);
+        const p = repo.createScanPreview({ rootId: scanRootId, path: dir, deep: false });
+        repo.replaceScanPreviewItems(p.id, [{ path: gonePath, path_norm: normalizePath(gonePath), change: "missing", assetId: a }]);
+        const row = repo.listScanPreviewItems(p.id, { limit: 10 }).items[0] as any;
+        repo.updateScanPreview(p.id, { state: "applying" });
+        const run = repo.createScanApplyRun({ previewId: p.id, requested: 1 });
+        const job = repo.createJob("scan", null, {
+          mode: "apply", previewId: p.id, applyRunId: run.id, path: dir, rootId: scanRootId, deep: false,
+          files: [], markMissing: legacy ? [a] : [{ id: a, pathNorm: normalizePath(gonePath) }],
+          applyItems: [{ id: row.id, pathNorm: normalizePath(gonePath), change: "missing" }], staleCount: 0,
+        }, 5);
+        repo.updateScanApplyRun(run.id, { job_id: job.id });
+        repo.updateScanPreview(p.id, { apply_job_id: job.id });
+        const movedPath = join(dir, `moved-${legacy}.zip`);
+        t.db.prepare("UPDATE assets SET path=?, path_norm=? WHERE id=?").run(movedPath, normalizePath(movedPath), a);
+        const deps: JobDeps = { repo, media: {} as any, booth: {} as any, log: () => {}, limits: resolveLimits({ maxScanFiles: 10, registerBatchSize: 10 }) };
+        await runJob(deps, job.id);
+        assert.equal(repo.getAsset(a)!.status, "present", `relocated asset remains present (legacy=${legacy})`);
+        assert.equal(repo.scanPreviewItemCounts(p.id).failed, 1, `stale missing decision is not finalized as applied (legacy=${legacy})`);
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

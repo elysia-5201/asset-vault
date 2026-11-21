@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "./db/migrate";
 import { Repo } from "./db/repo";
@@ -18,7 +19,9 @@ import { IndexPipeline } from "./services/pipeline/pipeline";
 import { resolveLimits, limitsHash } from "./services/pipeline/limits";
 import { acquirePipelineLock, type PipelineLock } from "./services/pipeline/lock";
 import { adoptLegacyStaging, sweepStagingOnStartup } from "./services/structure";
+import { recoverInterruptedOperations } from "./services/unity-install";
 import { assertLocalListenHost } from "./listen-host";
+export { createArchiveDragStaging } from "./services/archive-drag";
 
 export const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -76,6 +79,9 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     if (process.env.ASSETVAULT_VERBOSE) console.log(line);
   };
 
+  try { await recoverInterruptedOperations({ dataDir, log }); }
+  catch (e) { log("unity-install recovery failed: " + String((e as Error)?.message ?? e)); }
+
   const db = openDatabase(dbPath, opts.schemaFile);
   const repo = new Repo(db);
   const seeded = seedAvatars(repo, opts.seedFile);
@@ -110,6 +116,17 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   let app: FastifyInstance | null = null;
   const watcher = new InboxWatcher(repo, log);
   const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined, limits, dataDir });
+  const close = async () => {
+    runner.stop();
+    try { await pipeline?.stop(); } catch { /* noop */ }
+    try { await watcher.close(); } catch { /* noop */ }
+    try { await app?.close(); } catch { /* noop */ }
+    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* noop */ }
+    try { db.close(); } catch { /* noop */ }
+    lock.release();
+    logStream.end();
+    await finished(logStream, { cleanup: true }).catch(() => {});
+  };
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
@@ -135,8 +152,9 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     const host = assertLocalListenHost(opts.host ?? process.env.HOST ?? "127.0.0.1", {
       allowRemote: process.env.ASSETVAULT_ALLOW_REMOTE_LISTEN === "1",
     });
-    await fastify.listen({ port, host });
     app = fastify;
+    try { await fastify.listen({ port, host }); }
+    catch (e) { await close(); throw e; }
     // v6 租约：只有取得单写入者锁的实例才跑 jobs。未取得锁的实例只提供 HTTP 接口，
     // 否则两个进程会同时领取/接管作业（recoverInFlight 本来就在 lock 分支内）。
     if (lock.acquired) runner.start(400);
@@ -147,29 +165,13 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     if (process.env.ASSETVAULT_VERBOSE) console.log("AssetVault up on http://" + host + ":" + port);
     return {
       app, repo, media, booth, runner, watcher, pipeline, cache, dataDir, port, url: "http://" + host + ":" + port, log,
-      close: async () => {
-        runner.stop();
-        try { await pipeline?.stop(); } catch { /* noop */ }
-        try { await watcher.close(); } catch { /* noop */ }
-        try { await app?.close(); } catch { /* noop */ }
-        try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* noop */ }
-        try { db.close(); } catch { /* noop */ }
-        lock.release();
-        logStream.end();
-      },
+      close,
     };
   }
 
   log("AssetVault embedded mode (db=" + dbPath + ", seeded=" + seeded + ", tagsSeeded=" + seededTags + ")");
   return {
     app: null, repo, media, booth, runner, watcher, pipeline, cache, dataDir, port: 0, url: "", log,
-    close: async () => {
-      runner.stop();
-      try { await pipeline?.stop(); } catch { /* noop */ }
-      try { await watcher.close(); } catch { /* noop */ }
-      try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* noop */ }
-      try { db.close(); } catch { /* noop */ }
-      lock.release(); logStream.end();
-    },
+    close,
   };
 }

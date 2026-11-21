@@ -54,7 +54,7 @@ describe("mapFocusToUnits：精确映射才预选", () => {
     assert.deepEqual(map.missingAssetIds, [99]);
   });
 
-  test("同一资产对应多个单元（整包里多个包）→ 不预选该资产（工作台一次只能导入一个）", () => {
+  test("同一归档内的模型包和材质包可一起预选", () => {
     const units = [
       unit({ unitId: "1", assetId: 10, relPath: "a.unitypackage" }),
       unit({ unitId: "2", assetId: 10, relPath: "b.unitypackage" }),
@@ -63,8 +63,8 @@ describe("mapFocusToUnits：精确映射才预选", () => {
       { assetId: 10, relPath: "a.unitypackage" },
       { assetId: 10, relPath: "b.unitypackage" },
     ]), units);
-    assert.deepEqual(map.preselected, []);
-    assert.deepEqual(map.ambiguousAssetIds, [10]);
+    assert.deepEqual(map.preselected, ["1", "2"]);
+    assert.deepEqual(map.ambiguousAssetIds, []);
   });
 
   test("不可导入的单元不预选", () => {
@@ -74,10 +74,10 @@ describe("mapFocusToUnits：精确映射才预选", () => {
     assert.equal(map.unresolved.length, 1);
   });
 
-  test("同条目同包名但不同资产（互斥槽位冲突）→ 不预选，避免静默替换用户选择", () => {
+  test("存在变体关系的包不预选，即使路径不同", () => {
     const units = [
-      unit({ unitId: "1", assetId: 10, relPath: "a.unitypackage", packageName: "same.unitypackage" }),
-      unit({ unitId: "2", assetId: 11, relPath: "b.unitypackage", packageName: "same.unitypackage" }),
+      unit({ unitId: "1", assetId: 10, relPath: "a.unitypackage", variantIds: ["2"] }),
+      unit({ unitId: "2", assetId: 11, relPath: "b.unitypackage" }),
     ];
     const map = mapFocusToUnits(focusOf([
       { assetId: 10, relPath: "a.unitypackage" },

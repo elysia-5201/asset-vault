@@ -13,7 +13,7 @@
  * - 不自动 scan/repair/删文件/改条目状态；只提供跳详情与忽略/恢复。
  * - 父挂载（App 入口/onOpenItem）归 task34；本组件只提供可接 props，不假称已主 UI 可用。
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError, apiMode, createCleanupFilter, deleteCleanupFilter, describeError, getCategories,
   ignoreCleanupTodo, listAvatars, listCleanupFilters, listCleanupIgnores, listCleanupTodos,
@@ -34,6 +34,8 @@ export interface CleanupPanelProps {
   /** 跳条目详情；父挂载（task34）提供。缺省时只提示，不伪造跳转。 */
   onOpenItem?: (id: number) => void;
   onToast?: (kind: "ok" | "bad" | "info", text: string) => void;
+  /** 从条目详情返回时刷新当前待办列表。 */
+  refreshKey?: number;
 }
 
 /** 错误文案：mock 模式真缺能力要明示，不伪写成功。 */
@@ -78,6 +80,7 @@ export function CleanupPanel(props: CleanupPanelProps) {
   const [ignores, setIgnores] = useState<CleanupIgnoresResponse | null>(null);
   const [ignoresLoading, setIgnoresLoading] = useState(false);
   const [ignoresError, setIgnoresError] = useState("");
+  const todoRequest = useRef(0);
 
   const toast = (kind: "ok" | "bad" | "info", text: string) => props.onToast?.(kind, text);
 
@@ -88,14 +91,15 @@ export function CleanupPanel(props: CleanupPanelProps) {
   };
 
   const reloadTodos = useCallback(() => {
+    const request = ++todoRequest.current;
     setLoading(true); setError("");
     listCleanupTodos({
       rule: rule ?? undefined, ignored, q: debouncedQ, avatarIds, categoryIds, sort,
       localSourcePolicy: policy, limit, offset,
     })
-      .then(setData)
-      .catch((e) => setError(errorText(e)))
-      .finally(() => setLoading(false));
+      .then((result) => { if (request === todoRequest.current) setData(result); })
+      .catch((e) => { if (request === todoRequest.current) setError(errorText(e)); })
+      .finally(() => { if (request === todoRequest.current) setLoading(false); });
   }, [rule, debouncedQ, avatarIds, categoryIds, ignored, sort, policy, limit, offset]);
 
   const reloadIgnores = useCallback(() => {
@@ -113,8 +117,8 @@ export function CleanupPanel(props: CleanupPanelProps) {
       .catch((e) => toast("bad", errorText(e)));
   }, [props.onToast]);
 
-  useEffect(() => { reloadTodos(); }, [reloadTodos]);
-  useEffect(() => { reloadIgnores(); }, [reloadIgnores]);
+  useEffect(() => { reloadTodos(); }, [reloadTodos, props.refreshKey]);
+  useEffect(() => { reloadIgnores(); }, [reloadIgnores, props.refreshKey]);
   useEffect(() => { reloadFilters(); }, [reloadFilters]);
   useEffect(() => {
     // 过滤选项失败不阻塞列表；不伪造选项。
@@ -270,8 +274,13 @@ export function CleanupPanel(props: CleanupPanelProps) {
         </div>
       )}
 
+      <div className="row wrap" style={{ gap: "6px", marginTop: "8px" }}>
+        <input type="search" aria-label="搜索整理待办" value={q} placeholder="搜索标题、店铺、作者、备注或标签" onChange={(e) => { setQ(e.target.value); setOffset(0); }} />
+      </div>
+
+      <details className="batch-secondary" style={{ marginTop: "6px" }}>
+        <summary>高级筛选与管理</summary>
       <div className="row wrap" style={{ gap: "6px", marginTop: "6px" }}>
-        <input value={q} placeholder="搜索标题/店铺/作者/备注/标签" onChange={(e) => { setQ(e.target.value); setOffset(0); }} />
         <select
           multiple
           size={3}
@@ -363,6 +372,8 @@ export function CleanupPanel(props: CleanupPanelProps) {
           ))}
         </div>
       )}
+
+      </details>
 
       {!loading && !error && data && data.items.length === 0 && (
         <div className="hint" style={{ marginTop: "6px" }}>当前条件下没有待办行。</div>

@@ -1,19 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AvatarMatch } from "@core/contracts";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { AvatarMatch, ItemAssetScanResult } from "@core/contracts";
 import {
   addAsset, addImages, addItemAvatars, addItemTags, addToCollection, boothPeek, checkUpdate, createCollection, deleteImage, deleteItem, describeError,
   deleteCollection, getCollection, getItem, getItemDuplicates, getRelatedItems, linkBooth, listItems, matchAvatars, mediaUrl, mergeItems, patchItem, pruneItemAvatars, removeFromCollection, removeItemAvatar, reorderImages, restoreItem, setCover,
   type CollectionMember,
-  itemUsage, scanProjectUsage, unityPackages, unityStatus,
-  type EntryPreview, type UnityPackageWeb, type UnityStatusWeb,
+  itemUsage, scanItemFiles, scanProjectUsage,
+  type EntryPreview,
 } from "../api";
-import type { AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
-import { unityPackageRelPath, type WorkbenchFocus } from "../workbench-focus";
+import type { AssetRow, AvatarCard, DuplicateFileDiff, DuplicateLevel, DuplicateMatch, ItemDetailWeb, ProjectRefUsage, RelatedMatch } from "../types";
+import type { WorkbenchFocus } from "../workbench-focus";
 import { formatBytes, formatDate, formatYen, shortenPath } from "../util";
 import { ArchiveView } from "./ArchiveView";
+import { MissingAssetActions } from "./MissingAssetActions";
 import { MergePreview } from "./MergePreview";
 import { VersionLinksSection } from "./VersionLinksSection";
 import { AddToLoadoutButton } from "./AddToLoadoutButton";
+import { RegisterAvatarSection } from "./RegisterAvatarSection";
+import { BoothCorrectionSection } from "./BoothCorrectionSection";
 import { CategoryEditor } from "./CategoryEditor";
 import { Badge, Collapsible, EvidenceLine, MATCH_LABEL, Section, SITE_LABEL, STATUS_LABEL, Spinner } from "./ui";
 
@@ -43,8 +46,43 @@ function DiffGroup(props: { label: string; items: DuplicateFileDiff[] }) {
   );
 }
 
+function DetailDisclosure({ label, meta, children, onOpen }: {
+  label: ReactNode; meta?: ReactNode; children: ReactNode; onOpen?: () => void;
+}) {
+  const [opened, setOpened] = useState(false);
+  return (
+    <details className="detail-disclosure" onToggle={(event) => {
+      if (event.currentTarget.open && !opened) {
+        setOpened(true);
+        onOpen?.();
+      }
+    }}>
+      <summary>
+        {label}
+        {meta != null && <span className="detail-disclosure-meta">{meta}</span>}
+      </summary>
+      {opened && <div className="detail-disclosure-body">{children}</div>}
+    </details>
+  );
+}
+
+function DetailFile({ asset, onToast }: {
+  asset: AssetRow; onToast: (kind: "ok" | "bad" | "info", text: string) => void;
+}) {
+  const fileName = asset.path.split(/[\\/]/).filter(Boolean).at(-1) ?? asset.path;
+  return (
+    <DetailDisclosure
+      label={<span className="detail-file-name" title={asset.path}>{fileName}</span>}
+      meta={formatBytes(asset.size)}
+    >
+      <ArchiveView asset={asset} onToast={onToast} />
+    </DetailDisclosure>
+  );
+}
+
 export function ItemDetail(props: {
   itemId: number;
+  hidden?: boolean;
   avatars: AvatarCard[];
   projects: ProjectLite[];
   onClose: () => void;
@@ -54,23 +92,28 @@ export function ItemDetail(props: {
   onMarkImported: (itemId: number, projectId: number) => void;
   /** 打开另一个条目的详情（「疑似重复」里点「打开 #id」用）。 */
   onOpenItem: (itemId: number) => void;
-  /** 打开「头像工作台」——唯一合法的导入入口（计划 → 风险确认 → 作业）；带上本页勾选的包作为上下文。 */
+  /** 打开工作台并定位到本条素材。 */
   onOpenWorkbench?: (focus: WorkbenchFocus) => void;
   /**
    * 用户在头像轨显式选中的模型（恰好一个时才有值）。只用于「加入搭配清单」的显式目标，
    * 不从条目的适配模型自动推断；null = 未选/多选，按钮只提示。
    */
   selectedAvatarId?: number | null;
+  /** 条目被登记为模型本体后，通知父刷新 avatars 列表（详情与 items 由本组件/onChanged 负责）。 */
+  onAvatarRegistered?: () => void;
 }) {
   const { itemId } = props;
   const [detail, setDetail] = useState<ItemDetailWeb | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
-  const [notes, setNotes] = useState("");
+  const [notesDraft, setNotesDraft] = useState<string | null>(null);
   const [notesSaving, setNotesSaving] = useState(false);
   const [imgUrl, setImgUrl] = useState("");
   const [imgPaths, setImgPaths] = useState("");
   const [assetPath, setAssetPath] = useState("");
+  const [fileScanBusy, setFileScanBusy] = useState(false);
+  const [fileScan, setFileScan] = useState<ItemAssetScanResult | null>(null);
+  const [fileScanError, setFileScanError] = useState("");
   const [newTag, setNewTag] = useState("");
   const [boothUrl, setBoothUrl] = useState("");
   const [collName, setCollName] = useState("");
@@ -85,7 +128,7 @@ export function ItemDetail(props: {
   const [compatPick, setCompatPick] = useState<number | "">("");
   const [compatMatch, setCompatMatch] = useState<AvatarMatch>("any");
   const [busy, setBusy] = useState(false);
-  const boothInputRef = useRef<HTMLInputElement | null>(null);
+  const detailRequest = useRef(0);
   /** 只在商品页标题/标签/描述里出现过、素材内容里毫无痕迹的适配模型（可用「按包内证据校正」一键去掉）。 */
   const weakAvatars = useMemo(() => {
     const FILE_SOURCES = ["archive_path", "unitypackage_path", "filename"];
@@ -97,12 +140,6 @@ export function ItemDetail(props: {
       } catch { return false; }
     });
   }, [detail]);
-  const [unity, setUnity] = useState<UnityStatusWeb | null>(null);
-  const [unityPkgs, setUnityPkgs] = useState<UnityPackageWeb[]>([]);
-  const [unityPicked, setUnityPicked] = useState<Set<string>>(new Set());
-  const [unityBusy, setUnityBusy] = useState(false);
-  const [unityNote, setUnityNote] = useState("");
-  const [unityPickNote, setUnityPickNote] = useState("");
   /** 这个条目在各工程里"真的被用到"的文件（GUID 求交；未扫描/旧后端 → 空数组，静默不报错） */
   const [usage, setUsage] = useState<ProjectRefUsage[] | null>(null);
   const [usageOpen, setUsageOpen] = useState<number | null>(null);
@@ -157,14 +194,38 @@ export function ItemDetail(props: {
   };
 
   const load = useCallback(() => {
-    setLoading(true); setErr("");
+    const request = ++detailRequest.current;
+    setErr("");
     getItem(itemId)
-      .then((d) => { setDetail(d); setNotes(d.notes ?? ""); setLocalTags(null); })
-      .catch((e) => setErr(describeError(e)))
-      .finally(() => setLoading(false));
+      .then((result) => {
+        if (detailRequest.current !== request) return;
+        setDetail(result);
+        setLocalTags(null);
+      })
+      .catch((error) => { if (detailRequest.current === request) setErr(describeError(error)); })
+      .finally(() => { if (detailRequest.current === request) setLoading(false); });
   }, [itemId]);
 
-  useEffect(() => { setOrder(null); setLocalTags(null); setLocalTagNote(false); load(); }, [itemId, load]);
+  useEffect(() => {
+    load();
+    return () => { detailRequest.current++; };
+  }, [load]);
+
+  const scanFiles = async () => {
+    setFileScanBusy(true);
+    setFileScan(null);
+    setFileScanError("");
+    try {
+      const result = await scanItemFiles(itemId);
+      setFileScan(result);
+      load();
+      if (result.files.some((file) => file.changed)) props.onChanged();
+    } catch (error) {
+      setFileScanError(describeError(error));
+    } finally {
+      setFileScanBusy(false);
+    }
+  };
 
   /** 拉一次本条的疑似重复；失败静默（空列表）。 */
   const loadDups = useCallback(() => {
@@ -264,7 +325,12 @@ export function ItemDetail(props: {
     if (!detail) return;
     setNotesSaving(true);
     patchItem(itemId, { notes })
-      .then(() => { props.onToast("ok", "备注已保存"); props.onChanged(); })
+      .then(() => {
+        setDetail((current) => current ? { ...current, notes, item: { ...current.item, notes } } : current);
+        setNotesDraft((current) => current === notes ? null : current);
+        props.onToast("ok", "备注已保存");
+        props.onChanged();
+      })
       .catch((e) => props.onToast("bad", describeError(e)))
       .finally(() => setNotesSaving(false));
   };
@@ -297,41 +363,6 @@ export function ItemDetail(props: {
   };
 
   /**
-   * 探测当前打开的 Unity（MCP for Unity）+ 这个条目里的 .unitypackage 清单。
-   * 认得出"当前工程是哪个 avatar"时，只预选那个 avatar 的包（其余仍列出来，手动可勾）。
-   */
-  const loadUnity = useCallback(async (refresh = false) => {
-    setUnityBusy(true); setUnityNote(""); setUnityPickNote("");
-    try {
-      let st: UnityStatusWeb;
-      try { st = await unityStatus(); }
-      catch (e) { st = { ok: false, endpoint: "", error: describeError(e), candidates: [], projectAvatar: null }; }
-      setUnity(st);
-      let list: UnityPackageWeb[] = [];
-      let projAvatar = st.projectAvatar ?? null;
-      let scanErrors = 0;
-      try {
-        const pk = await unityPackages(itemId, st.editor?.projectPath, refresh);
-        list = pk.packages;
-        projAvatar = pk.projectAvatar ?? projAvatar;
-        scanErrors = pk.scanErrors ?? 0;
-      } catch (e) { if (!st.ok) setUnityNote("列包失败：" + describeError(e)); }
-      setUnityPkgs(list);
-      const matched = list.filter((p) => p.matched);
-      setUnityPicked(new Set((matched.length ? matched : list).map((p) => p.key)));
-      if (scanErrors > 0) {
-        setUnityNote("有 " + scanErrors + " 个内层压缩包这次没读成功（网络盘/杀软偶发），点右上「重新检测」重扫。");
-      } else if (matched.length && matched.length < list.length) {
-        setUnityPickNote("已按当前工程 @" + (projAvatar?.name ?? "?") + " 预选 " + matched.length + "/" + list.length + " 个包（其余是给别的 avatar 的，要装可以自己勾）");
-      } else if (list.length > 1 && !matched.length && projAvatar) {
-        setUnityPickNote("这 " + list.length + " 个包里没有认出 @ " + projAvatar.name + " 的（工程名对不上包名），已全选，请自己确认");
-      }
-    } finally { setUnityBusy(false); }
-  }, [itemId]);
-
-  useEffect(() => { void loadUnity(); }, [loadUnity]);
-
-  /**
    * 拉这个条目的"实际引用"（工程里真的在用哪些文件）。
    * 接口 404/失败一律静默：旧后端没有 /items/:id/usage，不能因此弹错或崩。
    */
@@ -340,7 +371,6 @@ export function ItemDetail(props: {
       .then((r) => setUsage(r.projects))
       .catch(() => setUsage((prev) => prev ?? []));
   }, [itemId]);
-  useEffect(() => { loadUsage(); }, [loadUsage]);
 
   /** 扫某个工程的引用（会写 project_refs、可能跑几十秒），完成后刷新本条的 usage。 */
   const doScanUsage = (p: ProjectLite) => {
@@ -372,44 +402,10 @@ export function ItemDetail(props: {
     return () => { alive = false; };
   }, [collIds]);
 
-  /**
-   * task-1：详情页不再直接导入。旧 `POST /api/unity/import` 绕过 计划快照 → 风险确认 → 作业验证，
-   * 后端已 409 拒绝；这里把用户交给「头像工作台」的既有链路（按单元勾选 → 风险 → confirm → execute）。
-   * 保留上面的包列表/勾选，只用于"这次要装哪几个包"的对照，不再产生外部副作用。
-   */
-  const openPlanImport = () => {
-    const picked = unityPkgs.filter((p) => unityPicked.has(p.key));
-    // 详情页的包（assetId + entryPath/innerEntryPath）与工作台单元（assetId + rel_path）能精确对上；
-    // 工作台只做"精确映射才预选"，对不上会在那边显式提示，不会自动生成/执行计划。
-    const units = picked.map((p) => ({ assetId: p.assetId, relPath: unityPackageRelPath(p) }));
-    const focus: WorkbenchFocus = {
-      itemId,
-      title: detail?.item?.title ?? ("条目 #" + itemId),
-      assetIds: [...new Set(units.map((u) => u.assetId))],
-      units,
-    };
-    if (units.length) {
-      setUnityPickNote("已把 " + units.length + " 个包带入工作台清单（按 assetId + relPath 对应单元）；"
-        + "在工作台核对清单 → 生成计划 → 看风险 → 确认 → 执行。");
-    }
-    props.onToast("info", units.length
-      ? "已打开「头像工作台」并带入 " + units.length + " 个包：核对清单 → 生成计划 → 确认 → 执行"
-      : "已打开「头像工作台」：请按单元勾选 → 生成计划 → 确认 → 执行");
-    if (props.onOpenWorkbench) props.onOpenWorkbench(focus);
-    else setUnityNote("请从顶部「头像工作台」按计划导入：按单元勾选 → 看风险 → 确认 → 执行。");
-  };
-
-  /** 没有可用商品链接时：把「关联 BOOTH 商品」输入框滚进视野并聚焦。 */
-  const focusBoothPanel = () => {
-    const el = boothInputRef.current;
-    if (!el) { props.onToast("info", "该条目没有 BOOTH 商品链接，请先在下方粘贴商品链接"); return; }
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.focus();
-  };
-
-  if (loading) return <div className="backdrop"><div className="drawer"><div className="empty"><Spinner /> 载入条目 #{itemId}…</div></div></div>;
-  if (err || !detail) return (
-    <div className="backdrop" onClick={props.onClose}>
+  const backdropProps = { className: "backdrop item-detail-backdrop", hidden: props.hidden };
+  if (loading) return <div {...backdropProps}><div className="drawer"><div className="empty"><Spinner /> 载入条目 #{itemId}…</div></div></div>;
+  if (!detail) return (
+    <div {...backdropProps} onClick={props.onClose}>
       <div className="drawer" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-head"><h3>条目 #{itemId}</h3><button className="btn" onClick={props.onClose}>关闭</button></div>
         <div className="pane-body"><div className="err">{err || "无数据"}</div></div>
@@ -422,408 +418,475 @@ export function ItemDetail(props: {
   const boothUrlFromItem = it.source_site === "booth" && it.source_url ? it.source_url : "";
   const tags = localTags ?? detail.tags ?? [];
   const imported = props.importedIds.includes(itemId);
+  const cover = images.find((image) => image.id === detail.coverImageId) ?? images[0];
+  const coverUrl = detail.coverUrl ?? (cover ? cover.thumbUrl ?? mediaUrl(cover.id, 240) : null);
+  const category = [detail.category?.categoryName, detail.category?.subCategoryName].filter(Boolean).join(" › ");
+  const sourceName = [SITE_LABEL[it.source_site], it.source_item_id].filter(Boolean).join(" ");
+  const notes = notesDraft ?? detail.notes ?? "";
+  const visibleFiles = 4;
+  const availableFiles = detail.assets.filter((asset) => asset.status === "present");
+  const missingFiles = detail.assets.filter((asset) => asset.status === "missing");
+  const unavailable = fileScan?.files.filter((file) => file.state === "unavailable") ?? [];
 
   return (
-    <div className="backdrop" onClick={props.onClose}>
+    <div {...backdropProps} onClick={props.onClose}>
       <div className="drawer" onClick={(e) => e.stopPropagation()}>
-        <div className="drawer-head">
+        <div className="drawer-head item-detail-head">
           <h3 title={detail.title}>{detail.title}</h3>
           <Badge tone={detail.status === "inbox" ? "warn" : "muted"}>{STATUS_LABEL[detail.status]}</Badge>
-          <Badge>{SITE_LABEL[detail.sourceSite]}</Badge>
           {imported && <Badge tone="ok">已导入</Badge>}
           {busy && <Spinner />}
-          <button className="btn tiny" onClick={() => guard(checkUpdate(itemId), "已起 check_update 作业")}>检查更新</button>
-          <button className="btn tiny" onClick={() => guard(matchAvatars(itemId), "已起 match_avatars 作业")}>重跑头像匹配</button>
-          {detail.status === "trashed"
-            ? <button className="btn tiny" title="只恢复条目状态；合并时已迁到别处的压缩包/图片/标签/模型不会自动迁回" onClick={() => guard(restoreItem(itemId), "已从回收站恢复（资源不自动迁回）")}>恢复</button>
-            : <button className="btn tiny danger" onClick={() => guard(deleteItem(itemId), "已软删（status=trashed）")}>删除</button>}
           <button className="btn" onClick={props.onClose}>关闭</button>
         </div>
-        <div className="drawer-body">
-          <div className="left">
-            {(detail.sourceSite === "local" || !it.source_url) && (
-              <Section title="关联 BOOTH 商品（补全标题/店铺/价格/标签 + 抓图集）">
-                <div className="row">
-                  <input
-                    ref={boothInputRef}
-                    type="url"
-                    placeholder="https://booth.pm/zh-cn/items/6747912"
-                    value={boothUrl}
-                    onChange={(e) => setBoothUrl(e.target.value)}
-                    style={{ flex: 1 }}
-                  />
-                  <button
-                    className="btn tiny"
-                    disabled={!boothUrl.trim() || boothBusy}
-                    onClick={async () => {
-                      setBoothBusy(true); setBoothHint("");
-                      try {
-                        const p: any = await boothPeek(boothUrl.trim());
-                        setBoothHint("预览：" + String(p.title ?? "").slice(0, 40) + " · " + (p.images?.length ?? 0) + " 张图 · " + ((p.files?.length ?? 0)) + " 个文件");
-                      } catch (e) { setBoothHint("预览失败：" + describeError(e)); }
-                      finally { setBoothBusy(false); }
-                    }}
-                  >预览</button>
-                  <button
-                    className="btn"
-                    disabled={!boothUrl.trim() || boothBusy}
-                    onClick={() => runBoothLink(boothUrl, (r) => {
-                      const s = r?.imageStats;
-                      if (!s) return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "，抓取 " + (r?.images ?? 0) + " 张图";
-                      return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "：下载成功 " + s.downloaded + " / 新增 " + s.added + " / 复用 " + s.reused + " / 内容重复 " + s.duplicates + " / 失败 " + s.failed;
-                    })}
-                  >抓取</button>
-                  {boothBusy && <Spinner />}
-                </div>
-                <div className="hint">扫库建出来的本地条目没有商品号；粘一次商品链接就会把元数据与图集补全（原压缩包保持不变）。</div>
-                {boothHint && <div className="notice" style={{ marginTop: "6px" }}>{boothHint}</div>}
-              </Section>
-            )}
-            <Section title="套装 / 合并（同一商品的模型包 + 材质包）">
-              <div className="row wrap" style={{ gap: "6px", alignItems: "center" }}>
-                {(detail.collections ?? []).length === 0 && <span className="hint">未归入任何套装</span>}
-                {(detail.collections ?? []).map((c) => (
-                  <span key={c.id} className="row" style={{ gap: "2px", alignItems: "center" }}>
-                    <Badge tone="violet">{c.name}</Badge>
-                    <button className="btn tiny" title="把本条移出这个套装" onClick={() => guard(removeFromCollection(c.id, itemId), "已移出套装")}>×</button>
-                    <button className="btn tiny danger" title="删除整个套装（只删分组，不动条目本身）" onClick={() => { if (window.confirm("删除套装「" + c.name + "」？\n只删这个分组，条目本身不受影响。")) guard(deleteCollection(c.id), "已删除套装「" + c.name + "」"); }}>🗑</button>
-                  </span>
-                ))}
+        <div className="item-detail-body">
+          {err && <div className="err" role="status">刷新失败：{err}</div>}
+          <div className="item-detail-overview">
+            <div className="item-detail-cover">
+              {coverUrl ? <img src={coverUrl} alt="素材封面" /> : <span>暂无封面</span>}
+            </div>
+            <dl className="item-detail-facts">
+              <div>
+                <dt>来源</dt>
+                <dd>
+                  {it.source_url ? <a href={it.source_url} target="_blank" rel="noreferrer">{sourceName}</a> : sourceName}
+                  {it.shop_name && <> · {it.shop_name}</>}
+                </dd>
               </div>
-              {/* 疑似同商品：**手动触发**。自动列出太容易误报（标签命中），所以默认严格、按需查。
-                  同商品 ≠ 重复内容：这里只提示，归组（加入套装）或并入由用户点按钮决定。 */}
-              <div className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "4px" }}>
-                <button
-                  className="btn tiny"
-                  disabled={relatedBusy}
-                  title="按标题 / 包内文件名里的产品名找「同一商品的不同打包」（模型包 + 材质包 / DLC）"
-                  onClick={() => findRelated(relatedLoose)}
-                >{relatedBusy ? "查找中…" : related === null ? "🔍 查找同商品" : "🔍 重新查找"}</button>
-                <label className="row" style={{ gap: "4px", alignItems: "center", cursor: "pointer" }} title="连「只在标签里出现过」的也一起列出来——这类很容易误报（卖家常把支持的全部 base 打上标签）">
-                  <input
-                    type="checkbox"
-                    checked={relatedLoose}
-                    onChange={(e) => { const v = e.target.checked; setRelatedLoose(v); if (related !== null) findRelated(v); }}
-                  />
-                  <span className="hint">更宽松（含标签命中，易误报）</span>
-                </label>
-                {related !== null && !relatedBusy && (
-                  <span className="hint">{related.length ? "找到 " + related.length + " 条" : "严格模式下没找到；可勾「更宽松」再试"}</span>
-                )}
+              <div><dt>分类</dt><dd>{category || "未分类"}</dd></div>
+              <div>
+                <dt>适配模型</dt>
+                <dd>
+                  {detail.avatars.length ? detail.avatars.slice(0, 3).map((avatar) => avatar.name).join("、") : "未标注"}
+                  {detail.avatars.length > 3 && <span className="hint"> · 另有 {detail.avatars.length - 3} 个</span>}
+                </dd>
               </div>
-              {related !== null && related.length > 0 && (
-                <div style={{ marginTop: "4px" }}>
-                  {related.map((m) => (
-                    <div key={m.itemId} className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "2px" }}>
-                      {m.score < 0.75 && <span className="badge warn" title={"相似度 " + (m.score * 100).toFixed(0) + "%"}>弱</span>}
-                      <span className="hint">疑似同商品（模型包 / 材质包）：《#{m.itemId} {m.title}》 共有「{m.shared[0] ?? m.reason}」</span>
-                      <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 与本条归入同一个套装（保留各自条目）"} onClick={() => doRelateCollect(m)}>加入套装</button>
-                      <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 并进本条（对方进回收站，可恢复）"} onClick={() => doRelateMerge(m)}>并入本条</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {/* 套装只是归组：成员仍是各自独立的条目。这里直接把同套装的其它条目并进来（可恢复）。 */}
-              {(detail.collections ?? []).map((c) => {
-                const others = (collMembers[c.id] ?? []).filter((m) => m.id !== itemId && m.status !== "trashed");
-                if (!others.length) return null;
-                return (
-                  <div key={"m" + c.id} className="row wrap" style={{ gap: "4px", alignItems: "center", marginTop: "4px" }}>
-                    <span className="hint">{c.name} 里还有：</span>
-                    {others.map((m) => (
-                      <button
-                        key={m.id}
-                        className="btn tiny"
-                        disabled={busy}
-                        title={"把 #" + m.id + "「" + m.title + "」合并到本条（它的压缩包/标签/模型并过来；图片保留在原条目，它进回收站、可恢复）"}
-                        onClick={() => setMergePreview({ sourceId: m.id, targetId: itemId })}
-                      >#{m.id} {m.title.slice(0, 20)} ⤵并入</button>
-                    ))}
-                  </div>
-                );
-              })}
-              <div className="row" style={{ marginTop: "6px" }}>
-                <input placeholder="套装名（如 Danzai Bunny）" value={collName} onChange={(e) => setCollName(e.target.value)} style={{ flex: 1 }} />
-                <button className="btn tiny" disabled={!collName.trim() || busy} onClick={() => guard(createCollection(collName.trim(), [itemId]), "已加入套装「" + collName.trim() + "」")}>加入套装</button>
-              </div>
-              <div className="hint">套装 = 保留各自条目、只做归组（适合"模型包 + 材质包"分别售卖的情况）。</div>
-              <div className="hr" />
-              <label className="hint">
-                合并到另一条目（方向：<b>本条 → 目标</b>，单向；搜索只查其他条目、不含本条。合并后本条进回收站——
-                「恢复」只恢复条目状态，已并过去的压缩包/标签/模型不会自动迁回；图片保留在原条目）
-              </label>
-              <div className="row">
-                <input placeholder="搜索目标条目标题…" value={mergeQ} onChange={(e) => { setMergeQ(e.target.value); const q = e.target.value.trim(); if (q.length >= 2) listItems({ q, limit: 6 }).then((r) => setMergeHits(r.items.filter((x) => x.id !== itemId).map((x) => ({ id: x.id, title: x.title })))).catch(() => setMergeHits([])); else setMergeHits([]); }} style={{ flex: 1 }} />
-              </div>
-              {mergeQ.trim().length >= 2 && mergeHits.length === 0 && (
-                <div className="hint">没有匹配的条目（搜索只含其他条目，不含本条；本页没有反向搜索）</div>
-              )}
-              {mergeHits.length > 0 && (
-                <div className="row wrap" style={{ gap: "4px", marginTop: "4px" }}>
-                  {mergeHits.map((h) => (
-                    <button key={h.id} className="btn tiny" onClick={() => setMergePreview({ sourceId: itemId, targetId: h.id })}>#{h.id} {h.title.slice(0, 24)}</button>
-                  ))}
-                </div>
-              )}
-            </Section>
-            <Section
-              title={<>缩略图 {images.length} · {detail.imageCount} 张</>}
-              right={<span className="hint">{order ? "本地顺序" : "服务端顺序"}</span>}
-            >
-              <div className="img-grid">
-                {images.map((im, i) => (
-                  <div className={"img-cell" + (detail.coverImageId === im.id ? " cover" : "")} key={im.id}>
-                    <img src={im.thumbUrl ?? mediaUrl(im.id, 240)} alt={im.role} loading="lazy" />
-                    <div className="tags">
-                      {detail.coverImageId === im.id && <Badge tone="ok">封面</Badge>}
-                      <Badge tone="muted">{im.role}</Badge>
-                    </div>
-                    <div className="ops">
-                      <button className="btn tiny" disabled={i === 0} onClick={() => moveImage(im.id, -1)} title="本地前移">↑</button>
-                      <button className="btn tiny" disabled={i === images.length - 1} onClick={() => moveImage(im.id, 1)} title="本地后移">↓</button>
-                      <button className="btn tiny" onClick={() => guard(setCover(itemId, im.id), "已设为封面")}>封面</button>
-                      <button className="btn tiny danger" onClick={() => guard(deleteImage(itemId, im.id), "已删除图片")}>删</button>
-                    </div>
-                  </div>
-                ))}
-                {!images.length && <div className="hint">暂无图片</div>}
-              </div>
-              <div className="hr" />
-              <label className="hint">加图片 URL（新导入的第一张会设为封面）</label>
-              <div className="row">
-                <input type="url" placeholder="https://booth.pximg.net/…" value={imgUrl} onChange={(e) => setImgUrl(e.target.value)} />
-                <button className="btn" disabled={!imgUrl.trim()} onClick={() => { guard(addImages(itemId, { url: imgUrl.trim(), origin: "user", role: "user" }), "已添加 URL 图片"); setImgUrl(""); }}>加图</button>
-              </div>
-              <label className="hint" style={{ display: "block", marginTop: "6px" }}>加本地图片路径（每行一个）</label>
-              <textarea rows={2} placeholder="%LIBRARY%/素材库/1/extra.png" value={imgPaths} onChange={(e) => setImgPaths(e.target.value)} />
-              <div className="row">
-                <span className="spacer" />
-                <button className="btn" disabled={!imgPaths.trim()} onClick={() => { guard(addImages(itemId, { paths: imgPaths.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean), origin: "user", role: "user" }), "已添加本地图片"); setImgPaths(""); }}>添加</button>
-              </div>
-              <div className="hint" style={{ marginTop: "4px" }}>↑↓ 调 POST /items/:id/images/reorder 落库；失败才退回本机顺序。</div>
-            </Section>
-
-            <Section title="备注" right={<button className="btn tiny" disabled={notesSaving} onClick={saveNotes}>保存</button>}>
-              <textarea rows={4} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="PATCH /items/:id { notes }" />
-              <div className="hint">{(detail.item.notes ?? "").length > 0 ? "已存长度 " + (detail.item.notes ?? "").length : "尚未填写"}</div>
-            </Section>
-
-            <Section title="标签">
-              <div className="row wrap">
-                {tags.map((t) => (
-                  <span className="tag-chip" key={t}>{t}<button onClick={() => applyTags(tags.filter((x) => x !== t), "remove")} title="移除（PATCH 全量替换）">×</button></span>
-                ))}
-                {!tags.length && <span className="hint">无标签</span>}
-              </div>
-              <div className="row" style={{ marginTop: "6px" }}>
-                <input type="text" placeholder="新增标签名" value={newTag} onChange={(e) => setNewTag(e.target.value)} />
-                <button className="btn" disabled={!newTag.trim()} onClick={() => { applyTags([...tags, newTag.trim()], "add"); setNewTag(""); }}>加标签</button>
-              </div>
-              {localTagNote && <div className="notice" style={{ marginTop: "6px" }}>该后端未接受标签改动（POST /items/:id/tags 与 PATCH tags 均失败），改动仅本机生效。</div>}
-            </Section>
-
-            {/* 物品分类编辑区（docs/categories.md §7）。注意：下面「元数据」里的「分类」是 BOOTH 来源分类，两者不是一回事。 */}
-            <CategoryEditor detail={detail} onToast={props.onToast} onBusy={setBusy} onSaved={() => { load(); props.onChanged(); }} />
-
-            <Section title="元数据">
-              <table className="kv">
-                <tbody>
-                  <tr><td className="k">id / uid</td><td className="mono">{it.id} · {it.uid}</td></tr>
-                  <tr>
-                    <td className="k">来源</td>
-                    <td>
-                      {it.source_url
-                        ? <a href={it.source_url} target="_blank" rel="noreferrer" title={"在浏览器打开来源页：" + it.source_url}>{SITE_LABEL[it.source_site]} {it.source_item_id ?? ""}</a>
-                        : <span>{SITE_LABEL[it.source_site]}{it.source_item_id ? " " + it.source_item_id : ""}</span>}
-                      {" "}
-                      <button
-                        className="btn tiny"
-                        disabled={boothBusy}
-                        title="关联 BOOTH 商品（补全标题/店铺/价格/标签 + 抓图集）"
-                        onClick={() => (boothUrlFromItem
-                          ? runBoothLink(boothUrlFromItem, (res) => "已补全 BOOTH " + (res?.meta?.itemId ?? "") + " 元数据/标签，新增 " + (res?.images ?? 0) + " 张图")
-                          : focusBoothPanel())}
-                      >{boothUrlFromItem ? "补全 BOOTH" : "关联 BOOTH 商品"}</button>
-                    </td>
-                  </tr>
-                  <tr><td className="k">店铺/作者</td><td>{it.shop_name ?? "—"} / {it.author ?? "—"}</td></tr>
-                  <tr><td className="k">分类</td><td>{it.category_parent ? it.category_parent + " › " : ""}{it.category_name ?? "—"}</td></tr>
-                  <tr><td className="k">价格</td><td>{formatYen(it.price_yen, it.price_text)} {it.purchased ? "· 已购入" : ""}</td></tr>
-                  <tr><td className="k">声明适配</td><td>{it.compat_declared_count ?? "—"} 体</td></tr>
-                  <tr><td className="k">识别</td><td>{it.id_match_method ?? "—"} · conf {it.id_confidence ?? "—"}</td></tr>
-                  <tr><td className="k">发布时间</td><td>{formatDate(it.published_at)}</td></tr>
-                  <tr><td className="k">更新时间</td><td>{formatDate(it.updated_at)}</td></tr>
-                  <tr><td className="k">体积</td><td>{formatBytes(detail.totalBytes)}</td></tr>
-                </tbody>
-              </table>
-            </Section>
-
-            <Section
-              title="导入到 Unity 工程"
-              right={<button className="btn tiny" disabled={unityBusy} onClick={() => void loadUnity(true)}>{unityBusy ? "检测中…" : "重新检测"}</button>}
-            >
-              {unity?.ok && unity.editor ? (
-                <>
-                  <div className="row wrap" style={{ alignItems: "center", gap: "6px" }}>
-                    <Badge tone="ok">已连接</Badge>
-                    <span className="hint">{unity.editor.projectName} · Unity {unity.editor.unityVersion}{unity.editor.isPlaying ? " · 播放中" : ""}{unity.editor.isCompiling ? " · 编译中" : ""}</span>
-                  </div>
-                  <div className="hint mono" style={{ wordBreak: "break-all", fontSize: "10px" }}>{unity.editor.projectPath} ← {unity.endpoint}</div>
-                  {!unityPkgs.length && (
-                    <div className="hint" style={{ marginTop: "6px" }}>
-                      这个条目里没找到 .unitypackage{detail.assets.length ? "（压缩包还没索引的话，先在下面「资产」里重建索引）" : "（这个条目还没有资产）"}。
-                    </div>
-                  )}
-                  {unityPkgs.length > 0 && (
-                    <>
-                      <div className="hint" style={{ marginTop: "6px" }}>
-                        找到 {unityPkgs.length} 个包{unityPkgs.some((p) => p.matched) ? "（★ 是当前工程那个 avatar 的）" : ""}。
-                        勾选只用于「带入工作台清单」（按 assetId + relPath 对应单元）；导入仍走「头像工作台」的计划 → 风险确认 → 作业。
-                      </div>
-                      <div className="unity-pkgs">
-                        {unityPkgs.map((p) => (
-                          <label className={"unity-pkg" + (p.matched ? " on" : "")} key={p.key} title={(p.entryPath ? p.sourcePath + " › " + p.entryPath : p.sourcePath) + (p.avatar ? " ｜ avatar: " + p.avatar.name + "（命中 " + p.avatar.via + "）" : " ｜ 没认出 avatar")}>
-                            <input
-                              type="checkbox"
-                              checked={unityPicked.has(p.key)}
-                              onChange={(e) => setUnityPicked((prev) => { const n = new Set(prev); if (e.target.checked) n.add(p.key); else n.delete(p.key); return n; })}
-                            />
-                            <span className={"unity-pkg-avatar" + (p.matched ? " on" : "")}>{p.avatar ? "@" + p.avatar.name : "@?"}</span>
-                            <span className="unity-pkg-name">{p.label}</span>
-                            <span className="hint">{formatBytes(p.size)}</span>
-                          </label>
-                        ))}
-                      </div>
-                      <div className="row wrap" style={{ marginTop: "6px", gap: "6px" }}>
-                        <button className="btn" onClick={openPlanImport} title="打开头像工作台并带入上面勾选的包：按单元核对 → 生成计划 → 看风险 → 确认 → 执行（有作业与验证，可追溯）">
-                          到头像工作台导入（{unityPicked.size ? "带入 " + unityPicked.size + " 个包" : "未勾选，打开后按单元选"}）
-                        </button>
-                        {unity.projectAvatar && unityPkgs.some((p) => p.matched) && (
-                          <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.filter((p) => p.matched).map((p) => p.key)))}>只选 @{unity.projectAvatar.name}</button>
-                        )}
-                        <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set(unityPkgs.map((p) => p.key)))}>全选</button>
-                        <button className="btn tiny" disabled={unityBusy} onClick={() => setUnityPicked(new Set())}>全不选</button>
-                      </div>
-                      {unityPickNote && <div className="hint" style={{ marginTop: "4px" }}>{unityPickNote}</div>}
-                    </>
-                  )}
-                </>
-              ) : (
-                <div className="hint">
-                  没连上 Unity（{unity?.error ?? "检测中…"}）。在 Unity 里装好并打开 MCP for Unity，然后点右上「重新检测」。
-                  {unity?.candidates?.length ? <> 本机探测：<span className="mono">{unity.candidates.join(" / ")}</span></> : null}
-                </div>
-              )}
-              {/* P3-7：排障场景（没连上）也要能看到被丢弃的非法/非回环端点 */}
-              {!!unity?.dropped && (
-                <div className="notice" style={{ marginTop: "6px" }}>
-                  已忽略 {unity.dropped} 个非回环或非法的 Unity MCP 地址（本工具只驱动本机 Unity；确需远程请到「设置」里显式打开「允许非回环端点」）。
-                </div>
-              )}
-              {unityNote && <div className="notice" style={{ marginTop: "6px" }}>{unityNote}</div>}
-              <div className="hr" />
-              <div className="row wrap">
-                {props.projects.map((p) => {
-                  const u = usage ? usage.find((x) => x.projectId === p.id) ?? null : null;
-                  return (
-                    <span key={p.id} className="row" style={{ gap: "4px", alignItems: "center" }}>
-                      <button className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>仅登记：已导入 → {p.name}</button>
-                      {u && u.files > 0 ? (
-                        <button
-                          className="btn tiny"
-                          onClick={() => setUsageOpen(usageOpen === p.id ? null : p.id)}
-                          title={"工程里真的在用（GUID 求交命中 " + u.files + " 个文件）：" + u.paths.slice(0, 10).join(" / ")}
-                        >项目里真的在用：{u.name || p.name}（{u.files} 个文件）</button>
-                      ) : usage ? (
-                        <span className="hint">未扫描</span>
-                      ) : null}
-                      <button className="btn tiny" disabled={usageBusy !== 0} onClick={() => doScanUsage(p)}>
-                        {usageBusy === p.id ? "扫描中…（最多 45s）" : "扫描工程引用"}
-                      </button>
-                    </span>
-                  );
-                })}
-                {!props.projects.length && <span className="hint">无已登记工程</span>}
-              </div>
-              {usageOpen !== null && (() => {
-                const u = usage ? usage.find((x) => x.projectId === usageOpen) : null;
-                if (!u || !u.paths.length) return null;
-                return (
-                  <div className="hint mono" style={{ marginTop: "4px", wordBreak: "break-all", fontSize: "10px" }}>
-                    {u.name || "#" + u.projectId} 实际引用（前 {Math.min(5, u.paths.length)}/{u.files}）：{u.paths.slice(0, 5).join(" ｜ ")}
-                  </div>
-                );
-              })()}
-              <div className="hint" style={{ marginTop: "4px" }}>上面是"真的导进 Unity"；下面这排只写本地登记（POST /projects/:id/imports），不动 Unity；「项目里真的在用」是拿工程 Assets/ 下 .meta 的 GUID 与素材包 GUID 求交（POST /projects/:id/scan-usage）。</div>
-            </Section>
+            </dl>
           </div>
 
-          <div className="right">
-            <Section
-              title={<>适配模型 {detail.avatars.length}</>}
-              right={weakAvatars.length > 0 ? (
-                <button
-                  className="btn tiny"
-                  disabled={busy}
-                  title={"移除只在商品页标题/标签/描述里出现过的适配模型：" + weakAvatars.map((a) => "@" + a.name).join("、") + "\n注意：若是「全アバター対応 / N アバター対応」的工具类素材，这些标签本身是有意义的，别删。"}
-                  onClick={doPruneAvatars}
-                >按包内证据校正（去 {weakAvatars.length} 个）</button>
-              ) : undefined}
-            >
-              <div className="row wrap" style={{ marginBottom: "6px" }}>
-                {detail.avatars.map((a) => (
-                  <span className="tag-chip" key={a.id} title={a.evidence ?? "无证据字段"}>
-                    @{a.name} · {MATCH_LABEL[a.match]}{a.confidence !== undefined && a.confidence !== null ? " · " + a.confidence.toFixed(2) : ""}
-                    <button onClick={() => guard(removeItemAvatar(itemId, a.id), "已移除适配模型 @" + a.name)} title="移除">×</button>
-                  </span>
-                ))}
-                {!detail.avatars.length && <span className="hint">未标注适配模型</span>}
-              </div>
-              {/* 模型多的时候这一列会很长：默认收起，只占一行。 */}
-              <Collapsible label="适配模型证据（点开看每个模型的证据来源）" count={detail.avatars.length} defaultOpen={detail.avatars.length <= 3}>
-                <div className="asset-list">
-                  {detail.avatars.map((a) => (
-                    <EvidenceLine key={"ev" + a.id} name={a.name} source={a.source} evidence={a.evidence} confidence={a.confidence} />
-                  ))}
-                  {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
-                </div>
-              </Collapsible>
-              {weakAvatars.length > 0 && (
-                <div className="notice" style={{ marginTop: "6px" }}>
-                  {weakAvatars.length} 个适配模型（{weakAvatars.map((a) => "@" + a.name).join("、")}）只有商品页证据 —— 标题/标签/描述里有，
-                  但压缩包和包内路径里没有任何对应文件。多 avatar 商品里你只下了某一个变体时，这就是假适配，可点右上「按包内证据校正」删掉；
-                  <b>但「全アバター対応 / N アバター対応」的工具类素材（插件、姿势、着色器）本来就该匹配一大堆</b>，那种别删。
+          <Section title={"本地文件 " + availableFiles.length} right={detail.assets.length > 0 && detail.status !== "trashed" ? (
+            <>
+              <span className="hint">{formatBytes(availableFiles.reduce((total, file) => total + file.size, 0))}</span>
+              <button className="btn tiny" disabled={fileScanBusy} onClick={() => void scanFiles()}>
+                {fileScanBusy ? "扫描中…" : "扫描本条"}
+              </button>
+            </>
+          ) : undefined}>
+            <div className="item-detail-file-list">
+              {fileScanError && <div className="err" role="alert">扫描失败：{fileScanError}</div>}
+              {fileScan && (
+                <div className="hint" role="status">
+                  已检查 {fileScan.files.length} 个路径 · {fileScan.files.filter((file) => file.state === "missing").length} 个缺失
+                  {unavailable.length > 0 && <> · {unavailable.length} 个无法确认</>}
                 </div>
               )}
-              {/* 加入搭配清单（spec §7.1）：模型由父传入的显式选择，未选只提示、不推断。 */}
-              <div className="row wrap" style={{ marginTop: "7px" }}>
-                <AddToLoadoutButton
-                  itemId={itemId}
-                  avatarId={props.selectedAvatarId ?? null}
-                  onToast={props.onToast}
-                  onAdded={() => props.onChanged()}
-                />
-              </div>
-              <div className="row" style={{ marginTop: "7px" }}>
-                <select value={compatPick} onChange={(e) => setCompatPick(e.target.value ? Number(e.target.value) : "")}>
-                  <option value="">选择头像…</option>
-                  {props.avatars.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-                </select>
-                <select value={compatMatch} onChange={(e) => setCompatMatch(e.target.value as AvatarMatch)} style={{ width: "90px" }}>
-                  <option value="any">any</option>
-                  <option value="all">all</option>
-                  <option value="exclude">exclude</option>
-                </select>
-                <button
-                  className="btn"
-                  disabled={compatPick === ""}
-                  onClick={() => { if (compatPick !== "") guard(addItemAvatars(itemId, [compatPick], compatMatch), "已标注适配模型"); }}
-                >添加</button>
-              </div>
-            </Section>
+              {unavailable.length > 0 && (
+                <DetailDisclosure label="无法确认的路径" meta={unavailable.length}>
+                  {unavailable.map((file) => <div key={file.assetId}><span className="mono">{file.path}</span> · {file.reason}</div>)}
+                </DetailDisclosure>
+              )}
+              {availableFiles.slice(0, visibleFiles).map((asset) => <DetailFile key={asset.id} asset={asset} onToast={props.onToast} />)}
+              {!availableFiles.length && <span className="hint">暂无可用本地文件</span>}
+              {availableFiles.length > visibleFiles && (
+                <DetailDisclosure label={"其余 " + (availableFiles.length - visibleFiles) + " 个文件"}>
+                  <div className="item-detail-file-list">
+                    {availableFiles.slice(visibleFiles).map((asset) => <DetailFile key={asset.id} asset={asset} onToast={props.onToast} />)}
+                  </div>
+                </DetailDisclosure>
+              )}
+              {missingFiles.length > 0 && (
+                <DetailDisclosure label="缺失记录" meta={missingFiles.length}>
+                  {missingFiles.map((asset) => (
+                    <div className="missing-asset-row" key={asset.id}>
+                      <div className="mono missing-asset-path">{asset.path}</div>
+                      {detail.status !== "trashed" && <MissingAssetActions asset={asset} onToast={props.onToast}
+                        onChanged={() => { setFileScan(null); load(); props.onChanged(); }} />}
+                    </div>
+                  ))}
+                </DetailDisclosure>
+              )}
+            </div>
+          </Section>
 
-            {/* 疑似重复：紧邻资产区上方；没有匹配时整块不渲染（不打扰正常素材） */}
-            {dups.length > 0 && (
+          <div className="item-detail-panels">
+            {props.onOpenWorkbench && detail.status !== "trashed" && (
+              <button className="btn primary item-detail-import" onClick={() => props.onOpenWorkbench?.({
+                itemId, title: detail.title, assetIds: [], units: [],
+              })}>导入到 Unity</button>
+            )}
+            <DetailDisclosure label="工程使用记录" onOpen={loadUsage}>
+              <Section title="已登记的工程">
+                <div className="row wrap">
+                  {props.projects.map((p) => {
+                    const u = usage ? usage.find((x) => x.projectId === p.id) ?? null : null;
+                    return (
+                      <span key={p.id} className="row" style={{ gap: "4px", alignItems: "center" }}>
+                        <button className="btn tiny" onClick={() => props.onMarkImported(itemId, p.id)} title={p.path}>仅登记：已导入 → {p.name}</button>
+                        {u && u.files > 0 ? (
+                          <button
+                            className="btn tiny"
+                            onClick={() => setUsageOpen(usageOpen === p.id ? null : p.id)}
+                            title={"工程里真的在用（GUID 求交命中 " + u.files + " 个文件）：" + u.paths.slice(0, 10).join(" / ")}
+                          >项目里真的在用：{u.name || p.name}（{u.files} 个文件）</button>
+                        ) : usage ? (
+                          <span className="hint">未扫描</span>
+                        ) : null}
+                        <button className="btn tiny" disabled={usageBusy !== 0} onClick={() => doScanUsage(p)}>
+                          {usageBusy === p.id ? "扫描中…（最多 45s）" : "扫描工程引用"}
+                        </button>
+                      </span>
+                    );
+                  })}
+                  {!props.projects.length && <span className="hint">无已登记工程</span>}
+                </div>
+                {usageOpen !== null && (() => {
+                  const u = usage ? usage.find((x) => x.projectId === usageOpen) : null;
+                  if (!u || !u.paths.length) return null;
+                  return (
+                    <div className="hint mono" style={{ marginTop: "4px", wordBreak: "break-all", fontSize: "10px" }}>
+                      {u.name || "#" + u.projectId} 实际引用（前 {Math.min(5, u.paths.length)}/{u.files}）：{u.paths.slice(0, 5).join(" ｜ ")}
+                    </div>
+                  );
+                })()}
+                <div className="hint" style={{ marginTop: "4px" }}>已导入登记只更新素材库记录。扫描引用可核对工程实际使用的文件。</div>
+              </Section>
+            </DetailDisclosure>
+            {detail.description && (
+              <DetailDisclosure label="商品说明">
+                <div className="item-detail-description">{detail.description}</div>
+              </DetailDisclosure>
+            )}
+            <DetailDisclosure label="素材管理">
+              <div className="item-detail-manage">
+                <DetailDisclosure label="图片与封面" meta={images.length ? images.length + " 张" : undefined}>
+                  <Section
+                    title="图片与封面"
+                    right={order ? <span className="hint">使用本地排序</span> : undefined}
+                  >
+                    <div className="img-grid">
+                      {images.map((im, i) => (
+                        <div className={"img-cell" + (detail.coverImageId === im.id ? " cover" : "")} key={im.id}>
+                          <img src={im.thumbUrl ?? mediaUrl(im.id, 240)} alt={im.role} loading="lazy" />
+                          <div className="tags">
+                            {detail.coverImageId === im.id && <Badge tone="ok">封面</Badge>}
+                            <Badge tone="muted">{im.role}</Badge>
+                          </div>
+                          <div className="ops">
+                            <button className="btn tiny" disabled={i === 0} onClick={() => moveImage(im.id, -1)} title="本地前移">↑</button>
+                            <button className="btn tiny" disabled={i === images.length - 1} onClick={() => moveImage(im.id, 1)} title="本地后移">↓</button>
+                            <button className="btn tiny" onClick={() => guard(setCover(itemId, im.id), "已设为封面")}>封面</button>
+                            <button className="btn tiny danger" onClick={() => guard(deleteImage(itemId, im.id), "已删除图片")}>删</button>
+                          </div>
+                        </div>
+                      ))}
+                      {!images.length && <div className="hint">暂无图片</div>}
+                    </div>
+                    <div className="hr" />
+                    <label className="hint">加图片 URL（新导入的第一张会设为封面）</label>
+                    <div className="row">
+                      <input type="url" placeholder="https://booth.pximg.net/…" value={imgUrl} onChange={(e) => setImgUrl(e.target.value)} />
+                      <button className="btn" disabled={!imgUrl.trim()} onClick={() => { guard(addImages(itemId, { url: imgUrl.trim(), origin: "user", role: "user" }), "已添加 URL 图片"); setImgUrl(""); }}>加图</button>
+                    </div>
+                    <label className="hint" style={{ display: "block", marginTop: "6px" }}>加本地图片路径（每行一个）</label>
+                    <textarea rows={2} placeholder="%LIBRARY%/素材库/1/extra.png" value={imgPaths} onChange={(e) => setImgPaths(e.target.value)} />
+                    <div className="row">
+                      <span className="spacer" />
+                      <button className="btn" disabled={!imgPaths.trim()} onClick={() => { guard(addImages(itemId, { paths: imgPaths.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean), origin: "user", role: "user" }), "已添加本地图片"); setImgPaths(""); }}>添加</button>
+                    </div>
+                  </Section>
+                </DetailDisclosure>
+                <DetailDisclosure label="适配模型">
+                  <Section
+                    title={<>适配模型 {detail.avatars.length}</>}
+                    right={weakAvatars.length > 0 ? (
+                      <button
+                        className="btn tiny"
+                        disabled={busy}
+                        title={"移除只在商品页标题/标签/描述里出现过的适配模型：" + weakAvatars.map((a) => "@" + a.name).join("、") + "\n注意：若是「全アバター対応 / N アバター対応」的工具类素材，这些标签本身是有意义的，别删。"}
+                        onClick={doPruneAvatars}
+                      >按包内证据校正（去 {weakAvatars.length} 个）</button>
+                    ) : undefined}
+                  >
+                    <div className="row wrap" style={{ marginBottom: "6px" }}>
+                      {detail.avatars.map((a) => (
+                        <span className="tag-chip" key={a.id} title={a.evidence ?? "无证据字段"}>
+                          @{a.name} · {MATCH_LABEL[a.match]}{a.confidence !== undefined && a.confidence !== null ? " · " + a.confidence.toFixed(2) : ""}
+                          <button onClick={() => guard(removeItemAvatar(itemId, a.id), "已移除适配模型 @" + a.name)} title="移除">×</button>
+                        </span>
+                      ))}
+                      {!detail.avatars.length && <span className="hint">未标注适配模型</span>}
+                    </div>
+                    {/* 模型多的时候这一列会很长：默认收起，只占一行。 */}
+                    <Collapsible label="适配证据" count={detail.avatars.length}>
+                      <div className="asset-list">
+                        {detail.avatars.map((a) => (
+                          <EvidenceLine key={"ev" + a.id} name={a.name} source={a.source} evidence={a.evidence} confidence={a.confidence} />
+                        ))}
+                        {!detail.avatars.length && <div className="hint">没有证据行（先跑「重跑头像匹配」）</div>}
+                      </div>
+                    </Collapsible>
+                    {weakAvatars.length > 0 && (
+                      <div className="notice" style={{ marginTop: "6px" }}>
+                        {weakAvatars.length} 个适配模型（{weakAvatars.map((a) => "@" + a.name).join("、")}）只有商品页证据 —— 标题/标签/描述里有，
+                        但压缩包和包内路径里没有任何对应文件。多 avatar 商品里你只下了某一个变体时，这就是假适配，可点右上「按包内证据校正」删掉；
+                        <b>但「全アバター対応 / N アバター対応」的工具类素材（插件、姿势、着色器）本来就该匹配一大堆</b>，那种别删。
+                      </div>
+                    )}
+                    {/* 加入搭配清单（spec §7.1）：模型由父传入的显式选择，未选只提示、不推断。 */}
+                    <div className="row wrap" style={{ marginTop: "7px" }}>
+                      <AddToLoadoutButton
+                        itemId={itemId}
+                        avatarId={props.selectedAvatarId ?? null}
+                        onToast={props.onToast}
+                        onAdded={() => props.onChanged()}
+                      />
+                    </div>
+                    {/* 设为模型本体（SALT 首次确认）：显式入口，点开才展开表单；不自动建档、不猜名称。 */}
+                    <div className="hint" style={{ marginTop: "7px" }}>
+                      设为模型本体时，可先确认模型名称和别名。
+                    </div>
+                    <RegisterAvatarSection
+                      itemId={itemId}
+                      onToast={props.onToast}
+                      onRegistered={() => { load(); props.onChanged(); props.onAvatarRegistered?.(); }}
+                    />
+                    <div className="row" style={{ marginTop: "7px" }}>
+                      <select value={compatPick} onChange={(e) => setCompatPick(e.target.value ? Number(e.target.value) : "")}>
+                        <option value="">选择头像…</option>
+                        {props.avatars.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+                      </select>
+                      <select value={compatMatch} onChange={(e) => setCompatMatch(e.target.value as AvatarMatch)} style={{ width: "90px" }}>
+                        <option value="any">any</option>
+                        <option value="all">all</option>
+                        <option value="exclude">exclude</option>
+                      </select>
+                      <button
+                        className="btn"
+                        disabled={compatPick === ""}
+                        onClick={() => { if (compatPick !== "") guard(addItemAvatars(itemId, [compatPick], compatMatch), "已标注适配模型"); }}
+                      >添加</button>
+                    </div>
+                  </Section>
+                </DetailDisclosure>
+                <DetailDisclosure label="分类与标签">
+                  <Section title="标签">
+                    <div className="row wrap">
+                      {tags.map((t) => (
+                        <span className="tag-chip" key={t}>{t}<button onClick={() => applyTags(tags.filter((x) => x !== t), "remove")} title="移除标签">×</button></span>
+                      ))}
+                      {!tags.length && <span className="hint">无标签</span>}
+                    </div>
+                    <div className="row" style={{ marginTop: "6px" }}>
+                      <input type="text" placeholder="新增标签名" value={newTag} onChange={(e) => setNewTag(e.target.value)} />
+                      <button className="btn" disabled={!newTag.trim()} onClick={() => { applyTags([...tags, newTag.trim()], "add"); setNewTag(""); }}>加标签</button>
+                    </div>
+                    {localTagNote && <div className="notice" style={{ marginTop: "6px" }}>该后端未接受标签改动（POST /items/:id/tags 与 PATCH tags 均失败），改动仅本机生效。</div>}
+                  </Section>
+
+                  {/* 物品分类编辑区（docs/categories.md §7）。注意：下面「元数据」里的「分类」是 BOOTH 来源分类，两者不是一回事。 */}
+                  <CategoryEditor detail={detail} onToast={props.onToast} onBusy={setBusy} onSaved={() => { load(); props.onChanged(); }} />
+                </DetailDisclosure>
+                <DetailDisclosure label="备注">
+                  <Section title="备注" right={<button className="btn tiny" disabled={notesSaving} onClick={saveNotes}>保存</button>}>
+                    <textarea rows={4} value={notes} onChange={(e) => setNotesDraft(e.target.value)} placeholder="填写备注…" aria-label="备注" />
+                  </Section>
+                </DetailDisclosure>
+                <DetailDisclosure label="套装与合并">
+                  <Section title="套装与合并">
+                    <div className="row wrap" style={{ gap: "6px", alignItems: "center" }}>
+                      {(detail.collections ?? []).length === 0 && <span className="hint">未归入任何套装</span>}
+                      {(detail.collections ?? []).map((c) => (
+                        <span key={c.id} className="row" style={{ gap: "2px", alignItems: "center" }}>
+                          <Badge tone="violet">{c.name}</Badge>
+                          <button className="btn tiny" title="把本条移出这个套装" onClick={() => guard(removeFromCollection(c.id, itemId), "已移出套装")}>×</button>
+                          <button className="btn tiny danger" title="删除整个套装（只删分组，不动条目本身）" onClick={() => { if (window.confirm("删除套装「" + c.name + "」？\n只删这个分组，条目本身不受影响。")) guard(deleteCollection(c.id), "已删除套装「" + c.name + "」"); }}>🗑</button>
+                        </span>
+                      ))}
+                    </div>
+                    {/* 疑似同商品：**手动触发**。自动列出太容易误报（标签命中），所以默认严格、按需查。
+                        同商品 ≠ 重复内容：这里只提示，归组（加入套装）或并入由用户点按钮决定。 */}
+                    <div className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "4px" }}>
+                      <button
+                        className="btn tiny"
+                        disabled={relatedBusy}
+                        title="按标题 / 包内文件名里的产品名找「同一商品的不同打包」（模型包 + 材质包 / DLC）"
+                        onClick={() => findRelated(relatedLoose)}
+                      >{relatedBusy ? "查找中…" : related === null ? "🔍 查找同商品" : "🔍 重新查找"}</button>
+                      <label className="row" style={{ gap: "4px", alignItems: "center", cursor: "pointer" }} title="连「只在标签里出现过」的也一起列出来——这类很容易误报（卖家常把支持的全部 base 打上标签）">
+                        <input
+                          type="checkbox"
+                          checked={relatedLoose}
+                          onChange={(e) => { const v = e.target.checked; setRelatedLoose(v); if (related !== null) findRelated(v); }}
+                        />
+                        <span className="hint">更宽松（含标签命中，易误报）</span>
+                      </label>
+                      {related !== null && !relatedBusy && (
+                        <span className="hint">{related.length ? "找到 " + related.length + " 条" : "严格模式下没找到；可勾「更宽松」再试"}</span>
+                      )}
+                    </div>
+                    {related !== null && related.length > 0 && (
+                      <div style={{ marginTop: "4px" }}>
+                        {related.map((m) => (
+                          <div key={m.itemId} className="row wrap" style={{ gap: "6px", alignItems: "center", marginTop: "2px" }}>
+                            {m.score < 0.75 && <span className="badge warn" title={"相似度 " + (m.score * 100).toFixed(0) + "%"}>弱</span>}
+                            <span className="hint">疑似同商品（模型包 / 材质包）：《#{m.itemId} {m.title}》 共有「{m.shared[0] ?? m.reason}」</span>
+                            <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 与本条归入同一个套装（保留各自条目）"} onClick={() => doRelateCollect(m)}>加入套装</button>
+                            <button className="btn tiny" disabled={busy} title={"把 #" + m.itemId + " 并进本条（对方进回收站，可恢复）"} onClick={() => doRelateMerge(m)}>并入本条</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {/* 套装只是归组：成员仍是各自独立的条目。这里直接把同套装的其它条目并进来（可恢复）。 */}
+                    {(detail.collections ?? []).map((c) => {
+                      const others = (collMembers[c.id] ?? []).filter((m) => m.id !== itemId && m.status !== "trashed");
+                      if (!others.length) return null;
+                      return (
+                        <div key={"m" + c.id} className="row wrap" style={{ gap: "4px", alignItems: "center", marginTop: "4px" }}>
+                          <span className="hint">{c.name} 里还有：</span>
+                          {others.map((m) => (
+                            <button
+                              key={m.id}
+                              className="btn tiny"
+                              disabled={busy}
+                              title={"把 #" + m.id + "「" + m.title + "」合并到本条（它的压缩包/标签/模型并过来；图片保留在原条目，它进回收站、可恢复）"}
+                              onClick={() => setMergePreview({ sourceId: m.id, targetId: itemId })}
+                            >#{m.id} {m.title.slice(0, 20)} ⤵并入</button>
+                          ))}
+                        </div>
+                      );
+                    })}
+                    <div className="row" style={{ marginTop: "6px" }}>
+                      <input placeholder="套装名（如 Danzai Bunny）" value={collName} onChange={(e) => setCollName(e.target.value)} style={{ flex: 1 }} />
+                      <button className="btn tiny" disabled={!collName.trim() || busy} onClick={() => guard(createCollection(collName.trim(), [itemId]), "已加入套装「" + collName.trim() + "」")}>加入套装</button>
+                    </div>
+                    <div className="hint">套装 = 保留各自条目、只做归组（适合"模型包 + 材质包"分别售卖的情况）。</div>
+                    <div className="hr" />
+                    <label className="hint">
+                      合并到另一条目（方向：<b>本条 → 目标</b>，单向；搜索只查其他条目、不含本条。合并后本条进回收站——
+                      「恢复」只恢复条目状态，已并过去的压缩包/标签/模型不会自动迁回；图片保留在原条目）
+                    </label>
+                    <div className="row">
+                      <input placeholder="搜索目标条目标题…" value={mergeQ} onChange={(e) => { setMergeQ(e.target.value); const q = e.target.value.trim(); if (q.length >= 2) listItems({ q, limit: 6 }).then((r) => setMergeHits(r.items.filter((x) => x.id !== itemId).map((x) => ({ id: x.id, title: x.title })))).catch(() => setMergeHits([])); else setMergeHits([]); }} style={{ flex: 1 }} />
+                    </div>
+                    {mergeQ.trim().length >= 2 && mergeHits.length === 0 && (
+                      <div className="hint">没有匹配的条目（搜索只含其他条目，不含本条；本页没有反向搜索）</div>
+                    )}
+                    {mergeHits.length > 0 && (
+                      <div className="row wrap" style={{ gap: "4px", marginTop: "4px" }}>
+                        {mergeHits.map((h) => (
+                          <button key={h.id} className="btn tiny" onClick={() => setMergePreview({ sourceId: itemId, targetId: h.id })}>#{h.id} {h.title.slice(0, 24)}</button>
+                        ))}
+                      </div>
+                    )}
+                  </Section>
+                </DetailDisclosure>
+                <DetailDisclosure label="版本关系">
+                  {/* 版本关系（spec §8.2）：只对已登记资产建候选，人工确认；不自动 proven。 */}
+                  <VersionLinksSection itemId={itemId} onToast={props.onToast} onChanged={() => { load(); props.onChanged(); }} />
+                </DetailDisclosure>
+                <DetailDisclosure label="挂接文件">
+                  <div className="row">
+                    <input type="text" aria-label="本地文件或目录路径" placeholder="本地文件或目录路径" value={assetPath} onChange={(e) => setAssetPath(e.target.value)} />
+                    <button className="btn" disabled={!assetPath.trim()} onClick={() => { guard(addAsset(itemId, assetPath.trim()), "已挂接资产"); setAssetPath(""); }}>挂接</button>
+                  </div>
+                </DetailDisclosure>
+                <DetailDisclosure label="来源与条目操作">
+                  <div className="row wrap item-detail-actions">
+                    <button className="btn tiny" onClick={() => guard(checkUpdate(itemId), "已开始检查更新")}>检查更新</button>
+                    <button className="btn tiny" onClick={() => guard(matchAvatars(itemId), "已开始匹配头像")}>重跑头像匹配</button>
+                    {detail.status === "trashed"
+                      ? <button className="btn tiny" title="只恢复条目状态；合并时已迁到别处的压缩包/图片/标签/模型不会自动迁回" onClick={() => guard(restoreItem(itemId), "已从回收站恢复（资源不自动迁回）")}>恢复</button>
+                      : <button className="btn tiny danger" onClick={() => guard(deleteItem(itemId), "已移到回收站")}>删除</button>}
+                  </div>
+                  <Section title="元数据">
+                    <table className="kv">
+                      <tbody>
+                        <tr><td className="k">id / uid</td><td className="mono">{it.id} · {it.uid}</td></tr>
+                        <tr>
+                          <td className="k">来源</td>
+                          <td>
+                            {it.source_url
+                              ? <a href={it.source_url} target="_blank" rel="noreferrer" title={"在浏览器打开来源页：" + it.source_url}>{SITE_LABEL[it.source_site]} {it.source_item_id ?? ""}</a>
+                              : <span>{SITE_LABEL[it.source_site]}{it.source_item_id ? " " + it.source_item_id : ""}</span>}
+                            {boothUrlFromItem && (
+                              <>
+                                {" "}
+                                <button className="btn tiny" disabled={boothBusy}
+                                  onClick={() => runBoothLink(boothUrlFromItem, (res) => "已补全 BOOTH 元数据，新增 " + (res?.images ?? 0) + " 张图")}
+                                >补全 BOOTH</button>
+                                <BoothCorrectionSection
+                                  itemId={itemId}
+                                  reload={load}
+                                  onChanged={props.onChanged}
+                                  onToast={props.onToast}
+                                />
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                        <tr><td className="k">店铺/作者</td><td>{it.shop_name ?? "—"} / {it.author ?? "—"}</td></tr>
+                        <tr><td className="k">来源分类</td><td>{it.category_parent ? it.category_parent + " › " : ""}{it.category_name ?? "—"}</td></tr>
+                        <tr><td className="k">价格</td><td>{formatYen(it.price_yen, it.price_text)} {it.purchased ? "· 已购入" : ""}</td></tr>
+                        <tr><td className="k">声明适配</td><td>{it.compat_declared_count ?? "—"} 体</td></tr>
+                        <tr><td className="k">识别</td><td>{it.id_match_method ?? "—"} · conf {it.id_confidence ?? "—"}</td></tr>
+                        <tr><td className="k">发布时间</td><td>{formatDate(it.published_at)}</td></tr>
+                        <tr><td className="k">更新时间</td><td>{formatDate(it.updated_at)}</td></tr>
+                        <tr><td className="k">体积</td><td>{formatBytes(detail.totalBytes)}</td></tr>
+                      </tbody>
+                    </table>
+                  </Section>
+                  {!boothUrlFromItem && (
+                    <Section title="关联 BOOTH 商品">
+                      <div className="row">
+                        <input
+                          type="url"
+                          placeholder="https://booth.pm/zh-cn/items/6747912"
+                          value={boothUrl}
+                          onChange={(e) => setBoothUrl(e.target.value)}
+                          style={{ flex: 1 }}
+                        />
+                        <button
+                          className="btn tiny"
+                          disabled={!boothUrl.trim() || boothBusy}
+                          onClick={async () => {
+                            setBoothBusy(true); setBoothHint("");
+                            try {
+                              const p: any = await boothPeek(boothUrl.trim());
+                              setBoothHint("预览：" + String(p.title ?? "").slice(0, 40) + " · " + (p.images?.length ?? 0) + " 张图 · " + ((p.files?.length ?? 0)) + " 个文件");
+                            } catch (e) { setBoothHint("预览失败：" + describeError(e)); }
+                            finally { setBoothBusy(false); }
+                          }}
+                        >预览</button>
+                        <button
+                          className="btn"
+                          disabled={!boothUrl.trim() || boothBusy}
+                          onClick={() => runBoothLink(boothUrl, (r) => {
+                            const s = r?.imageStats;
+                            if (!s) return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "，抓取 " + (r?.images ?? 0) + " 张图";
+                            return "已关联 BOOTH " + (r?.meta?.itemId ?? "") + "：下载成功 " + s.downloaded + " / 新增 " + s.added + " / 复用 " + s.reused + " / 内容重复 " + s.duplicates + " / 失败 " + s.failed;
+                          })}
+                        >抓取</button>
+                        {boothBusy && <Spinner />}
+                      </div>
+                      {boothHint && <div className="notice" style={{ marginTop: "6px" }}>{boothHint}</div>}
+                    </Section>
+                  )}
+                  {detail.updates && detail.updates.length > 0 && (
+                    <Section title="更新记录">
+                      <table className="kv">
+                        <tbody>
+                          {detail.updates.map((u) => (
+                            <tr key={u.id}><td className="k">{u.kind}</td><td>{u.detail ?? "—"}<div className="hint">{formatDate(u.created_at)}</div></td></tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </Section>
+                  )}
+                </DetailDisclosure>
+              </div>
+            </DetailDisclosure>
+          </div>
+          {dups.length > 0 && (
+            <DetailDisclosure label="疑似重复" meta={dups.length + " 条"}>
               <Section
                 title={<>⚠ 疑似重复 {dups.length}</>}
                 right={<button className="btn tiny" disabled={dupBusy} onClick={loadDups}>{dupBusy ? "检测中…" : "重新检测"}</button>}
@@ -856,41 +919,8 @@ export function ItemDetail(props: {
                   );
                 })}
               </Section>
-            )}
-
-            {/* 版本关系（spec §8.2）：只对已登记资产建候选，人工确认；不自动 proven。 */}
-            <VersionLinksSection itemId={itemId} onToast={props.onToast} onChanged={() => { load(); props.onChanged(); }} />
-
-            <Section title={<>资产 {detail.assets.length}</>}>
-              <div className="asset-list">
-                {detail.assets.map((a) => <ArchiveView key={a.id} asset={a} onToast={props.onToast} />)}
-                {!detail.assets.length && <span className="hint">未挂接资产</span>}
-              </div>
-              <div className="row" style={{ marginTop: "7px" }}>
-                <input type="text" placeholder="本地文件/目录路径，如 %DOWNLOADS%/pkg.zip" value={assetPath} onChange={(e) => setAssetPath(e.target.value)} />
-                <button className="btn" disabled={!assetPath.trim()} onClick={() => { guard(addAsset(itemId, assetPath.trim()), "已挂接资产"); setAssetPath(""); }}>挂接</button>
-              </div>
-              <div className="hint" style={{ marginTop: "4px" }}>POST /items/:id/assets — 自动识别容器类型。</div>
-            </Section>
-
-            {detail.updates && detail.updates.length > 0 && (
-              <Section title="更新记录">
-                <table className="kv">
-                  <tbody>
-                    {detail.updates.map((u) => (
-                      <tr key={u.id}><td className="k">{u.kind}</td><td>{u.detail ?? "—"}<div className="hint">{formatDate(u.created_at)}</div></td></tr>
-                    ))}
-                  </tbody>
-                </table>
-              </Section>
-            )}
-
-            {detail.description && (
-              <Section title="商品说明">
-                <div style={{ whiteSpace: "pre-wrap", maxHeight: "220px", overflow: "auto", fontSize: "12px" }}>{detail.description}</div>
-              </Section>
-            )}
-          </div>
+            </DetailDisclosure>
+          )}
         </div>
         {mergePreview && (
           <MergePreview

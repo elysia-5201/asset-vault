@@ -7,7 +7,7 @@
  * - 直接 .unitypackage：relPath = 文件名（= 包的 label）
  * - 压缩包里的包：relPath = entryPath
  * - zip 套 zip：relPath = "entryPath::innerEntryPath"
- * 对不上（还没做结构分析、包被改名）或工作台一次只能导入一个（同资产多单元 / 互斥槽位）时，
+ * 对不上（还没做结构分析、包被改名）或存在互斥变体时，
  * **不预选**，由 focusNotice 显式说明；绝不自动生成/执行计划。
  */
 import type { WorkbenchItem } from "./types";
@@ -32,7 +32,7 @@ export interface FocusMap {
   matched: string[];
   /** 资产有单元但 relPath 对不上，或对应单元不可导入 */
   unresolved: (FocusUnitRef & { reason: "relpath-mismatch" | "not-importable" })[];
-  /** 同一资产多个单元 / 互斥槽位冲突 → 工作台一次只能导入其中一个 */
+  /** 互斥变体或重复路径涉及的资产 */
   ambiguousAssetIds: number[];
   /** 工作台里完全没有这个资产的可导入单元（可能还没做结构分析） */
   missingAssetIds: number[];
@@ -49,11 +49,14 @@ export function unityPackageRelPath(p: { label: string; entryPath: string | null
   return inner ? entry + "::" + inner : entry;
 }
 
-/** 两个单元是否占同一个「槽位」（与工作台互斥规则一致）：同资产 / 同容器 / 同条目同包名。 */
+/** 同一个归档可以包含多个独立包。只拦互斥变体或重复包路径。 */
 export function sameSlot(a: WorkbenchItem, b: WorkbenchItem): boolean {
-  if (a.assetId !== null && b.assetId !== null && a.assetId === b.assetId) return true;
-  if (a.containerPath && b.containerPath && a.containerPath === b.containerPath) return true;
-  return a.itemId === b.itemId && (a.packageName ?? "") === (b.packageName ?? "");
+  if (a.unitId === b.unitId) return true;
+  if (a.variantIds?.includes(b.unitId) || b.variantIds?.includes(a.unitId)) return true;
+  const first = a.relPath || a.packageName;
+  const second = b.relPath || b.packageName;
+  return a.itemId === b.itemId && !!first && !!second &&
+    first.replaceAll("\\", "/").toLowerCase() === second.replaceAll("\\", "/").toLowerCase();
 }
 
 /**
@@ -82,25 +85,17 @@ export function mapFocusToUnits(focus: WorkbenchFocus | null | undefined, units:
   }
   map.matched = exact.map((u) => u.unitId);
 
-  // 同一资产多个单元：工作台一次只能导入其中一个 → 该资产整体不预选（不能替用户做取舍）
-  const byAsset = new Map<number, WorkbenchItem[]>();
-  for (const u of exact) { const id = u.assetId as number; byAsset.set(id, [...(byAsset.get(id) ?? []), u]); }
-  const safe: WorkbenchItem[] = [];
-  for (const [assetId, list] of byAsset) {
-    if (list.length > 1) { if (!map.ambiguousAssetIds.includes(assetId)) map.ambiguousAssetIds.push(assetId); continue; }
-    safe.push(list[0]!);
-  }
-  // 跨资产互斥槽位（同容器/同条目同包名）：两个都不预选，避免静默替换用户选择
-  const conflict = new Set<number>();
-  for (let i = 0; i < safe.length; i++) {
-    for (let j = i + 1; j < safe.length; j++) {
-      if (!sameSlot(safe[i]!, safe[j]!)) continue;
-      if (safe[i]!.assetId !== null) conflict.add(safe[i]!.assetId as number);
-      if (safe[j]!.assetId !== null) conflict.add(safe[j]!.assetId as number);
+  const conflict = new Set<string>();
+  for (let i = 0; i < exact.length; i++) {
+    for (let j = i + 1; j < exact.length; j++) {
+      if (!sameSlot(exact[i], exact[j])) continue;
+      for (const unit of [exact[i], exact[j]]) {
+        conflict.add(unit.unitId);
+        if (unit.assetId !== null && !map.ambiguousAssetIds.includes(unit.assetId)) map.ambiguousAssetIds.push(unit.assetId);
+      }
     }
   }
-  for (const id of conflict) if (!map.ambiguousAssetIds.includes(id)) map.ambiguousAssetIds.push(id);
-  map.preselected = safe.filter((u) => u.assetId !== null && !conflict.has(u.assetId as number)).map((u) => u.unitId);
+  map.preselected = exact.filter((u) => !conflict.has(u.unitId)).map((u) => u.unitId);
   return map;
 }
 
@@ -132,6 +127,6 @@ export function focusNotice(focus: WorkbenchFocus, map: FocusMap): string {
   const notes: string[] = [];
   if (map.missingAssetIds.length) notes.push(map.missingAssetIds.length + " 个包在工作台里未找到对应单元（可能还没做结构分析）");
   if (map.unresolved.length) notes.push(map.unresolved.length + " 个包的 relPath 未精确对应到可导入单元（可能还没做结构分析或包被改名）");
-  if (map.ambiguousAssetIds.length) notes.push(map.ambiguousAssetIds.length + " 个资产有多个可导入单元或互斥槽位冲突，未预选");
+  if (map.ambiguousAssetIds.length) notes.push(map.ambiguousAssetIds.length + " 个资产存在互斥变体或重复路径，未预选");
   return head + "。" + (notes.length ? notes.join("；") + "，这些未预选。" : "") + next;
 }

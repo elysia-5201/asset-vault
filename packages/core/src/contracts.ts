@@ -141,6 +141,11 @@ export interface AssetRow {
   size: number; mtime: string | null; sha256: string | null; sha256_state: ShaState; status: AssetStatus;
   discovered_by: "scan" | "watch" | "download" | "manual"; first_seen: string; last_verified_at: string | null;
 }
+export interface ItemAssetScanResult {
+  files: {
+    assetId: number; path: string; state: "present" | "missing" | "unavailable"; changed: boolean; reason?: string;
+  }[];
+}
 export interface AvatarRow { id: number; name: string; name_norm: string; kind: AvatarKind; booth_item_id: string | null; cover_path: string | null; owned: number; sort: number; created_at: string; updated_at: string }
 export interface AvatarAliasRow { id: number; avatar_id: number; alias: string; alias_norm: string; lang: string | null; source: "booth_tag" | "filename" | "user" | "seed" }
 export interface ItemAvatarRow { item_id: number; avatar_id: number; match: AvatarMatch; confidence: number; evidence: string | null; source: "auto" | "manual" | "confirmed" }

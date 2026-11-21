@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { normalizePath } from "@core/pathnorm";
 import {
-  confirmImportPlan, createImportPlans, describeError, executeImportPlan, getImportPlan, getImportRun,
-  listJobs, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems,
+  analyzeWorkbenchItem, confirmImportPlan, createImportPlans, describeError, executeImportPlan, getImportPlan, getImportRun,
+  getJob, listImportPlans, mediaUrl, scanAllWorkbench, unityStatus, workbenchAvatars, workbenchItems, type UnityStatusWeb,
 } from "../api";
 import type { ImportPlan, PlanLatestRun, ImportRun, WorkbenchAvatar, WorkbenchItem } from "../types";
-import { focusApplyAllowed, focusNotice, mapFocusToUnits, sameSlot, type FocusMap, type WorkbenchFocus } from "../workbench-focus";
+import { mapFocusToUnits, sameSlot, type WorkbenchFocus } from "../workbench-focus";
+import { defaultLoadoutPackage, loadLoadoutPackages, type LoadoutPackages, type LoadoutWorkbenchScope } from "../loadout-workbench";
 import {
   GUID_SCOPE_NOTE, PLAN_STATE_LABEL, RUN_STATE_TONE, VERIFICATION_SCOPE_LABEL, consoleErrorCauseText, planToneOf,
   runCountsText, runVerdictOf, verificationText,
@@ -29,8 +31,7 @@ export { sameSlot } from "../workbench-focus";
  *   verifying / verified / partial_success / failed / unknown），这里只做标签与配色映射、原样展示。
  * - **suggested 不默认入计划**：建议项一律未勾选，必须用户显式勾选才会进入 confirm 的 unitIds。
  * - **mixed 必须显式警告**：混合整包会把其它 Avatar 的资源一起导入，卡片与计划两处都要提示。
- * - 清单**互斥**：同一压缩包（containerPath）里的多个单元只能选一个（导入其中一个就等于导入整包），
- *   同一 item + 同一包名也不重复。纯函数 `togglePick` 可单测。
+ * - 选择冲突仅涉及互斥变体或重复包路径，一个归档里的独立包可以一起导入。
  */
 
 type Tone = "ok" | "warn" | "bad" | "busy" | "muted" | "violet" | "";
@@ -152,60 +153,6 @@ export function UnitsEmptyState(props: {
         {props.scanning ? "扫描中…" : SCAN_ALL_LABEL}
       </button>
       <div className="hint">只补还没分析过的条目（onlyMissing=true）</div>
-    </div>
-  );
-}
-
-function ItemRow(props: { item: WorkbenchItem; picked: boolean; onToggle: () => void }) {
-  const it = props.item;
-  const ev = it.evidence;
-  return (
-    <div
-      className={"preview-row" + (props.picked ? " on" : "")}
-      style={{ cursor: "pointer" }}
-      onClick={props.onToggle}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); props.onToggle(); } }}
-    >
-      <div className="row" style={{ gap: "8px", alignItems: "flex-start" }}>
-        {it.coverImageId !== null
-          ? <img src={mediaUrl(it.coverImageId, 96)} alt="" style={{ width: "54px", height: "54px", objectFit: "cover", borderRadius: "6px", border: "1px solid var(--line)", flex: "0 0 auto" }} />
-          : <div className="hint" style={{ width: "54px", height: "54px", border: "1px dashed var(--line)", borderRadius: "6px", flex: "0 0 auto", display: "grid", placeItems: "center", fontSize: "10px" }}>无图</div>}
-        <div style={{ minWidth: 0, flex: 1, display: "flex", flexDirection: "column", gap: "2px" }}>
-          <div className="row" style={{ gap: "5px", minWidth: 0 }}>
-            <b style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.title}</b>
-            <Badge tone={LEVEL_TONE[it.level]} title={"证据级别：" + it.level}>{LEVEL_LABEL[it.level] ?? it.level}</Badge>
-            {it.suggested && <Badge tone="violet" title="后端建议项：默认不加入计划，需你勾选">建议</Badge>}
-            {it.mixed && <Badge tone="bad" title={MIXED_WARNING}>整包风险</Badge>}
-            {!it.importable && <Badge tone="muted" title={"policy=" + it.policy + "，不可导入"}>不可导入</Badge>}
-            <span className="spacer" />
-            <span className="hint">{POLICY_LABEL[it.policy] ?? it.policy}</span>
-          </div>
-          <div className="hint mono" style={{ wordBreak: "break-all" }}>
-            {it.packageName ? shortenPath(it.packageName, 60) : "—"}
-            {it.relPath ? " › " + shortenPath(it.relPath, 52) : ""}
-          </div>
-          <div className="hint">
-            {it.sourceSite ? it.sourceSite.toUpperCase() : "本地"}
-            {it.sourceItemId ? " " + it.sourceItemId : ""}
-            {it.shopName ? " · " + it.shopName : ""}
-            {it.avatarName ? " · 目标 @" + it.avatarName : ""}
-            {it.kind ? " · " + it.kind : ""}
-          </div>
-          {ev && (
-            <div className="hint">
-              <b>{LEVEL_LABEL[ev.level] ?? ev.level}</b>
-              {ev.summary ? "：" + ev.summary : ""}
-              {ev.sources.length ? "（" + ev.sources.join(" / ") + "）" : ""}
-            </div>
-          )}
-          {it.error && <div className="err-text">{it.error.code}：{it.error.message}</div>}
-        </div>
-        <span className="hint" style={{ flex: "0 0 auto", opacity: it.importable ? 1 : 0.45 }}>
-          {!it.importable ? "不可加入" : props.picked ? "✓ 已加入" : "加入 →"}
-        </span>
-      </div>
     </div>
   );
 }
@@ -488,539 +435,644 @@ export function PlansSection(props: {
   );
 }
 
+type WorkbenchPage = "pick" | "review" | "result" | "history";
+type AnalysisJob = { id: number; itemId?: number };
+type PlanBatch = Awaited<ReturnType<typeof createImportPlans>>;
+const PAGE_SIZE = 120;
+
+function packageTitle(unit: WorkbenchItem): string {
+  return unit.packageName || unit.relPath || "包 #" + unit.unitId;
+}
+
+function needsAck(plan: ImportPlan): boolean {
+  return plan.risk.state !== "clear" || anyMixed(plan.units);
+}
+
+function isBlocked(plan: ImportPlan): boolean {
+  return !["ready", "needs_confirmation"].includes(plan.state)
+    || !["clear", "warning", "unknown"].includes(plan.risk.state)
+    || !plan.precheck.ok
+    || !plan.units.length
+    || plan.units.some((unit) => unit.state === "blocked" || unit.suggested);
+}
+
+export function recommendedPackages(units: WorkbenchItem[], avatarId: number | null): WorkbenchItem[] {
+  if (avatarId === null) return [];
+  return units.filter((u) => u.importable && !u.mixed && u.policy === "single_unitypackage"
+    && (u.avatarMatches?.some((a) => a.id === avatarId && a.level === "confirmed")
+      ?? (u.avatarId === avatarId && u.level === "confirmed"))
+    && !units.some((other) => other.importable && other.unitId !== u.unitId && sameSlot(u, other)));
+}
+
+function RiskDetails({ plan }: { plan: ImportPlan }) {
+  const blocked = isBlocked(plan);
+  return <div className="wb-review-card">
+    {blocked
+      ? <Badge tone="bad">受阻</Badge>
+      : needsAck(plan) ? <Badge tone="warn">需要确认</Badge> : <Badge tone="ok">检查通过</Badge>}
+    {plan.units.map((unit) => (
+      <div className="wb-package-note" key={unit.unitId} title={unit.packagePath ?? undefined}>
+        <b>{unit.title}</b>
+        {unit.relPath && <span className="hint mono">{unit.relPath}</span>}
+        {unit.error && <span className="err-text">{unit.error.message}</span>}
+      </div>
+    ))}
+    {anyMixed(plan.units) && <div className="notice">{MIXED_WARNING}</div>}
+    {plan.risk.state === "warning" && <div className="notice">部分文件需要核对后才能导入。</div>}
+    {plan.risk.state === "unknown" && <div className="notice">无法完整确认包内风险。</div>}
+    {!plan.risk.state && <div className="err">没有收到风险检查结果，请重新检查。</div>}
+    {plan.precheck.errors.map((error, i) => <div className="err" key={i}>{error.message}</div>)}
+    {plan.precheck.warnings.map((warning, i) => <div className="notice" key={i}>{warning}</div>)}
+    {plan.error && <div className="err">{plan.error.message}</div>}
+    {plan.risk.hits.length > 0 && (
+      <details open={blocked || undefined}>
+        <summary>风险命中 {plan.risk.hits.length} 项</summary>
+        {plan.risk.hits.slice(0, RISK_HIT_LIMIT).map((hit, i) => (
+          <div className="wb-package-note" key={i}><span className="mono">{hit.path}</span><span className="hint">{hit.reason || hit.type}</span></div>
+        ))}
+        {plan.risk.hits.length > RISK_HIT_LIMIT && <p className="hint">此处显示前 {RISK_HIT_LIMIT} 项。</p>}
+      </details>
+    )}
+    {blocked && <div className="hint">回到选包，移除受阻的包或修正文件后重新检查。</div>}
+  </div>;
+}
+
+function ImportResult({ plan }: { plan: ImportPlan }) {
+  const [run, setRun] = useState<ImportRun | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [error, setError] = useState("");
+  const { runId, latestRun } = plan;
+  const lastStatus = latestRun?.status;
+  useEffect(() => {
+    if (!expanded || runId === null) return;
+    let active = true;
+    let pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const result = await getImportRun(runId);
+        if (active) { setRun(result); setError(""); }
+      } catch (e) { if (active) setError(describeError(e)); }
+      finally { pending = false; }
+    };
+    void refresh();
+    const timer = PLAN_TERMINAL_STATES.includes(plan.state) ? null : setInterval(() => void refresh(), 1500);
+    return () => { active = false; if (timer) clearInterval(timer); };
+  }, [expanded, runId, lastStatus, plan.state]);
+  const queued = plan.jobId !== null && !PLAN_TERMINAL_STATES.includes(plan.state) && !latestRun;
+  const label = latestRun ? runVerdictOf(latestRun.status).label
+    : queued ? "已提交，等待 Unity" : plan.state === "executed" ? "验证状态未知" : PLAN_STATE_LABEL[plan.state] ?? plan.state;
+  return (
+    <div className="section wb-result">
+      <div className="wb-result-head">
+        <b>{plan.itemTitle || (plan.units.length === 1 ? plan.units[0].title : plan.units.length + " 个导入包")}</b>
+        <Badge tone={latestRun ? runVerdictOf(latestRun.status).tone : queued ? "busy" : planToneOf(plan)}>{label}</Badge>
+      </div>
+      <div className="hint wb-path">{plan.projectPath}{plan.createdAt && " · " + formatDate(plan.createdAt)}</div>
+      {latestRun && <div className="hint">{runCountsText(latestRun.counts)}</div>}
+      {plan.error && <div className="err">{plan.error.message}</div>}
+      {latestRun && ["unknown", "interrupted"].includes(latestRun.status) && <div className="notice">{UNKNOWN_STATE_HINT}</div>}
+      <details onToggle={(e) => setExpanded(e.currentTarget.open)}>
+        <summary>查看各包与验证详情</summary>
+        {plan.units.map((unit) => <div className="wb-package-note" key={unit.unitId}><b>{unit.title}</b>{unit.error && <span className="err-text">{unit.error.message}</span>}</div>)}
+        {error && <div className="err">{error}</div>}
+        {run?.id === runId && run && <RunCard run={run} />}
+      </details>
+    </div>
+  );
+}
+
 export function AvatarWorkbench(props: {
   onClose: () => void;
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
-  /** 从条目详情「带入清单」打开的上下文：定位条目 + 按 assetId/relPath 精确映射已勾选的包。 */
   focus?: WorkbenchFocus | null;
+  loadout?: LoadoutWorkbenchScope | null;
+  projects?: { id: number; name: string; path: string }[];
+  initialAvatarId?: number | null;
 }) {
   const focus = props.focus ?? null;
-  const [avatars, setAvatars] = useState<WorkbenchAvatar[]>([]);
-  const [avatarId, setAvatarId] = useState<number | null>(null);
-  const [avatarsLoading, setAvatarsLoading] = useState(true);
-  const [avatarsErr, setAvatarsErr] = useState("");
-
-  const [q, setQ] = useState("");
-  const debouncedQ = useDebounced(q, 250);
-  /** 后端支持的条目状态过滤（inbox/active/archived/trashed）；分类不在 /workbench/units 契约里。 */
-  const [itemStatus, setItemStatus] = useState("");
-  const [level, setLevel] = useState("");
-  const [policy, setPolicy] = useState("");
-  const [confirmedOnly, setConfirmedOnly] = useState(false);
-
-  const [items, setItems] = useState<WorkbenchItem[]>([]);
-  const [itemsTotal, setItemsTotal] = useState(0);
-  const [itemsLoading, setItemsLoading] = useState(false);
-  const [itemsErr, setItemsErr] = useState("");
-  /** 从详情页打开时只看该条目的单元（可切回当前 Avatar 的单元）。 */
+  const loadout = props.loadout ?? null;
+  const targetProject = loadout?.project;
+  const [page, setPage] = useState<WorkbenchPage>("pick");
   const [focusOnly, setFocusOnly] = useState(!!focus);
-  /** 当前 items 对应哪个查询范围（focus:123 / avatar:5），用来判断"该范围已加载完"。 */
-  const [itemsLoadedFor, setItemsLoadedFor] = useState("");
-  /** 详情页上下文 → 单元的映射结论（预选多少、哪些没对上）。 */
-  const [focusMap, setFocusMap] = useState<FocusMap | null>(null);
-  /** 同一个 focus 只带入一次：用户之后自己勾选/取消不被覆盖。 */
-  const focusAppliedRef = useRef("");
-
+  const [avatars, setAvatars] = useState<WorkbenchAvatar[]>([]);
+  const [avatarId, setAvatarId] = useState<number | null>(props.initialAvatarId ?? null);
+  const [query, setQuery] = useState("");
+  const q = useDebounced(query, 250);
+  const [offset, setOffset] = useState(0);
+  const [units, setUnits] = useState<WorkbenchItem[]>([]);
+  const [loadoutPackages, setLoadoutPackages] = useState<LoadoutPackages[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState("");
+  const [revision, setRevision] = useState(0);
+  const [analysis, setAnalysis] = useState<AnalysisJob | null>(null);
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [analysisStatus, setAnalysisStatus] = useState("");
   const [picked, setPicked] = useState<WorkbenchItem[]>([]);
-  const [projectPath, setProjectPath] = useState("");
-  const [projectName, setProjectName] = useState("");
-  const [probing, setProbing] = useState(false);
-  /** Unity 工程里认出的 Avatar（/workbench/avatars 为空时兜底）。 */
-  const [projectAvatar, setProjectAvatar] = useState<{ id: number; name: string } | null>(null);
-  const [avatarFallback, setAvatarFallback] = useState(false);
-  /** scan-all 的 job id（轮询到终态后刷新 avatars/units）。 */
-  const [scanJob, setScanJob] = useState<number | null>(null);
-  const [scanAllBusy, setScanAllBusy] = useState(false);
-  const projectAvatarRef = useRef<{ id: number; name: string } | null>(null);
-  const avatarsRef = useRef<WorkbenchAvatar[]>([]);
-  avatarsRef.current = avatars;
-  /** 打开面板只自动探测一次：之后只有手点「探测」才会再发请求。 */
-  const probedRef = useRef(false);
-  const toastRef = useRef(props.onToast);
-  toastRef.current = props.onToast;
+  const [conflict, setConflict] = useState<{ next: WorkbenchItem; previous: WorkbenchItem[] } | null>(null);
+  const preferenceApplied = useRef(false);
+  const loadoutDefaults = useRef(new Set<number>());
+  const [editor, setEditor] = useState<UnityStatusWeb | null>(null);
+  const [probing, setProbing] = useState(true);
+  const [selectedProjectPath, setProjectPath] = useState("");
+  const projectPath = targetProject?.path ?? selectedProjectPath;
+  const [batch, setBatch] = useState<PlanBatch | null>(null);
+  const [riskAck, setRiskAck] = useState(false);
+  const [partialAck, setPartialAck] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [submitted, setSubmitted] = useState<ImportPlan[]>([]);
+  const [submitErrors, setSubmitErrors] = useState<string[]>([]);
+  const [history, setHistory] = useState<ImportPlan[]>([]);
+  const [historyError, setHistoryError] = useState("");
 
-  /** 后端按 item 建计划，所以这里可能是多个（通常 1 个）。 */
-  const [plans, setPlans] = useState<ImportPlan[]>([]);
-  /** 勾选状态键 = `${planId}:${unitId}`；suggested / state==="suggested" 默认不勾选。 */
-  const [checks, setChecks] = useState<Record<string, boolean>>({});
-  const [planBusy, setPlanBusy] = useState(false);
-  const [planErr, setPlanErr] = useState("");
+  const editorPath = editor?.ok ? editor.editor?.projectPath : undefined;
+  const matchesEditor = !!projectPath.trim() && !!editorPath && normalizePath(editorPath) === normalizePath(projectPath.trim());
 
-  const [runs, setRuns] = useState<ImportRun[]>([]);
-  const [runErr, setRunErr] = useState("");
-  /** 已提交执行、需要继续轮询的计划 id（execute 只回 202 {jobId,planId}）。 */
-  const [pollPlanIds, setPollPlanIds] = useState<number[]>([]);
-  /** planId → 执行作业 id（仅用于展示 "job #N"）。 */
-  const [ackedJobs, setAckedJobs] = useState<Record<number, number>>({});
-  /** planId → 风险提示是否已显式确认（warning / unknown 必须勾；blocked 勾了也不放行）。 */
-  const [riskAcks, setRiskAcks] = useState<Record<number, boolean>>({});
+  const probeUnity = useCallback(async () => {
+    setProbing(true);
+    try {
+      const status = await unityStatus();
+      setEditor(status);
+      if (status.ok && status.editor?.projectPath) setProjectPath((path) => path || status.editor!.projectPath);
+      return status;
+    } catch {
+      setEditor(null);
+      return null;
+    } finally { setProbing(false); }
+  }, []);
+  useEffect(() => { void probeUnity(); }, [probeUnity]);
+  useEffect(() => {
+    if (loadout) return;
+    let alive = true;
+    workbenchAvatars().then((list) => { if (alive) setAvatars(list); }).catch(() => {});
+    return () => { alive = false; };
+  }, [loadout, revision]);
 
-  // ① Avatar 列表
-  const applyAvatarList = useCallback((list: WorkbenchAvatar[]) => {
-    if (list.length) {
-      setAvatars(list); setAvatarFallback(false);
-      setAvatarId((cur) => (cur === null || !list.some((a) => a.id === cur) ? list[0].id : cur));
+  useEffect(() => {
+    if (loadout) return;
+    let alive = true;
+    setLoading(true); setListError("");
+    workbenchItems({
+      itemId: focusOnly ? focus?.itemId : undefined,
+      avatarId: focusOnly ? undefined : avatarId ?? undefined,
+      q: q.trim() || undefined,
+      limit: focusOnly ? 2000 : PAGE_SIZE + 1,
+      offset: focusOnly ? 0 : offset,
+    }).then(({ items }) => {
+      if (!alive) return;
+      setHasMore(!focusOnly && items.length > PAGE_SIZE);
+      setUnits(focusOnly ? items : items.slice(0, PAGE_SIZE));
+    }).catch((e) => {
+      if (alive) { setUnits([]); setHasMore(false); setListError(describeError(e)); }
+    }).finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [loadout, focus, focusOnly, avatarId, q, offset, revision]);
+
+  useEffect(() => {
+    if (!loadout) return;
+    let alive = true;
+    setLoading(true);
+    void loadLoadoutPackages(loadout, () => alive).then((rows) => {
+      if (!alive) return;
+      const currentUnits = rows.flatMap((row) => row.units);
+      const available = new Map(currentUnits.filter((unit) => unit.importable).map((unit) => [unit.unitId, unit]));
+      const defaults = rows.flatMap((row) => {
+        if (loadoutDefaults.current.has(row.id)) return [];
+        const next = defaultLoadoutPackage(row, loadout.avatarId, currentUnits);
+        if (!next) return [];
+        loadoutDefaults.current.add(row.id);
+        return [next];
+      });
+      setPicked((before) => {
+        const next = before.flatMap((unit) => available.get(unit.unitId) ?? []);
+        return [...next, ...defaults.filter((unit) => !next.some((other) => sameSlot(unit, other)))];
+      });
+      setConflict(null);
+      setUnits(currentUnits);
+      setLoadoutPackages(rows);
+      setLoading(false);
+    });
+    return () => { alive = false; };
+  }, [loadout, revision]);
+
+  useEffect(() => {
+    if (!focus || !focusOnly || loading || probing || q || !units.length || preferenceApplied.current) return;
+    const preferred = editor?.projectAvatar?.id ?? props.initialAvatarId ?? null;
+    const mapped = new Set(focus.units.length ? mapFocusToUnits(focus, units).preselected : []);
+    const candidates = focus.units.length ? units.filter((unit) => mapped.has(unit.unitId))
+      : recommendedPackages(units, preferred);
+    preferenceApplied.current = true;
+    setPicked((existing) => existing.length ? existing : candidates.filter((unit) => unit.importable && !unit.mixed && unit.policy === "single_unitypackage"));
+  }, [editor, focus, focusOnly, loading, probing, props.initialAvatarId, q, units]);
+
+  async function launchAnalysis(itemId?: number) {
+    setAnalysisBusy(true); setAnalysisStatus("");
+    try {
+      const response = itemId ? await analyzeWorkbenchItem(itemId, units.some((u) => u.itemId === itemId)) : await scanAllWorkbench(true);
+      if (!response.jobId) throw new Error("结构分析没有返回作业编号");
+      setAnalysis({ id: response.jobId, itemId });
+      setAnalysisStatus("等待结构分析…");
+    } catch (e) { setAnalysisStatus(describeError(e)); }
+    finally { setAnalysisBusy(false); }
+  }
+
+  useEffect(() => {
+    if (!analysis) return;
+    let alive = true;
+    let pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const job = await getJob(analysis.id);
+        if (!alive) return;
+        if (["done", "failed", "cancelled", "abandoned"].includes(job.state)) {
+          setAnalysis(null);
+          setAnalysisStatus(job.state === "done" ? "结构分析完成" : job.error || "结构分析未完成");
+          setRevision((n) => n + 1);
+        } else {
+          setAnalysisStatus(job.state === "queued" ? "等待结构分析…" : "正在分析包内结构…");
+        }
+      } catch {
+        if (alive) setAnalysisStatus("正在重新连接结构分析作业…");
+      } finally { pending = false; }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 1500);
+    return () => { alive = false; clearInterval(timer); };
+  }, [analysis]);
+
+  useEffect(() => {
+    if (page !== "history") return;
+    let alive = true;
+    let pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const recent = await listImportPlans(focusOnly ? focus?.itemId : undefined);
+        if (alive) { setHistory(recent); setHistoryError(""); }
+      } catch (e) { if (alive) setHistoryError(describeError(e)); }
+      finally { pending = false; }
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [page, focus, focusOnly]);
+
+  const pendingIds = submitted.filter((p) => !PLAN_TERMINAL_STATES.includes(p.state)).map((p) => p.id).join(",");
+  useEffect(() => {
+    if (!pendingIds) return;
+    const ids = pendingIds.split(",").map(Number);
+    let alive = true;
+    let pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      const rows = await Promise.allSettled(ids.map(getImportPlan));
+      pending = false;
+      if (!alive) return;
+      const next = rows.flatMap((row) => row.status === "fulfilled" ? [row.value] : []);
+      setSubmitted((before) => before.map((plan) => {
+        const current = next.find((p) => p.id === plan.id);
+        return current ? { ...current, jobId: current.jobId ?? plan.jobId } : plan;
+      }));
+    };
+    void refresh();
+    const timer = setInterval(() => void refresh(), 1500);
+    return () => { alive = false; clearInterval(timer); };
+  }, [pendingIds]);
+
+  function changePick(unit: WorkbenchItem) {
+    if (busy || !unit.importable) return;
+    preferenceApplied.current = true;
+    if (picked.some((p) => p.unitId === unit.unitId)) {
+      setPicked(picked.filter((p) => p.unitId !== unit.unitId));
+      setConflict(null);
       return;
     }
-    // 列表为空：用 Unity 工程里认出的头像兜底并选中，别让用户面对一片空白
-    const pa = projectAvatarRef.current;
-    if (pa) { setAvatars([fallbackAvatarOf(pa)]); setAvatarFallback(true); setAvatarId(pa.id); return; }
-    setAvatars([]); setAvatarFallback(false); setAvatarId(null);
-  }, []);
-
-  const loadAvatars = useCallback(() => {
-    setAvatarsLoading(true); setAvatarsErr("");
-    workbenchAvatars()
-      .then((list) => applyAvatarList(list))
-      .catch((e) => setAvatarsErr(describeError(e)))
-      .finally(() => setAvatarsLoading(false));
-  }, [applyAvatarList]);
-
-  useEffect(() => { loadAvatars(); }, [loadAvatars]);
-
-  // ② Unity 工程：**打开面板只自动探测一次**（probedRef 守卫），之后只有手点「探测」才会再发请求；
-  //    成功一律静默（不 toast），失败也只在手动探测时提示。
-  const probeUnity = useCallback((manual = false): void => {
-    setProbing(true);
-    unityStatus()
-      .then((s) => {
-        const p = s.editor?.projectPath ?? "";
-        if (p) { setProjectPath(p); setProjectName(s.editor?.projectName ?? ""); }
-        const pa = s.projectAvatar ?? null;
-        if (pa) {
-          projectAvatarRef.current = { id: pa.id, name: pa.name };
-          setProjectAvatar(projectAvatarRef.current);
-          // avatars 为空 → 用它兜底并选中（否则左侧一片空白，用户以为探测失败）
-          if (avatarsRef.current.length === 0) {
-            setAvatars([fallbackAvatarOf(pa)]);
-            setAvatarFallback(true);
-            setAvatarId(pa.id);
-          }
-        }
-        if (!p && manual) toastRef.current("info", "没探测到打开的 Unity 工程（可手填路径，或先打开工程再点探测）");
-      })
-      .catch(() => { if (manual) toastRef.current("info", "Unity 探测失败：编辑器没开或 MCP 不可达"); })
-      .finally(() => setProbing(false));
-  }, []);
-
-  useEffect(() => {
-    if (probedRef.current) return;
-    probedRef.current = true;
-    probeUnity(false);
-  }, [probeUnity]);
-
-  // ③ 素材单元（有详情页上下文时默认只看该条目；?itemId= 走后端过滤）
-  const loadItems = useCallback(() => {
-    const focused = focusOnly && focus !== null;
-    const scopeKey = focused ? "focus:" + focus.itemId : "avatar:" + String(avatarId ?? "none");
-    if (!focused && avatarId === null) { setItems([]); setItemsTotal(0); setItemsLoadedFor(scopeKey); return; }
-    setItemsLoading(true); setItemsErr("");
-    workbenchItems({
-      avatarId: focused ? undefined : avatarId ?? undefined,
-      itemId: focused ? focus.itemId : undefined,
-      level: (confirmedOnly ? "confirmed" : level) || undefined,
-      policy: policy || undefined,
-      itemStatus: itemStatus || undefined,
-      limit: 500,
-    })
-      .then((r) => {
-        // 关键词后端不支持：本地按 标题/包名/relPath/@Avatar 过滤
-        const needle = debouncedQ.trim().toLowerCase();
-        const list = needle
-          ? r.items.filter((it) => [it.title, it.packageName ?? "", it.relPath ?? "", it.avatarName ?? ""]
-              .join(" ").toLowerCase().includes(needle))
-          : r.items;
-        setItems(list); setItemsTotal(list.length);
-      })
-      .catch((e) => { setItems([]); setItemsTotal(0); setItemsErr(describeError(e)); })
-      .finally(() => { setItemsLoading(false); setItemsLoadedFor(scopeKey); });
-  }, [avatarId, debouncedQ, itemStatus, level, policy, confirmedOnly, focusOnly, focus]);
-
-  useEffect(() => { loadItems(); }, [loadItems]);
-
-  // 详情页带入的包 → 工作台单元：**精确映射才预选**；不明确时只给提示，不替用户做取舍。
-  useEffect(() => {
-    if (!focus) return;
-    const key = "focus:" + focus.itemId;
-    if (itemsLoadedFor !== key || focusAppliedRef.current === key) return;
-    const map = mapFocusToUnits(focus, items);
-    setFocusMap(map);
-    // 该条目还没有单元（未做结构分析）：先不置位，扫描完成加载 units 后可再精确预选一次。
-    if (!focusApplyAllowed(focus, items, focusAppliedRef.current)) return;
-    if (map.preselected.length) {
-      const byId = new Map(items.map((u) => [u.unitId, u]));
-      setPicked(map.preselected.map((id) => byId.get(id)).filter((u): u is WorkbenchItem => !!u));
-    }
-    focusAppliedRef.current = key;
-  }, [focus, items, itemsLoadedFor]);
-
-  // ④ 一键补结构分析：提交 scan-all（onlyMissing）→ 轮询 /api/jobs 里那条 → 完成后刷新 avatars/units
-  const scanAll = useCallback((): void => {
-    if (scanAllBusy) return;
-    setScanAllBusy(true);
-    scanAllWorkbench(true)
-      .then((r) => {
-        if (!r.jobId) {
-          setScanAllBusy(false);
-          toastRef.current("bad", "后端没有返回 jobId（/api/workbench/scan-all）");
-          return;
-        }
-        setScanJob(r.jobId);
-        toastRef.current("ok", "已提交结构扫描（job #" + r.jobId + "），完成后自动刷新");
-      })
-      .catch((e) => {
-        setScanAllBusy(false);
-        toastRef.current("bad", "提交扫描失败：" + describeError(e));
-      });
-  }, [scanAllBusy]);
-
-  useEffect(() => {
-    if (scanJob === null) return;
-    const tick = (): void => {
-      if (typeof document !== "undefined" && document.hidden) return;
-      listJobs(undefined, 50)
-        .then((r) => {
-          const j = r.jobs.find((x) => x.id === scanJob);
-          if (!j) return;
-          if (!["done", "failed", "cancelled", "abandoned"].includes(j.state)) return;
-          setScanJob(null);
-          setScanAllBusy(false);
-          toastRef.current(
-            j.state === "done" ? "ok" : "bad",
-            "结构扫描 " + j.state + (j.error ? "：" + j.error : "") + "，已刷新列表",
-          );
-          loadAvatars();
-          loadItems();
-        })
-        .catch(() => { /* 下一轮再试 */ });
-    };
-    const timer = setInterval(tick, 2000);
-    return () => clearInterval(timer);
-  }, [scanJob, loadAvatars, loadItems]);
-
-  // ⑤ 计划/执行轮询（只在还有在飞单元时跑；页面隐藏时跳过）
-  const refreshRun = useCallback((id: number) => {
-    getImportRun(id)
-      .then((r) => {
-        setRuns((list) => (list.some((x) => x.id === r.id) ? list.map((x) => (x.id === r.id ? r : x)) : [...list, r]));
-        setRunErr("");
-      })
-      .catch((e) => setRunErr(describeError(e)));
-  }, []);
-
-  const busyRun = useMemo(() => runs.some((r) => isRunBusy(r)), [runs]);
-  useEffect(() => {
-    const activeRuns = runs.filter((r) => isRunBusy(r)).map((r) => r.id);
-    if (!pollPlanIds.length && !activeRuns.length) return;
-    const tick = () => {
-      if (typeof document !== "undefined" && document.hidden) return;
-      for (const rid of activeRuns) refreshRun(rid);
-      // 计划：拿最新状态；一旦暴露出 run_id 就去拉 run；到终态就停止轮询它
-      for (const pid of pollPlanIds) {
-        getImportPlan(pid)
-          .then((np) => {
-            setPlans((list) => list.map((x) => (x.id === np.id ? np : x)));
-            if (np.runId !== null) refreshRun(np.runId);
-            if (PLAN_TERMINAL_STATES.includes(np.state)) setPollPlanIds((ids) => ids.filter((x) => x !== np.id));
-          })
-          .catch(() => { /* 下一轮再试；不因一次抖动停止轮询 */ });
-      }
-    };
-    const timer = setInterval(tick, 1500);
-    return () => clearInterval(timer);
-  }, [pollPlanIds, runs, refreshRun]);
-
-  const makePlan = () => {
-    if (!picked.length) { props.onToast("bad", "导入清单还是空的"); return; }
-    const path = projectPath.trim();
-    if (!path) { props.onToast("bad", "先填 Unity 工程路径"); return; }
-    setPlanBusy(true); setPlanErr(""); setRuns([]); setRunErr(""); setPollPlanIds([]); setAckedJobs({}); setRiskAcks({});
-    // 后端 createImportPlan 只认 unitIds / projectPath / includeSuggested，且一次只能属于同一 item
-    createImportPlans({
-      projectPath: path,
-      unitIds: picked.map((u) => u.unitId),
-      includeSuggested: false,
-    })
-      .then((list) => {
-        setPlans(list);
-        // suggested（或计划项状态就是 suggested）一律不勾选；其余默认勾选
-        const next: Record<string, boolean> = {};
-        for (const p of list) for (const u of p.units) next[p.id + ":" + u.unitId] = !(u.suggested || u.state === "suggested");
-        setChecks(next);
-        const warned = list.filter((p) => !p.precheck.ok).length;
-        props.onToast("ok", plansToastText(list.length, warned));
-      })
-      .catch((e) => { setPlans([]); setPlanErr(describeError(e)); props.onToast("bad", "生成计划失败：" + describeError(e)); })
-      .finally(() => setPlanBusy(false));
-  };
-
-  const doConfirm = async (): Promise<void> => {
-    if (!plans.length) return;
-    const targets = plans
-      .map((p) => ({ plan: p, unitIds: p.units.filter((u) => checks[p.id + ":" + u.unitId]).map((u) => u.unitId) }))
-      .filter((t) => t.unitIds.length > 0);
-    if (!targets.length) { props.onToast("bad", "至少要勾选一个单元"); return; }
-    setPlanBusy(true);
-    const jobs: number[] = [];
-    const failures: string[] = [];
-    // 每个计划**独立** confirm → execute：一个失败不影响其它计划（跨条目建计划时会有多个 PlanView）
-    for (const t of targets) {
-      try {
-        // ① confirm：只做人工确认（suggested → pending、user_confirmed=1），**不执行**
-        const confirmed = await confirmImportPlan(t.plan.id);
-        setPlans((list) => list.map((x) => (x.id === confirmed.plan.id ? confirmed.plan : x)));
-        // ② execute：Job 化执行 → 202 {jobId, planId}（不返回 run，run 由 plan 暴露后再轮询）
-        const ack = await executeImportPlan(t.plan.id);
-        const planId = ack.planId || t.plan.id;
-        if (ack.jobId !== null) {
-          jobs.push(ack.jobId);
-          setAckedJobs((m) => ({ ...m, [planId]: ack.jobId as number }));
-        }
-        setPollPlanIds((ids) => (ids.includes(planId) ? ids : [...ids, planId]));
-        if (ack.runId !== null) refreshRun(ack.runId);
-        // 立刻拉一次计划（可能已经带上 run_id），以后按 1.5s 轮询
-        getImportPlan(planId)
-          .then((np) => {
-            setPlans((list) => list.map((x) => (x.id === np.id ? np : x)));
-            if (np.runId !== null) refreshRun(np.runId);
-          })
-          .catch(() => { /* 轮询里会再试 */ });
-      } catch (e) {
-        failures.push("计划 #" + t.plan.id + "：" + describeError(e));
-      }
-    }
-    setPlanBusy(false);
-    if (failures.length) {
-      props.onToast("bad", failures.length + " / " + targets.length + " 个计划提交失败：" + failures.slice(0, 2).join("；"));
-    } else if (jobs.length) {
-      props.onToast("ok", "已提交执行（job " + jobs.map((n) => "#" + n).join(", ") + "），正在轮询计划/执行状态");
+    const previous = picked.filter((p) => sameSlot(p, unit));
+    if (previous.length) {
+      setConflict({ next: unit, previous });
     } else {
-      props.onToast("ok", "已确认并提交 " + targets.length + " 个计划，正在轮询执行状态");
+      setPicked([...picked, unit]);
+      setConflict(null);
     }
-  };
+  }
 
-  /** failed 才允许重建：按该计划自己的单元重新建一个新计划（旧计划保留为 failed，便于取证）。 */
-  const rebuildPlan = useCallback((p: ImportPlan): void => {
-    if (!canRebuildPlan(p.state)) return;
-    const path = (projectPath.trim() || p.projectPath || "").trim();
-    if (!path) { props.onToast("bad", "先填 Unity 工程路径"); return; }
-    setPlanBusy(true);
-    createImportPlans({ projectPath: path, unitIds: p.units.map((u) => u.unitId), includeSuggested: false })
-      .then((list) => {
-        setPlans((prev) => [...list, ...prev]);
-        setChecks((m) => {
-          const next = { ...m };
-          for (const np of list) for (const u of np.units) next[np.id + ":" + u.unitId] = !(u.suggested || u.state === "suggested");
-          return next;
-        });
-        setRiskAcks((m) => { const next = { ...m }; for (const np of list) delete next[np.id]; return next; });
-        props.onToast("ok", "已重建 " + list.length + " 个计划（旧计划保留为 failed）");
-      })
-      .catch((e) => props.onToast("bad", "重建计划失败：" + describeError(e)))
-      .finally(() => setPlanBusy(false));
-  }, [projectPath, props]);
+  async function inspect() {
+    if (!canInspect) return;
+    setBusy(true); setActionError(""); setRiskAck(false); setPartialAck(false); setBatch(null);
+    try {
+      const result = await createImportPlans({
+        unitIds: picked.map((u) => u.unitId), projectPath: projectPath.trim(), includeSuggested: false,
+      });
+      const selected = new Map(picked.map((u) => [u.unitId, u.itemId]));
+      if (result.plans.some((plan) => !plan.projectPath || normalizePath(plan.projectPath) !== normalizePath(projectPath.trim())
+        || plan.units.some((unit) => selected.get(unit.unitId) !== plan.itemId))) {
+        throw new Error("检查返回的包或工程与导入清单不符，请重新检查。");
+      }
+      const covered = new Set(result.plans.flatMap((p) => p.units.map((u) => u.unitId)));
+      const rejected = new Set(result.errors.map((e) => e.itemId));
+      for (const itemId of new Set(picked.filter((u) => !covered.has(u.unitId)).map((u) => u.itemId))) {
+        if (!rejected.has(itemId)) result.errors.push({ itemId, message: "服务端未返回该素材的完整检查结果" });
+      }
+      setBatch(result); setPage("review");
+    } catch (e) { setActionError(describeError(e)); }
+    finally { setBusy(false); }
+  }
 
-  const toggleCheck = (planId: number, unitId: string) => setChecks((m) => {
-    const k = planId + ":" + unitId;
-    return { ...m, [k]: !m[k] };
-  });
-  const checksOf = (p: ImportPlan): Record<string, boolean> => {
-    const out: Record<string, boolean> = {};
-    for (const u of p.units) out[u.unitId] = !!checks[p.id + ":" + u.unitId];
-    return out;
-  };
-  const currentAvatar = avatars.find((a) => a.id === avatarId) ?? null;
+  const invalidItems = new Set(batch?.errors.map((e) => e.itemId));
+  const readyPlans = batch?.plans.filter((p) => !isBlocked(p) && !invalidItems.has(p.itemId)) ?? [];
+  const blockedCount = (batch?.plans.length ?? 0) - readyPlans.length + (batch?.errors.filter((e) => !batch.plans.some((p) => p.itemId === e.itemId)).length ?? 0);
+  const pickedItemIds = new Set(picked.map((unit) => unit.itemId));
+  const omitted = loadoutPackages.filter((row) => !pickedItemIds.has(row.id));
+  const skippedCount = loadout ? loadout.items.length - new Set(readyPlans.map((plan) => plan.itemId)).size : blockedCount;
+  const wantsRiskAck = readyPlans.some(needsAck);
+  const countToImport = readyPlans.reduce((n, plan) => n + plan.units.length, 0);
+  const canSubmit = !busy && !probing && matchesEditor && countToImport > 0 && (!skippedCount || partialAck) && (!wantsRiskAck || riskAck);
+
+  async function importChecked() {
+    if (!canSubmit) return;
+    setBusy(true); setActionError(""); setSubmitted([]); setSubmitErrors([]);
+    try {
+      const current = await probeUnity();
+      const currentPath = current?.ok ? current.editor?.projectPath : undefined;
+      if (!currentPath || normalizePath(currentPath) !== normalizePath(projectPath.trim())) {
+        setActionError("Unity 当前打开的工程与本次检查的目标不一致。打开目标工程后重新检测，或返回更改工程。");
+        return;
+      }
+      setPage("result");
+      for (const plan of readyPlans) {
+        try {
+          await confirmImportPlan(plan.id, riskAck);
+          const ack = await executeImportPlan(plan.id);
+          if (ack.jobId === null && ack.runId === null) throw new Error("导入接口未返回作业状态，请查看导入记录");
+          setSubmitted((before) => [...before, { ...plan, jobId: ack.jobId, runId: ack.runId }]);
+        } catch (e) {
+          setSubmitErrors((before) => [...before, titleOf(plan.itemId) + "：" + describeError(e)]);
+        }
+      }
+    } finally { setBusy(false); }
+  }
+
+  function backToSelection() {
+    if (submitted.length) {
+      const sent = new Set(submitted.flatMap((plan) => plan.units.map((unit) => unit.unitId)));
+      setPicked((before) => before.filter((unit) => !sent.has(unit.unitId)));
+      setSubmitted([]);
+    }
+    setPage("pick"); setBatch(null); setActionError(""); setPartialAck(false); setRiskAck(false);
+  }
+
+  const groups = useMemo(() => {
+    const byItem = new Map<number, WorkbenchItem[]>();
+    for (const unit of units) {
+      const group = byItem.get(unit.itemId);
+      if (group) group.push(unit);
+      else byItem.set(unit.itemId, [unit]);
+    }
+    return [...byItem.values()];
+  }, [units]);
+
+  const titleOf = (itemId: number | null) => picked.find((u) => u.itemId === itemId)?.title
+    ?? loadout?.items.find((item) => item.id === itemId)?.title
+    ?? (itemId === focus?.itemId ? focus?.title : null) ?? (itemId ? "素材 #" + itemId : "部分素材");
+  const savedProjects = (props.projects ?? []).filter((p) => p.path && normalizePath(p.path) !== normalizePath(editorPath ?? ""));
+  const namedProject = (props.projects ?? []).find((p) => normalizePath(p.path) === normalizePath(projectPath));
+  const projectLabel = targetProject?.name ?? (matchesEditor ? editor?.editor?.projectName : namedProject?.name);
+  const selectedIds = new Set(picked.map((p) => p.unitId));
+  const filteredLoadoutPackages = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return loadoutPackages;
+    return loadoutPackages.flatMap((row) => {
+      if (row.title.toLowerCase().includes(needle)) return [row];
+      const units = row.units.filter((unit) => [unit.packageName, unit.relPath, unit.containerPath]
+        .some((value) => value?.toLowerCase().includes(needle)));
+      return units.length ? [{ ...row, units }] : [];
+    });
+  }, [loadoutPackages, q]);
+  const browserRows = loadout ? filteredLoadoutPackages : groups.map((units) => ({
+    id: units[0]!.itemId, title: units[0]!.title, units,
+  }));
+  const canInspect = !busy && picked.length > 0 && !!projectPath.trim() && !conflict
+    && (!loadout || (!loading && !analysisBusy && !analysis));
 
   return (
-    <div className="backdrop" onClick={props.onClose}>
-      <div className="drawer" role="dialog" aria-label="Avatar 素材工作台" onClick={(e) => e.stopPropagation()}>
+    <div className="backdrop" onClick={() => { if (!busy) props.onClose(); }}>
+      <div className="drawer wb-drawer" role="dialog" aria-label="素材工作台" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-head">
-          <h3>Avatar 素材工作台</h3>
-          <span className="hint">选 Avatar → 看证据/策略 → 进导入清单 → 生成计划 → 确认执行</span>
-          <span className="spacer" />
-          <button className="btn tiny" onClick={loadAvatars} title="重新拉取 Avatar 与计数">刷新</button>
-          <button className="btn" onClick={props.onClose}>关闭</button>
+          <h3>{loadout ? "导入搭配 · " + loadout.name
+            : focusOnly && focus ? "导入到 Unity · " + (focus.title || "素材 #" + focus.itemId) : "素材工作台"}</h3>
+          <button className="btn tiny" disabled={busy} onClick={() => page === "history" ? backToSelection() : setPage("history")}>
+            {page === "history" ? "返回选包" : "导入记录"}
+          </button>
+          <button className="btn" disabled={busy} onClick={props.onClose}>{loadout ? "返回搭配" : "关闭"}</button>
         </div>
 
-        <div className="drawer-body">
-          {/* 左：Avatar + 筛选 + 素材卡片 */}
-          <div className="left">
-            {focus && (
-              <div className="notice" data-workbench-focus="1">
-                <div className="row" style={{ gap: "6px", alignItems: "flex-start" }}>
-                  <b style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    来自条目「{focus.title?.trim() || "#" + focus.itemId}」
-                  </b>
-                  <span className="spacer" />
-                  <button className="btn tiny" onClick={() => setFocusOnly((v) => !v)}>
-                    {focusOnly ? "看全部 Avatar 的单元" : "只看这个条目"}
-                  </button>
-                </div>
-                <div className="hint" style={{ marginTop: "4px" }}>
-                  {focusMap ? focusNotice(focus, focusMap) : "正在按 assetId + relPath 把详情页勾选的包对应到单元…"}
-                </div>
+        {page !== "history" && <div className="wb-project">
+          <div className="row wrap">
+            <b>目标工程</b>
+            <Badge tone={matchesEditor ? "ok" : "warn"}>
+              {probing ? "正在检测 Unity" : matchesEditor ? "已连接" : editorPath ? "当前打开的是另一个工程" : "Unity 未连接"}
+            </Badge>
+            <span className="spacer" />
+            <button className="btn tiny" disabled={probing || busy} onClick={() => void probeUnity()}>重新检测</button>
+          </div>
+          {page === "pick" && !targetProject ? (
+            <>
+              <select aria-label="选择 Unity 工程" value={editorPath && matchesEditor ? editorPath : savedProjects.some((p) => p.path === projectPath) ? projectPath : projectPath ? "_custom" : ""}
+                disabled={busy} onChange={(e) => setProjectPath(e.target.value === "_custom" ? "" : e.target.value)}>
+                <option value="">选择或打开 Unity 工程</option>
+                {editorPath && <option value={editorPath}>当前打开 · {editor?.editor?.projectName || editorPath}</option>}
+                {savedProjects.map((p) => <option key={p.id} value={p.path}>{p.name}</option>)}
+                {projectPath && !matchesEditor && !savedProjects.some((p) => p.path === projectPath) && <option value="_custom">手动输入的工程</option>}
+              </select>
+              <details><summary>手动输入工程路径</summary>
+                <input type="text" aria-label="Unity 工程路径" value={projectPath} disabled={busy} onChange={(e) => setProjectPath(e.target.value)} />
+              </details>
+              {projectPath && <div className="hint wb-path">{projectPath}</div>}
+            </>
+          ) : <div className="wb-path">{projectLabel && <b>{projectLabel} · </b>}{projectPath}</div>}
+          {page === "pick" && targetProject && <div className="hint">可在搭配清单切换目标工程。</div>}
+          {page !== "result" && !matchesEditor && !probing && (
+            <div className="hint">打开目标 Unity 工程并连接 MCP for Unity，连接后才能执行导入。</div>
+          )}
+          {!!editor?.dropped && <div className="notice">已忽略 {editor.dropped} 个非法或未授权的 Unity MCP 地址。</div>}
+        </div>}
+
+        {page === "pick" && <>
+          <div className="wb-main">
+            <div className="wb-browser">
+              <div className="row wrap">
+                <b>{loadout ? `本次搭配 · ${loadout.items.length} 项素材` : focusOnly ? "选择本条的包" : "选择素材"}</b>
+                <span className="spacer" />
+                {focus && <button className="btn tiny" disabled={busy} onClick={() => {
+                  setFocusOnly(!focusOnly); setQuery(""); setOffset(0);
+                }}>{focusOnly ? "浏览全部素材" : "返回本条素材"}</button>}
+                {loadout && <button className="btn tiny" disabled={busy || loading || analysisBusy || !!analysis}
+                  onClick={() => setRevision((n) => n + 1)}>刷新候选包</button>}
               </div>
-            )}
-            <div className="hint">① 选择 Avatar（括号内是工作台计数）</div>
-            {avatarsErr && <div className="err">工作台接口不可用：{avatarsErr}</div>}
-            {avatarsLoading && !avatars.length && <div className="hint"><Spinner /> 载入 Avatar…</div>}
-            <div className="preview-list" style={{ maxHeight: "26vh" }}>
-              {avatars.map((a) => (
-                <button
-                  key={a.id}
-                  className={"preview-row" + (a.id === avatarId ? " on" : "")}
-                  onClick={() => { setAvatarId(a.id); setFocusOnly(false); }}
-                  title={focusOnly ? "选中这个 Avatar 并切回它的单元列表" : undefined}
-                >
-                  <span className="row" style={{ gap: "6px" }}>
-                    <b>{a.name}</b>
-                    <Badge tone={a.owned ? "ok" : "muted"}>{a.owned ? "已拥有" : "未拥有"}</Badge>
-                    <span className="spacer" />
-                    <span className="hint">{a.counts.total} 单元</span>
-                  </span>
-                  <span className="hint">
-                    已确认 {a.counts.confirmed} · 可能 {a.counts.probable} · 未知 {a.counts.unknown} · 整包 {a.counts.mixed}
-                  </span>
-                </button>
-              ))}
-              {!avatarsLoading && !avatars.length && !avatarsErr && <div className="hint" style={{ padding: "8px" }}>没有可选的 Avatar</div>}
-              {avatarFallback && (
-                <div className="notice">
-                  Avatar 列表为空：已用 Unity 工程里认出的 <b>@{projectAvatar?.name ?? avatars[0]?.name ?? "?"}</b> 兜底并选中；
-                  点「扫描全部结构」补齐库里的证据计数。
+              <div className="row wrap wb-filter">
+                <input type="search" aria-label="搜索素材或包名" placeholder="搜索素材或包名" value={query} disabled={busy}
+                  onChange={(e) => { setQuery(e.target.value); setOffset(0); }} />
+                {!focusOnly && !loadout && <select aria-label="按 Avatar 筛选" value={avatarId ?? ""} disabled={busy}
+                  onChange={(e) => { setAvatarId(e.target.value ? Number(e.target.value) : null); setOffset(0); }}>
+                  <option value="">全部 Avatar · 含通用素材</option>
+                  {avatars.map((avatar) => <option key={avatar.id} value={avatar.id}>{avatar.name}</option>)}
+                </select>}
+              </div>
+              {focusOnly && focus && (
+                <div className="row wrap">
+                  {(!units.some((u) => u.importable) && !q) ? (
+                    <button className="btn" onClick={() => void launchAnalysis(focus.itemId)} disabled={busy || loading || analysisBusy || !!analysis}>分析本条</button>
+                  ) : (
+                    <details>
+                      <summary>结构分析</summary>
+                      <button className="btn tiny" onClick={() => void launchAnalysis(focus.itemId)} disabled={busy || analysisBusy || !!analysis}>重新分析本条</button>
+                    </details>
+                  )}
+                  <span className="hint" role="status">{analysisStatus}</span>
                 </div>
               )}
-            </div>
-
-            <div className="row wrap" style={{ gap: "5px" }}>
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="关键词：名称 / 包名" style={{ flex: "1 1 120px" }} />
-              <select value={itemStatus} onChange={(e) => setItemStatus(e.target.value)} title="条目状态（后端 itemStatus）" style={{ width: "110px" }}>
-                <option value="">全部条目</option>
-                <option value="inbox">待整理</option>
-                <option value="active">在库</option>
-                <option value="archived">归档</option>
-              </select>
-              <select value={level} onChange={(e) => setLevel(e.target.value)} title="证据级别" style={{ width: "104px" }}>
-                <option value="">全部级别</option>
-                <option value="confirmed">已确认</option>
-                <option value="probable">可能</option>
-                <option value="unknown">未知</option>
-              </select>
-              <select value={policy} onChange={(e) => setPolicy(e.target.value)} title="打包策略" style={{ width: "104px" }}>
-                <option value="">全部策略</option>
-                <option value="single_unitypackage">独立包</option>
-                <option value="mixed_unitypackage">混合整包</option>
-                <option value="unknown_structure">结构未知</option>
-              </select>
-              <label className="chk"><input type="checkbox" checked={confirmedOnly} onChange={(e) => setConfirmedOnly(e.target.checked)} />仅已确认</label>
-            </div>
-
-            <div className="row" style={{ gap: "6px" }}>
-              <span className="hint">② 素材单元 {itemsTotal ? "（" + items.length + " / " + itemsTotal + "）" : ""}</span>
-              <span className="spacer" />
-              {itemsLoading && <Spinner />}
-              <button
-                className="btn tiny"
-                onClick={scanAll}
-                disabled={scanAllBusy || scanJob !== null}
-                title="POST /api/workbench/scan-all {onlyMissing:true} —— 只给还没分析过的条目补结构分析"
-              >
-                {scanJob !== null ? "扫描中…" : SCAN_ALL_LABEL}
-              </button>
-              <button className="btn tiny" onClick={loadItems} disabled={avatarId === null && !(focusOnly && focus)}>刷新</button>
-            </div>
-            {itemsErr && <div className="err">素材接口不可用：{itemsErr}</div>}
-            <div style={{ display: "flex", flexDirection: "column", gap: "5px", overflow: "auto", minHeight: 0 }}>
-              {items.map((it) => (
-                <ItemRow
-                  key={it.unitId}
-                  item={it}
-                  picked={picked.some((p) => p.unitId === it.unitId)}
-                  onToggle={() => setPicked((p) => togglePick(p, it))}
-                />
-              ))}
-              {!itemsLoading && !items.length && !itemsErr && (
-                focusOnly && focus
-                  ? <div className="hint" style={{ padding: "10px" }}>
-                      条目「{focus.title?.trim() || "#" + focus.itemId}」还没有已分析的素材单元；可点上面「扫描全部结构」补齐（只补没分析过的条目），或切回「看全部 Avatar 的单元」。
+              {!focusOnly && !loadout && <details>
+                <summary>批量结构分析</summary>
+                <div className="row wrap">
+                  <button className="btn tiny" onClick={() => void launchAnalysis()} disabled={busy || analysisBusy || !!analysis}>补齐全库结构</button>
+                  <span className="hint" role="status">{analysisStatus || "仅分析尚无结构结果的素材。"}</span>
+                </div>
+              </details>}
+              {loadout && analysisStatus && <div className="hint" role="status">{analysisStatus}</div>}
+              {listError && <div className="err">{listError} <button className="btn tiny" onClick={() => setRevision((n) => n + 1)}>重试</button></div>}
+              {loading && <div className="hint"><Spinner /> 加载素材…</div>}
+              {!loading && !listError && !browserRows.length && <div className="hint">
+                {q ? "没有符合搜索条件的包。" : focusOnly ? "分析这条素材后，可在这里选择包。" : "这里显示已分析的包。也可以从素材详情进入，只分析那条素材。"}
+              </div>}
+              {!loading && browserRows.map((row: LoadoutPackages) => {
+                const group = row.units;
+                const first = group[0];
+                const candidates = group.filter((unit) => unit.importable).length;
+                return <details className="wb-group" key={row.id} open={focusOnly || !!loadout || undefined}>
+                  <summary>
+                    {first?.coverImageId && <img src={mediaUrl(first.coverImageId, 96)} alt="" loading="lazy" />}
+                    <b>{row.title}</b>
+                    {row.notice ? <Badge tone="warn">{row.notice}</Badge> : <span className="hint">
+                      {group.some((u) => selectedIds.has(u.unitId)) && `${group.filter((u) => selectedIds.has(u.unitId)).length} 已选 · `}
+                      {loadout && candidates > 1 ? `${candidates} 个候选包` : `${group.length} 包`}
+                    </span>}
+                  </summary>
+                  {row.canAnalyze && <div className="wb-unit">
+                    <button className="btn" disabled={busy || analysisBusy || !!analysis} onClick={() => void launchAnalysis(row.id)}>分析本条</button>
+                  </div>}
+                  {group.map((unit) => (
+                    <div className="wb-unit" key={unit.unitId}>
+                      <label className="wb-unit-label">
+                        <input type="checkbox" checked={selectedIds.has(unit.unitId)} disabled={busy || !unit.importable} onChange={() => changePick(unit)} />
+                        <span>
+                          <b>{packageTitle(unit)}</b>
+                          {unit.relPath && unit.relPath !== packageTitle(unit) && <span className="hint wb-path">{unit.relPath}</span>}
+                        </span>
+                        {!unit.importable ? <Badge tone="warn">{unit.assetStatus === "missing" ? "文件缺失" : "无法导入"}</Badge>
+                          : unit.mixed ? <Badge tone="warn">混合整包</Badge>
+                          : <Badge tone={LEVEL_TONE[unit.level]}>{LEVEL_LABEL[unit.level] ?? "待核对"}</Badge>}
+                      </label>
+                      {(unit.avatarMatches?.length || unit.evidence || unit.error) ? <details className="wb-unit-evidence">
+                        <summary>适配与来源</summary>
+                        {unit.avatarMatches?.map((avatar) => <div className="hint" key={avatar.id}>{avatar.name} · {LEVEL_LABEL[avatar.level] ?? avatar.level}</div>)}
+                        {unit.evidence?.summary && <div className="hint wb-path">{unit.evidence.summary}</div>}
+                        {unit.containerPath && <div className="hint wb-path">{shortenPath(unit.containerPath)}</div>}
+                        {unit.error && <div className="err-text">{unit.error.message}</div>}
+                      </details> : null}
                     </div>
-                  : avatarId === null
-                  ? <div className="hint" style={{ padding: "10px" }}>先选一个 Avatar</div>
-                  : <UnitsEmptyState
-                      scanning={scanAllBusy || scanJob !== null}
-                      onScanAll={scanAll}
-                      avatarName={currentAvatar?.name ?? null}
-                      fallbackFromUnity={avatarFallback}
-                    />
-              )}
+                  ))}
+                </details>;
+              })}
+              {!focusOnly && (offset > 0 || hasMore) && <div className="row">
+                <button className="btn tiny" disabled={busy || loading || !offset} onClick={() => setOffset(offset - PAGE_SIZE)}>上一页</button>
+                <button className="btn tiny" disabled={busy || loading || !hasMore} onClick={() => setOffset(offset + PAGE_SIZE)}>下一页</button>
+              </div>}
+            </div>
+
+            <div className="section wb-selection">
+              <div className="row">
+                <b>导入清单 · {picked.length} 个包</b><span className="spacer" />
+                {picked.length > 0 && <button className="btn tiny" disabled={busy || (!!loadout && loading)} onClick={() => {
+                  setPicked([]); setConflict(null); preferenceApplied.current = true;
+                }}>清空</button>}
+              </div>
+              {picked.length === 0 && <div className="hint">展开素材，勾选要导入的包。</div>}
+              {picked.map((unit) => <div className="row wb-package-note" key={unit.unitId}>
+                <span><b>{packageTitle(unit)}</b><span className="hint">{unit.title}</span></span>
+                <button className="btn tiny" disabled={busy} onClick={() => changePick(unit)}>移除</button>
+              </div>)}
+              {conflict && <div className="notice">
+                <b>{packageTitle(conflict.next)} 与已选包冲突</b>
+                {conflict.previous.map((p) => <div key={p.unitId}>{packageTitle(p)}</div>)}
+                <div className="row wrap">
+                  <button className="btn tiny" onClick={() => setConflict(null)}>保留原选择</button>
+                  <button className="btn tiny" onClick={() => {
+                    const displaced = new Set(conflict.previous.map((u) => u.unitId));
+                    setPicked([...picked.filter((u) => !displaced.has(u.unitId)), conflict.next]); setConflict(null);
+                  }}>替换为新选择</button>
+                </div>
+              </div>}
             </div>
           </div>
-
-          {/* 右：导入清单 / Unity 工程 / 计划 / 执行 */}
-          <div className="right">
-            <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-              <div className="row" style={{ gap: "6px" }}>
-                <b>导入清单（{picked.length}）</b>
-                {currentAvatar && <span className="hint">→ @{currentAvatar.name}</span>}
-                {anyMixed(picked) && <Badge tone="bad">含整包风险</Badge>}
-                <span className="spacer" />
-                {picked.length > 0 && <button className="btn tiny" onClick={() => setPicked([])}>清空</button>}
-              </div>
-              {picked.length === 0 && <div className="hint">从左边的素材卡片点「加入 →」；同一压缩包里的单元互斥，选一个会自动替换同包的另一个。</div>}
-              {picked.map((u) => (
-                <div className="row" key={u.unitId} style={{ gap: "6px", alignItems: "flex-start" }}>
-                  <Badge tone={LEVEL_TONE[u.level]}>{LEVEL_LABEL[u.level] ?? u.level}</Badge>
-                  <span style={{ minWidth: 0, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.packageName ?? u.title}>{u.title}</span>
-                  {u.mixed && <Badge tone="bad">整包</Badge>}
-                  <button className="btn tiny ghost" onClick={() => setPicked((p) => togglePick(p, u))}>移除</button>
-                </div>
-              ))}
-              {anyMixed(picked) && <div className="err">{MIXED_WARNING}</div>}
-            </div>
-
-            <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-              <div className="row" style={{ gap: "6px" }}>
-                <b>③ Unity 工程</b>
-                {probing && <Spinner />}
-                {projectName && <span className="hint">已探测：{projectName}</span>}
-                <span className="spacer" />
-                <button className="btn tiny" onClick={() => probeUnity(true)} disabled={probing}>{probing ? "探测中…" : "探测"}</button>
-              </div>
-              <input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} placeholder="工程路径，如 E:/unity/MyAvatarProject" />
-              <div className="row" style={{ gap: "6px" }}>
-                <button className="btn primary" onClick={makePlan} disabled={planBusy || !picked.length || !projectPath.trim()}>
-                  {planBusy ? <Spinner /> : null}生成导入计划
-                </button>
-                <span className="hint">只读预检，不动 Unity</span>
-              </div>
-              {planErr && <div className="err">{planErr}</div>}
-            </div>
-
-            <PlansSection
-              plans={plans}
-              checksFor={checksOf}
-              onToggle={toggleCheck}
-              onConfirm={() => void doConfirm()}
-              busy={planBusy}
-              ackedJobs={ackedJobs}
-              riskAcks={riskAcks}
-              onRiskAck={(id, v) => setRiskAcks((m) => ({ ...m, [id]: v }))}
-              onRebuild={rebuildPlan}
-            />
-
-            {(runs.length > 0 || runErr) && (
-              <div className="section" style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                <div className="row" style={{ gap: "6px" }}>
-                  <b>⑤ 执行状态</b>
-                  {busyRun && <Spinner />}
-                  <span className="spacer" />
-                </div>
-                {runErr && <div className="err">{runErr}</div>}
-                {runs.map((run) => <RunCard key={run.id} run={run} />)}
-              </div>
-            )}
+          <div className="wb-footer">
+            {actionError && <div className="err" role="alert">{actionError}</div>}
+            <button className="btn primary" disabled={!canInspect} onClick={() => void inspect()}>
+              {busy ? "正在检查…" : "检查导入"}
+            </button>
           </div>
-        </div>
+        </>}
+
+        {page === "review" && batch && <>
+          <div className="wb-scroll">
+            <h4>核对本次导入</h4>
+            {omitted.length > 0 && <div className="notice">
+              <b>本次未选包的素材</b>
+              {omitted.map((row) => <div key={row.id}>{row.title} · {row.notice ?? "未选择导入包"}</div>)}
+            </div>}
+            {batch.errors.map((error, i) => <div className="err" key={i}>{titleOf(error.itemId)}：{error.message}</div>)}
+            {batch.plans.map((plan) => (
+              <section className="section" key={plan.id}>
+                <b>{titleOf(plan.itemId)}</b>
+                <RiskDetails plan={plan} />
+              </section>
+            ))}
+          </div>
+          <div className="wb-footer">
+            {actionError && <div className="err" role="alert">{actionError}</div>}
+            {skippedCount > 0 && countToImport > 0 && <label className="chk">
+              <input type="checkbox" checked={partialAck} disabled={busy} onChange={(e) => setPartialAck(e.target.checked)} />
+              {loadout ? `确认跳过 ${skippedCount} 项素材，只导入通过检查的已选包` : "跳过受阻的素材，只导入下方数量所示的包"}
+            </label>}
+            {wantsRiskAck && <label className="chk">
+              <input type="checkbox" checked={riskAck} disabled={busy} onChange={(e) => setRiskAck(e.target.checked)} />
+              我已核对风险提示，允许导入勾选的包（混合包会整包导入）
+            </label>}
+            <div className="row wrap">
+              <button className="btn" disabled={busy} onClick={backToSelection}>返回调整包或工程</button>
+              <button className="btn primary" disabled={!canSubmit} onClick={() => void importChecked()}>
+                {busy ? "正在提交…" : countToImport ? "确认导入 " + countToImport + " 个包" : "没有可导入的包"}
+              </button>
+            </div>
+          </div>
+        </>}
+
+        {(page === "result" || page === "history") && <div className="wb-scroll">
+          <h4>{page === "result" ? "本次导入结果" : focusOnly ? "本条的最近导入记录" : "最近导入记录"}</h4>
+          {page === "result" && skippedCount > 0 && <div className="notice">本次跳过 {skippedCount} 项素材。</div>}
+          {page === "result" && busy && <div className="hint"><Spinner /> 正在提交导入作业…</div>}
+          {page === "result" && submitErrors.map((error, i) => <div className="err" key={i}>{error}</div>)}
+          {page === "history" && historyError && <div className="err">{historyError}</div>}
+          {page === "history" && !history.length && !historyError && <div className="hint">暂无导入记录。</div>}
+          {(page === "result" ? submitted : history).map((plan) => <ImportResult key={plan.id} plan={plan} />)}
+          {page === "result" && <button className="btn" disabled={busy} onClick={backToSelection}>返回选包</button>}
+        </div>}
       </div>
     </div>
   );

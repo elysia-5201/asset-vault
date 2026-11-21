@@ -10,9 +10,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { openTempDb, addRoot, addItem, addAsset, count, NOW } from "../schema/_db";
 import { Repo } from "../../apps/server/src/db/repo";
 import { normalizePath } from "../../packages/core/src/pathnorm";
@@ -38,6 +38,57 @@ test("files 形状：目录/缺 expected 拒绝，重复路径去重", () => {
   assert.equal(r.jobIds.length, 1); assert.deepEqual(r.duplicates, [f]); assert.equal(r.legacy, false);
   assert.deepEqual(JSON.parse(repo.getJob(r.jobIds[0])!.payload!).expected, exp);
   rmSync(dir, { recursive: true, force: true }); t.close();
+});
+
+test("copy destination and explicit BOOTH link are bound to the same accepted-file job", async () => {
+  const t = openTempDb();
+  const repo = new Repo(t.db);
+  const dir = mkdtempSync(join(tmpdir(), "av-import-dest-"));
+  try {
+    const destination = join(dir, "library");
+    mkdirSync(destination);
+    const file = (name: string, bytes: string) => {
+      const path = join(dir, name);
+      writeFileSync(path, bytes);
+      const info = statSync(path);
+      return { path, expected: { size: info.size, mtime: info.mtime.toISOString() } };
+    };
+    const files = [file("Body.zip", "body"), file("Face.zip", "face")];
+    assert.throws(() => createImportPathJobs({ repo }, { files, destination, boothUrl: "https://booth.pm/downloadables/12345" }), /BOOTH/);
+    assert.throws(() => createImportPathJobs({ repo }, { files, destination: join(dir, "absent") }), /导入目录/);
+    assert.equal(count(t.db, "jobs"), 0);
+    assert.throws(() => createImportPathJobs({ repo }, { files: [files[0], { ...files[1], expected: undefined } as any], destination }), /expected/);
+    assert.equal(count(t.db, "jobs"), 0, "a bad second file cannot leave the first job queued");
+
+    const deps = { repo, media: {} as any, booth: { fetchItem: async () => { throw new Error("offline fixture"); } } as any, log: () => {} };
+    const batch = { files, destination, boothUrl: "https://example.booth.pm/items/9081929" };
+    const accepted = createImportPathJobs({ repo }, batch);
+    for (const id of accepted.jobIds) {
+      await runJob(deps, id);
+      assert.equal(repo.getJob(id)?.state, "done");
+    }
+    const item = repo.getItemBySource("booth", "9081929")!;
+    assert.ok(item);
+    assert.equal(item.source_url, "https://booth.pm/ja/items/9081929");
+    assert.equal(count(t.db, "items"), 1);
+    assert.equal(count(t.db, "assets"), 2);
+    assert.ok(existsSync(files[0].path));
+    assert.equal(readFileSync(join(destination, "Body.zip"), "utf8"), "body");
+    const importedFace = repo.listAssets(item.id).find((asset) => basename(asset.path) === "Face.zip");
+    assert.ok(importedFace);
+    assert.equal(importedFace.path_norm, normalizePath(join(destination, "Face.zip")));
+    assert.equal(statSync(importedFace.path).ino, statSync(join(destination, "Face.zip")).ino);
+    assert.equal(repo.getAssetByPathNorm(normalizePath(files[1].path)), null);
+
+    const changed = file("Face.zip", "different");
+    const conflict = createImportPathJobs({ repo }, { ...batch, files: [changed] }).jobIds[0];
+    await runJob(deps, conflict);
+    assert.equal(repo.getJob(conflict)?.state, "failed");
+    assert.equal(readFileSync(join(destination, "Face.zip"), "utf8"), "face");
+  } finally {
+    t.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("expected 不匹配 → PRECHECK_STALE；路径占用 → 409；shouldSkip 只在 linked 跨 owner 时 true", async () => {

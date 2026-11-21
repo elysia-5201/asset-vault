@@ -83,4 +83,21 @@ describe("POST /api/import-plans 分组", () => {
     const badPlans = (t.db.prepare("SELECT COUNT(*) c FROM import_plans WHERE item_id=?").get(bad.itemId) as any).c;
     assert.equal(badPlans, 0, "失败组不得留下半成品计划");
   });
+
+  test("已标记缺失的素材仍阻断，并可从条目历史读取", async () => {
+    const missing = unitOf("missing");
+    t.db.prepare("UPDATE assets SET status='missing' WHERE id=?").run(missing.assetId);
+    const server = app();
+    const units = await server.inject({ url: "/api/workbench/units?q=missing" });
+    assert.deepEqual(units.json().map((unit: any) => [unit.id, unit.importable, unit.asset.status]), [[missing.unitId, false, "missing"]]);
+    const checked = await server.inject({ method: "POST", url: "/api/import-plans", payload: { unitIds: [missing.unitId], projectPath: dir } });
+    assert.equal(checked.statusCode, 201);
+    const planId = checked.json().plan.id;
+    assert.equal(checked.json().plan.status, "blocked");
+    const confirmation = await server.inject({ method: "POST", url: "/api/import-plans/" + planId + "/confirm", payload: { riskAck: true } });
+    assert.equal(confirmation.statusCode, 409);
+    const history = await server.inject({ url: "/api/import-plans?itemId=" + missing.itemId });
+    assert.deepEqual(history.json().plans.map((view: any) => [view.plan.id, view.itemTitle, view.plan.status]), [[planId, "missing", "blocked"]]);
+    await server.close();
+  });
 });

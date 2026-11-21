@@ -1,41 +1,68 @@
 import { useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
+import { createPortal } from "react-dom";
 import type { BoothItemMeta } from "@core/contracts";
 import {
   addAssetWithExpected, boothPeek, commitStage, describeError, importAcceptedFiles, importUrl, listItems,
-  precheckPaths, scan, scanDryRun, stageDownload, type StageDownloadResponse,
+  precheckPaths, stageDownload, type StageDownloadResponse,
 } from "../api";
-import type { BoothPeekResponse, LibraryRootRow, PrecheckResponse, PrecheckResult, ScanPlanItem, ViewMode } from "../types";
+import type { BoothPeekResponse, LibraryRootRow, PrecheckResponse, PrecheckResult, ViewMode } from "../types";
 import {
   acceptedFileOf, expectedOf, pathCollisionText, summaryLabel, summaryPriority, versionCandidateText, warningText,
 } from "../precheck-view";
-import { looksLikeBoothUrl, splitPaths, uriToPath } from "../util";
+import { looksLikeBoothUrl } from "../util";
+import {
+  createGateLifecycle, createPrecheckGate, mergePathDraft, pathsFromFileList, pickNextBatch, runGuarded,
+  shouldAcceptExternalBatch, splitDraftPaths, type ExternalBatch,
+} from "../file-intake";
 import { Badge, Section, Spinner } from "./ui";
+
+/** toast 里展示非法草稿行：截断，避免长行撑爆提示。 */
+function shortText(s: string, n = 40): string {
+  const t = String(s ?? "");
+  return t.length > n ? t.slice(0, n) + "…" : t;
+}
+
+const LAST_DESTINATION = "av.localImportDestination";
+function lastDestination(): string {
+  try { return localStorage.getItem(LAST_DESTINATION) ?? ""; } catch { return ""; }
+}
 
 export function ImportPanel(props: {
   roots: LibraryRootRow[];
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
   onJobsChanged: () => void;
   onDataChanged: () => void;
+  onOpenScan: () => void;
   mode: ViewMode;
   /** 路径冲突行的「去合并条目…」：打开既有条目（合并入口在 ItemDetail）。未传时按钮禁用并说明。 */
   onOpenItem?: (itemId: number) => void;
+  /** 全局拖入/粘贴收集到的批次（App 级 GlobalDrop 注入，带单调 id）；消费后按 id 回调。 */
+  externalBatches?: ExternalBatch[];
+  onExternalPathsConsumed?: (id: number) => void;
 }) {
   const [url, setUrl] = useState("");
   const [peek, setPeek] = useState<BoothPeekResponse | null>(null);
   const [peeking, setPeeking] = useState(false);
   const [paths, setPaths] = useState("");
-  const [rootId, setRootId] = useState<number | "">(props.roots[0]?.id ?? "");
-  const [scanPath, setScanPath] = useState("");
-  const [deep, setDeep] = useState(true);
+  // 同步镜像：外部批次注入时要读「最新草稿」，不能读渲染闭包里的旧值。
+  const pathsRef = useRef("");
+  const updatePaths = (fn: (prev: string) => string) => {
+    setPaths((prev) => { const next = fn(prev); pathsRef.current = next; return next; });
+  };
   const [hot, setHot] = useState(false);
   const [busy, setBusy] = useState("");
-  const [plans, setPlans] = useState<ScanPlanItem[] | null>(null);
   // 预检卡：逐行选择（默认勾选有 expected 且无路径冲突的行），跳过只影响本次提交。
   const [precheck, setPrecheck] = useState<PrecheckResponse | null>(null);
   const [prechecking, setPrechecking] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [skipped, setSkipped] = useState<Record<string, boolean>>({});
   const [importing, setImporting] = useState(false);
+  const [dropDialog, setDropDialog] = useState(false);
+  const [destinationMode, setDestinationMode] = useState<"in-place" | "copy">("in-place");
+  const [destination, setDestination] = useState("");
+  const [boothLink, setBoothLink] = useState("");
+  const [dropError, setDropError] = useState("");
+  const dropRequest = useRef(0);
   // 下载：固定 stage=true，完成后只展示预检卡，由用户 import/skip 才 commit。
   const [dlUrl, setDlUrl] = useState("");
   const [dlItemId, setDlItemId] = useState("");
@@ -50,11 +77,6 @@ export function ImportPanel(props: {
     busy: boolean; err: string; done: { itemId: number; assetIds: number[] } | null;
   } | null>(null);
 
-  // roots 是异步加载的：挂载时 props.roots 还是空数组，必须在到达后补选默认根，
-  // 否则 scan/dryRun 会因缺 rootId 被服务端拒绝（INVALID_INPUT：需要 rootId 或 path）。
-  useEffect(() => {
-    if (rootId === "" && props.roots.length) setRootId(props.roots[0].id);
-  }, [props.roots, rootId]);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const doPeek = () => {
@@ -77,28 +99,43 @@ export function ImportPanel(props: {
       .finally(() => setBusy(""));
   };
 
-  const doScan = () => {
-    setBusy("scan");
-    scan({ rootId: rootId === "" ? undefined : rootId, path: scanPath.trim() || undefined, deep })
-      .then((r) => { props.onToast("ok", "已起 scan 作业 #" + r.jobId); props.onJobsChanged(); })
-      .catch((e) => props.onToast("bad", describeError(e)))
-      .finally(() => setBusy(""));
-  };
+  // 预检在飞控制（F3）：begin 同步挡同 tick 第二批；cancel 是真实可达的失效点（取消后迟到响应不回写）。
+  // HB1：每次挂载用 createGateLifecycle 建一个**本次专属** gate，cleanup 只 dispose 自己捕获的那个——
+  // StrictMode 的 setup→cleanup→setup 因此不会把第二次 setup 的新 gate 一起废掉（dev 下预检不再永久死）。
+  const gateRef = useRef(createPrecheckGate());
+  useEffect(() => {
+    const life = createGateLifecycle();
+    gateRef.current = life.gate;
+    return () => { life.dispose(); };
+  }, []);
 
-  const doDryRun = () => {
-    setBusy("dry");
-    scanDryRun({ rootId: rootId === "" ? undefined : rootId, path: scanPath.trim() || undefined, deep })
-      .then((r) => { setPlans(r.items); props.onToast("ok", "dryRun 预览：" + r.items.length + " 条待入库（未落库）"); })
-      .catch((e) => props.onToast("bad", describeError(e)))
-      .finally(() => setBusy(""));
-  };
-
-  const doPrecheck = () => {
-    const list = splitPaths(paths);
-    if (!list.length) { props.onToast("bad", "没有可预检的路径"); return; }
+  /**
+   * 预检（H1）：草稿原样保留，但**只把严格绝对路径**送 API。
+   * 环境变量占位（%VAR%）、相对路径、普通文字、畸形 URI 留在草稿里，并给出准确反馈（不假称已预检）。
+   */
+  const doPrecheck = (draftOverride?: string, fromDrop = false) => {
+    const draft = draftOverride ?? pathsRef.current;
+    const { valid, invalid } = splitDraftPaths(draft);
+    if (!valid.length) {
+      props.onToast("bad", invalid.length
+        ? "草稿里没有可预检的绝对路径（" + invalid.length + " 行不是绝对路径，例如：" + shortText(invalid[0]) + "）"
+        : "没有可预检的路径");
+      return;
+    }
+    if (gateRef.current.isBusy()) { props.onToast("info", "正在预检，稍后再试"); return; }
+    const skippedNote = invalid.length ? "（已跳过 " + invalid.length + " 行非绝对路径，草稿保留）" : "";
     setPrechecking(true); setPrecheck(null); setSelected({}); setSkipped({});
-    precheckPaths({ paths: list })
-      .then((r) => {
+    setDropDialog(fromDrop);
+    if (fromDrop) {
+      dropRequest.current++;
+      const previous = lastDestination();
+      setDestination(previous);
+      setDestinationMode(previous ? "copy" : "in-place");
+      setBoothLink("");
+      setDropError("");
+    }
+    const gen = runGuarded(gateRef.current, () => precheckPaths({ paths: valid }), {
+      onValue: (r) => {
         setPrecheck(r);
         // 默认只勾选「有 expected、无路径冲突、且不是精确重复」的行：
         // exact 已确认在库里，不默认再登记一次（要导入必须用户自己勾）。
@@ -107,10 +144,24 @@ export function ImportPanel(props: {
           init[row.pathNorm] = expectedOf(row) !== null && row.match.pathCollision === null && row.summary !== "exact";
         }
         setSelected(init);
-        props.onToast("ok", "预检完成：" + r.results.length + " 个文件" + (r.budget.truncated ? "（预算不足，已截断）" : ""));
-      })
-      .catch((e) => props.onToast("bad", describeError(e)))
-      .finally(() => setPrechecking(false));
+        if (!fromDrop) props.onToast("ok", "预检完成：" + r.results.length + " 个文件" + (r.budget.truncated ? "（预算不足，已截断）" : "") + skippedNote);
+      },
+      onError: (e) => fromDrop ? setDropError(describeError(e)) : props.onToast("bad", describeError(e)),
+      onSettled: () => setPrechecking(false),
+    });
+    if (gen === null) { setPrechecking(false); props.onToast("info", "正在预检，稍后再试"); }
+  };
+
+  /** 取消当前预检（含待确认卡）：使在飞响应失效，并清掉勾选/跳过，让新批次可接收。 */
+  const cancelPrecheck = () => {
+    gateRef.current.cancel();
+    dropRequest.current++;
+    setDropDialog(false);
+    setPrechecking(false);
+    setPrecheck(null);
+    setSelected({});
+    setSkipped({});
+    props.onToast("info", "已取消当前预检（草稿保留）");
   };
 
   const toggleRow = (key: string) => setSelected((s) => ({ ...s, [key]: !s[key] }));
@@ -123,25 +174,33 @@ export function ImportPanel(props: {
 
   /** 只提交当前勾选的文件（每项带 expected）；缺 expected 的行不伪造字段、不提交。 */
   const doImportSelected = () => {
-    if (!precheck) return;
+    if (!precheck || importing) return;
     const files = precheck.results
       .filter((r) => selected[r.pathNorm])
       .map((r) => acceptedFileOf(r))
       .filter((x): x is NonNullable<typeof x> => x !== null);
     if (!files.length) { props.onToast("bad", "没有可导入的文件（缺 expected 元数据的行不能导入）"); return; }
+    const target = dropDialog && destinationMode === "copy" ? destination.trim() : "";
+    if (dropDialog && destinationMode === "copy" && !target) return;
+    setDropError("");
     setImporting(true);
-    importAcceptedFiles(files)
+    importAcceptedFiles(files, dropDialog ? { destination: target || undefined, boothUrl: boothLink.trim() || undefined } : undefined)
       .then((r) => {
         if (r.jobIds.length === 0) {
           // 后端还没接 files 形状时会静默返回 0 个作业：明确报出来，不假装已导入。
-          props.onToast("bad", "后端未接受 files 形状（0 个作业）：需要 /api/import/paths 接线（P1-T5）");
+          const message = "没有创建导入作业，请检查文件后重试。";
+          if (dropDialog) setDropError(message); else props.onToast("bad", message);
           return;
+        }
+        if (dropDialog) {
+          try { localStorage.setItem(LAST_DESTINATION, target); } catch { /* storage is optional */ }
+          setDropDialog(false);
         }
         props.onToast("ok", "已起 " + r.jobIds.length + " 个 import_file 作业" + (r.duplicates.length ? "（重复路径 " + r.duplicates.length + " 条已去重）" : ""));
         props.onJobsChanged(); props.onDataChanged();
         setPrecheck(null); setSelected({}); setSkipped({});
       })
-      .catch((e) => props.onToast("bad", describeError(e)))
+      .catch((e) => dropDialog ? setDropError(describeError(e)) : props.onToast("bad", describeError(e)))
       .finally(() => setImporting(false));
   };
 
@@ -214,21 +273,57 @@ export function ImportPanel(props: {
       .catch((e) => setAssoc((s) => (s ? { ...s, busy: false, err: describeError(e) } : s)));
   };
 
+  /**
+   * 文件选择：桥优先（Electron 38 的 File.path 已移除），回退旧 File.path，都无则如实提示。
+   * M2：与全局入口同一同步忙碌门——待确认/预检/导入时不改草稿、不换卡，只给准确反馈。
+   */
   const handleFiles = (files: FileList | null) => {
     if (!files || !files.length) return;
-    const withPath = Array.from(files).map((f) => (f as File & { path?: string }).path).filter((p): p is string => !!p);
-    if (withPath.length) { setPaths((p) => (p ? p + "\n" : "") + withPath.join("\n")); props.onToast("ok", "已接收 " + withPath.length + " 个文件路径"); }
-    else props.onToast("info", "浏览器不暴露本地绝对路径，已忽略 " + files.length + " 个文件（请改用粘贴路径）");
+    if (!shouldAcceptExternalBatch({ prechecking: gateRef.current.isBusy(), importing, pending: precheck !== null || dropDialog })) {
+      props.onToast("info", "正在预检/提交或有待确认的预检，已忽略本次选择（不覆盖当前批次）");
+      return;
+    }
+    const r = pathsFromFileList(files, {
+      getPathForFile: (f) => (typeof window === "undefined" ? null : window.assetVaultDesktop?.getPathForFile(f) ?? null),
+    });
+    if (r.paths.length) {
+      updatePaths((p) => mergePathDraft(p, r.paths));
+      doPrecheck(r.paths.join("\n"), true);
+    } else {
+      props.onToast("info", "浏览器不暴露本地绝对路径，已忽略 " + r.ignored + " 个文件（请改用粘贴路径）");
+    }
   };
 
+  /**
+   * N3：面板的 drop 只做**防导航窄 guard**——外部 Files 拖到面板时阻止浏览器默认动作
+   * （无桥/虚拟 File 时否则会导航到该文件）。不读路径、不触预检：唯一入口仍是 App 级 GlobalDrop。
+   * 不 stopPropagation，事件照常冒泡到 window。
+   */
   const onDrop = (e: ReactDragEvent) => {
-    e.preventDefault(); setHot(false);
-    const dt = e.dataTransfer;
-    const text = dt.getData("text/uri-list") || dt.getData("text/plain");
-    const list = splitPaths(text || "");
-    handleFiles(dt.files);
-    if (list.length) { setPaths((p) => (p ? p + "\n" : "") + list.join("\n")); props.onToast("ok", "已接收 " + list.length + " 条路径"); }
+    if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) e.preventDefault();
   };
+
+  // 全局拖入/粘贴批次（N2）：身份是单调 id，不是路径内容。
+  // - 同一 id 只消费一次（StrictMode 双跑/同事件重放不重复消费）；
+  // - 同内容的新 id 仍会被处理（A→取消→再次 A 第一遍就进）；
+  // - 队列里更晚的批次不会被清空回调抹掉（App 按 id CAS 移除）。
+  // 预检中/提交中/已有待确认卡都明确拒绝（不覆盖、不改草稿）。
+  const consumedRef = useRef<number>(0);
+  useEffect(() => {
+    const next = pickNextBatch(props.externalBatches ?? [], consumedRef.current);
+    if (!next) return;
+    consumedRef.current = next.id;
+    if (!shouldAcceptExternalBatch({ prechecking: gateRef.current.isBusy(), importing, pending: precheck !== null || dropDialog })) {
+      props.onToast("info", "正在预检/提交或有待确认的预检，已忽略本次拖入（不覆盖当前批次）");
+      props.onExternalPathsConsumed?.(next.id);
+      return;
+    }
+    const merged = mergePathDraft(pathsRef.current, next.paths);
+    updatePaths(() => merged);
+    props.onExternalPathsConsumed?.(next.id);
+    doPrecheck(next.paths.join("\n"), true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.externalBatches]);
 
   const meta: BoothItemMeta | null = peek;
   const precheckRows = precheck
@@ -237,6 +332,7 @@ export function ImportPanel(props: {
   const selectedCount = precheck ? precheck.results.filter((r) => selected[r.pathNorm]).length : 0;
   const sizeText = (r: PrecheckResult): string => (typeof r.size === "number" && Number.isFinite(r.size) ? r.size + " B" : "大小未知");
   const mtimeText = (r: PrecheckResult): string => (typeof r.mtime === "string" && r.mtime ? r.mtime : "mtime 未知");
+  const chooseFolder = typeof window === "undefined" ? undefined : window.assetVaultDesktop?.chooseImportFolder;
 
   return (
     <div className="col-scroll">
@@ -307,43 +403,13 @@ export function ImportPanel(props: {
           )}
         </Section>
 
-        <Section title="扫库">
-          <div className="row">
-            <select value={rootId} onChange={(e) => setRootId(e.target.value ? Number(e.target.value) : "")}>
-              <option value="">（不指定 root）</option>
-              {props.roots.map((r) => <option key={r.id} value={r.id}>#{r.id} {r.path} [{r.mode}]</option>)}
-            </select>
-            <label className="chk" title="deep=true 递归子目录"><input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} />deep</label>
-          </div>
-          <div className="row" style={{ marginTop: "6px" }}>
-            <input type="text" placeholder="可选：额外路径" value={scanPath} onChange={(e) => setScanPath(e.target.value)} />
-            <button className="btn" disabled={busy === "dry"} onClick={doDryRun} title="POST /scan {dryRun:true} —— 只读预览，不落库">{busy === "dry" ? <Spinner /> : "预览"}</button>
-            <button className="btn primary" disabled={busy === "scan"} onClick={doScan}>扫描</button>
-          </div>
-          {plans && (
-            <div style={{ marginTop: "7px" }}>
-              <div className="hint">dryRun 预览（不落库）：{plans.length} 条</div>
-              <table className="kv">
-                <tbody>
-                  {plans.slice(0, 12).map((p, i) => (
-                    <tr key={i}>
-                      <td className="k">{p.sourceSite}</td>
-                      <td>{p.title}
-                        <div className="hint">{p.sourceItemId ?? "—"} · conf {p.confidence ?? "—"} · {p.assets} 资产</div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {plans.length > 12 && <div className="hint">…另有 {plans.length - 12} 条</div>}
-            </div>
-          )}
-        </Section>
+        <button className="btn" onClick={props.onOpenScan}>扫描库…</button>
 
         <Section title="本地路径导入">
-          <textarea rows={4} placeholder={"%DOWNLOADS%/pkg.zip\n%LIBRARY%/素材库/abc 目录"} value={paths} onChange={(e) => setPaths(e.target.value)} />
+          <textarea rows={4} placeholder={"C:\\Downloads\\pkg.zip\n/home/u/素材库/abc 目录"} value={paths} onChange={(e) => updatePaths(() => e.target.value)} />
+          <div className="hint" style={{ marginTop: "3px" }}>只接受绝对路径；%变量%、相对路径与普通文字会留在草稿里但不送预检。</div>
           <div className="row" style={{ marginTop: "6px" }}>
-            <input ref={fileRef} type="file" multiple style={{ display: "none" }} onChange={(e) => handleFiles(e.target.files)} />
+            <input ref={fileRef} type="file" multiple style={{ display: "none" }} onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
             <button className="btn tiny" onClick={() => fileRef.current?.click()}>选择文件</button>
             <span className="spacer" />
           </div>
@@ -353,9 +419,14 @@ export function ImportPanel(props: {
           <div className="row">
             <span className="hint">对上方「本地路径导入」里的路径做只读预检：不写库、不建 job。</span>
             <span className="spacer" />
-            <button className="btn" disabled={prechecking || !splitPaths(paths).length} onClick={doPrecheck}>{prechecking ? <Spinner /> : "预检"}</button>
+            <button className="btn" disabled={prechecking || splitDraftPaths(paths).valid.length === 0} onClick={() => doPrecheck()}>{prechecking ? <Spinner /> : "预检"}</button>
+            {!dropDialog && (precheck || prechecking) && (
+              <button className="btn tiny ghost" onClick={cancelPrecheck} title="取消当前预检（含待确认卡），草稿保留">
+                取消预检
+              </button>
+            )}
           </div>
-          {precheck && (
+          {precheck && !dropDialog && (
             <div style={{ marginTop: "8px" }}>
               <div className="hint">
                 预检于 {precheck.checkedAt} · {precheck.results.length} 个文件
@@ -456,23 +527,75 @@ export function ImportPanel(props: {
         </Section>
 
         <Section title="拖拽导入">
-          <div
-            className={"drop" + (hot ? " hot" : "")}
-            onDragOver={(e) => { e.preventDefault(); setHot(true); }}
-            onDragLeave={() => setHot(false)}
-            onDrop={onDrop}
-            onClick={() => fileRef.current?.click()}
-          >
-            拖入文件 / 文件夹 / 路径文本（uri-list、纯文本）到此
+          {/* F7：本地拖入只由 App 级 GlobalDrop 处理（唯一入口）；这里只保留说明与「选择文件」。 */}
+          <div className="drop" onDrop={onDrop} onClick={() => fileRef.current?.click()} title="点击选择文件；拖入请拖到页面任意位置">
+            拖入文件 / 文件夹 / 路径文本：拖到页面任意位置即可（统一入口）
             <div className="hint" style={{ marginTop: "4px" }}>浏览器不提供本地绝对路径时，请改用「本地路径导入」粘贴。</div>
           </div>
           <div className="row wrap" style={{ marginTop: "6px" }}>
-            {["file:///%DOWNLOADS%/a.zip", "%LIBRARY%/素材库/b.7z"].map((s) => (
-              <button key={s} className="btn tiny" onClick={() => setPaths((p) => (p ? p + "\n" : "") + uriToPath(s))} title="插入示例路径">+ 示例</button>
+            {["C:\\Downloads\\a.zip", "/home/u/素材库/b.7z"].map((s) => (
+              <button key={s} className="btn tiny" onClick={() => updatePaths((p) => mergePathDraft(p, [s]))} title="插入示例路径">+ 示例</button>
             ))}
           </div>
         </Section>
       </div>
+      {dropDialog && createPortal(
+        <div className="backdrop import-confirm-backdrop" onClick={() => { if (!importing) cancelPrecheck(); }}>
+          <div className="drawer import-confirm" role="dialog" aria-modal="true" aria-label="确认导入文件" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <h3>确认导入文件</h3>
+              <button className="btn" disabled={importing} onClick={cancelPrecheck}>取消</button>
+            </div>
+            <div className="import-confirm-body">
+              <label>导入位置
+                <select value={destinationMode} disabled={importing} onChange={(e) => setDestinationMode(e.target.value === "copy" ? "copy" : "in-place")}>
+                  <option value="in-place">原位置登记</option>
+                  <option value="copy">复制到指定目录</option>
+                </select>
+              </label>
+              {destinationMode === "copy" && <>
+                {props.roots.length > 0 && <label>已登记的库目录
+                  <select value={props.roots.some((root) => root.enabled && root.path === destination) ? destination : ""} disabled={importing}
+                    onChange={(e) => { if (e.target.value) setDestination(e.target.value); }}>
+                    <option value="">请选择或填写其他目录</option>
+                    {props.roots.filter((root) => root.enabled).map((root) => <option key={root.id} value={root.path}>{root.path}</option>)}
+                  </select>
+                </label>}
+                <div className="row">
+                  <input type="text" aria-label="目标文件夹" placeholder="输入目标文件夹的绝对路径" value={destination} disabled={importing} onChange={(e) => setDestination(e.target.value)} />
+                  {chooseFolder && <button className="btn" disabled={importing} onClick={async () => {
+                    const request = dropRequest.current;
+                    try {
+                      const folder = await chooseFolder(destination || undefined);
+                      if (folder && request === dropRequest.current) setDestination(folder);
+                    } catch { if (request === dropRequest.current) setDropError("无法打开文件夹选择器"); }
+                  }}>浏览…</button>}
+                </div>
+                <div className="hint">会保留原文件。下次默认使用这个目录。</div>
+              </>}
+              <label>BOOTH 商品链接（可选）
+                <input type="text" inputMode="url" value={boothLink} placeholder="https://booth.pm/ja/items/…" disabled={importing} onChange={(e) => setBoothLink(e.target.value)} />
+              </label>
+              <div className="hint">填写后，勾选的文件会归到同一个 BOOTH 商品下。</div>
+              {prechecking && <div className="hint" role="status"><Spinner /> 正在检查文件…</div>}
+              {precheck?.budget.truncated && <div className="notice">预检达到上限，只能导入下方显示的文件。</div>}
+              {precheck && !precheckRows.length && <div className="hint">没有可导入的文件。</div>}
+              {precheckRows.length > 0 && <div className="import-confirm-files">
+                {precheckRows.map((row) => <label key={row.pathNorm} className="import-confirm-file">
+                  <input type="checkbox" checked={selected[row.pathNorm] === true} disabled={!expectedOf(row) || importing} onChange={() => toggleRow(row.pathNorm)} />
+                  <span><span className="mono">{row.path}</span><small>{row.match.pathCollision ? pathCollisionText(row.match.pathCollision) : summaryLabel(row.summary)} · {sizeText(row)}</small></span>
+                </label>)}
+              </div>}
+              {dropError && <div className="err" role="alert">{dropError}</div>}
+            </div>
+            <div className="wb-footer">
+              <button className="btn primary" disabled={prechecking || importing || selectedCount === 0 || (destinationMode === "copy" && !destination.trim())} onClick={doImportSelected}>
+                {importing ? "正在提交…" : "导入 " + selectedCount + " 个文件"}
+              </button>
+            </div>
+          </div>
+        </div>, document.body,
+      )}
     </div>
   );
 }

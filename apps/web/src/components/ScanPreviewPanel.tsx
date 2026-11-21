@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   applyScanPreview, cancelScanPreview, createScanPreview, decideScanPreviewItems, deleteScanPreview,
-  describeError, getScanPreview, listScanPreviewItems, listScanPreviews, retryScanPreview,
+  describeError, getScanPreview, listScanPreviewItems, listScanPreviews, retryScanPreview, scan,
 } from "../api";
 import type { LibraryRootRow, ScanPreview, ScanPreviewItem } from "../types";
 import { formatBytes, shortenPath } from "../util";
@@ -39,93 +39,125 @@ export function ScanPreviewPanel(props: {
   onClose: () => void;
   onToast: (kind: "ok" | "bad" | "info", text: string) => void;
   onChanged: () => void;
+  initialRootId?: number;
+  onJobsChanged?: () => void;
 }) {
   const [list, setList] = useState<ScanPreview[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [sel, setSel] = useState<ScanPreview | null>(null);
   const [items, setItems] = useState<ScanPreviewItem[]>([]);
+  const [openingId, setOpeningId] = useState<number | null>(null);
   const [cursor, setCursor] = useState<number | null>(null);
-  const [filter, setFilter] = useState<string>("");
+  const [filter, setFilter] = useState<string>("changes");
   const [busy, setBusy] = useState("");
-  const [rootId, setRootId] = useState<number | "">(props.roots[0]?.id ?? "");
+  const [rootId, setRootId] = useState<number | "">(props.initialRootId ?? props.roots[0]?.id ?? "");
+  const [path, setPath] = useState(props.roots.find((r) => r.id === (props.initialRootId ?? props.roots[0]?.id))?.path ?? "");
+  const [mode, setMode] = useState<"preview" | "direct">("preview");
   const [deep, setDeep] = useState(true);
+  const [includeDuplicates, setIncludeDuplicates] = useState(false);
+  const [includeMissing, setIncludeMissing] = useState(false);
+  const previewRequest = useRef(0);
+  const listRequest = useRef(0);
+
+  const openPreview = useCallback((id: number) => {
+    const requestId = ++previewRequest.current;
+    setOpeningId(id);
+    setErr("");
+    return Promise.all([getScanPreview(id), listScanPreviewItems(id, { limit: 100, change: filter || undefined })])
+      .then(([d, page]) => {
+        if (requestId !== previewRequest.current) return;
+        setSel(d.preview); setItems(page.items); setCursor(page.nextCursor);
+      })
+      .catch((e) => { if (requestId === previewRequest.current) setErr(describeError(e)); })
+      .finally(() => { if (requestId === previewRequest.current) setOpeningId(null); });
+  }, [filter]);
 
   const loadList = useCallback((selectId?: number) => {
+    const requestId = ++listRequest.current;
+    const selectedRequest = previewRequest.current;
     setLoading(true); setErr("");
     return listScanPreviews(40)
-      .then((r) => {
+      .then(async (r) => {
+        if (requestId !== listRequest.current) return;
         setList(r.previews);
         const want = selectId ?? sel?.id ?? r.previews[0]?.id;
         const p = r.previews.find((x) => x.id === want) ?? r.previews[0] ?? null;
-        if (p) void openPreview(p.id);
+        if (p && previewRequest.current === selectedRequest) await openPreview(p.id);
       })
-      .catch((e) => { setErr(describeError(e)); setList([]); })
-      .finally(() => setLoading(false));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.id]);
-
-  const openPreview = useCallback((id: number) => {
-    setFilter("");
-    return Promise.all([getScanPreview(id), listScanPreviewItems(id, { limit: 100 })])
-      .then(([d, page]) => { setSel(d.preview); setItems(page.items); setCursor(page.nextCursor); })
-      .catch((e) => { setErr(describeError(e)); });
-  }, []);
+      .catch((e) => { if (requestId === listRequest.current) { setErr(describeError(e)); setList([]); } })
+      .finally(() => { if (requestId === listRequest.current) setLoading(false); });
+  }, [openPreview, sel?.id]);
 
   useEffect(() => { void loadList(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
 
   /** 扫描中 / 应用中：轮询详情；状态落定后刷新条目与列表。 */
+  const selectedId = sel?.id;
+  const selectedState = sel?.state;
+  const { onChanged } = props;
   useEffect(() => {
-    if (!sel || !["scanning", "applying"].includes(sel.state)) return;
+    if (selectedId === undefined || (selectedState !== "scanning" && selectedState !== "applying") || openingId !== null) return;
+    const selectedRequest = previewRequest.current;
+    let active = true;
+    let pending = false;
     const t = setInterval(() => {
-      getScanPreview(sel.id).then((d) => {
+      if (pending) return;
+      pending = true;
+      getScanPreview(selectedId).then((d) => {
+        if (!active || previewRequest.current !== selectedRequest || d.preview.id !== selectedId) return;
         setSel(d.preview);
         if (!["scanning", "applying"].includes(d.preview.state)) {
-          void openPreview(d.preview.id);
           void loadList(d.preview.id);
-          if (d.preview.state.startsWith("applied") || d.preview.state === "partially_applied") props.onChanged();
+          if (selectedState === "applying") onChanged();
         }
-      }).catch(() => { /* 轮询失败静默，下一次再试 */ });
+      }).catch(() => { /* 下次轮询重试 */ }).finally(() => { pending = false; });
     }, 1500);
-    return () => clearInterval(t);
-  }, [sel, openPreview, loadList, props]);
+    return () => { active = false; clearInterval(t); };
+  }, [selectedId, selectedState, openingId, loadList, onChanged]);
 
   const run = (label: string, fn: () => Promise<void>) => {
-    if (busy) return;
+    if (busy || openingId !== null) return;
     setBusy(label);
     fn().catch((e) => props.onToast("bad", label + "失败：" + describeError(e))).finally(() => setBusy(""));
   };
 
-  const doCreate = () => run("生成预览", async () => {
-    if (rootId === "") { props.onToast("bad", "请选择一个库根"); return; }
-    const r = await createScanPreview({ rootId: Number(rootId), deep });
-    props.onToast("ok", r.existing ? "已有同参数的活跃预览，直接打开" : "已开始扫描（预览生成中）");
+  const doCreate = () => run(mode === "direct" ? "扫描" : "生成预览", async () => {
+    if (!path.trim()) { props.onToast("bad", "请先选择扫描路径。"); return; }
+    if (mode === "direct") {
+      if (!window.confirm("即将直接扫描并记录：" + path + "\n此操作会立即更新库中文件记录。继续吗？")) return;
+      const job = await scan({ ...(rootId === "" ? {} : { rootId: Number(rootId) }), path: path.trim(), deep });
+      props.onToast("ok", "扫描任务 #" + job.jobId + " 已排队，请在任务列表查看进度。");
+      props.onJobsChanged?.();
+      return;
+    }
+    const r = await createScanPreview({ ...(rootId === "" ? {} : { rootId: Number(rootId) }), path: path.trim(), deep });
+    props.onJobsChanged?.();
+    props.onToast("ok", r.existing ? "已打开相同扫描范围的预览。" : "扫描预览已开始。");
     await loadList(r.previewId);
-    if (!items.length) await openPreview(r.previewId);
   });
 
   const doDecide = (item: ScanPreviewItem, accept: boolean) => run("勾选", async () => {
-    await decideScanPreviewItems(sel!.id, { keys: [item.item_key], decision: accept ? "accept" : "skip" });
+    const r = await decideScanPreviewItems(sel!.id, { keys: [item.item_key], decision: accept ? "accept" : "skip" });
+    setSel((s) => s ? { ...s, itemCounts: r.itemCounts } : s);
     setItems((xs) => xs.map((x) => (x.id === item.id ? { ...x, decision: accept ? "accept" : "skip" } : x)));
   });
 
-  const doAcceptAll = () => run("全选可应用", async () => {
-    let n = 0;
-    for (const c of APPLICABLE) {
-      const r = await decideScanPreviewItems(sel!.id, { change: c, decision: "accept" });
-      n += r.updated;
-    }
-    props.onToast(n ? "ok" : "info", n ? "已勾选 " + n + " 条可应用项" : "没有可勾选的条目");
+  const doAcceptAll = () => run("勾选变化项", async () => {
+    const selectedTypes = ["new", "changed", ...(includeDuplicates ? ["duplicate_suspected"] : []), ...(includeMissing ? ["missing"] : [])];
+    const r = await decideScanPreviewItems(sel!.id, { change: selectedTypes.join(","), decision: "accept" });
+    props.onToast(r.itemCounts.accepted ? "ok" : "info", "待应用 " + r.itemCounts.accepted + " 项");
     await openPreview(sel!.id);
   });
 
   const doApply = () => run("应用", async () => {
     const p = sel!;
-    if (!window.confirm("将应用预览 #" + p.id + " 中已勾选的条目（新增/变化/确认缺失）。\n不移动、不删除源文件；疑似重复不会自动合并。继续？")) return;
-    const r = await applyScanPreview(p.id, { planHash: p.plan_hash ?? undefined });
+    const breakdown = APPLICABLE.map((change) => [CHANGE_LABEL[change], p.itemCounts.byChange?.[change] ?? 0] as const)
+      .filter(([, count]) => count > 0).map(([label, count]) => label + " " + count).join(" · ");
+    if (!window.confirm("将应用 " + p.itemCounts.accepted + " 项已选变化。\n" + breakdown + "\n继续？")) return;
+    const r = await applyScanPreview(p.id, { planHash: p.plan_hash ?? undefined, selectionToken: p.itemCounts.selectionToken });
+    props.onJobsChanged?.();
     props.onToast("ok", "已提交应用：文件 " + r.files + " 条 / 缺失 " + r.missing + " 条 / 过期跳过 " + r.stale + " 条");
-    await openPreview(p.id);
-    void loadList(p.id);
+    await loadList(p.id);
   });
 
   const doCancel = () => run("取消", async () => {
@@ -136,9 +168,9 @@ export function ScanPreviewPanel(props: {
 
   const doRetry = () => run("重试", async () => {
     const r = await retryScanPreview(sel!.id);
+    props.onJobsChanged?.();
     props.onToast("ok", "已重试失败的 " + r.retried + " 条（文件 " + r.files + " / 缺失 " + r.missing + " / 过期 " + r.stale + "）");
-    await openPreview(sel!.id);
-    void loadList(sel!.id);
+    await loadList(sel!.id);
   });
 
   const doDelete = () => run("删除", async () => {
@@ -161,41 +193,44 @@ export function ScanPreviewPanel(props: {
   });
 
   const counts = sel?.counts ?? null;
-  const applicable = counts ? APPLICABLE.reduce((n, c) => n + (counts[c] ?? 0), 0) : 0;
+  const mayEdit = !busy && openingId === null && !!sel && ["ready", "partial"].includes(sel.state);
 
   return (
     <div className="backdrop" onClick={props.onClose}>
-      <div className="drawer" role="dialog" aria-label="扫描变更中心" onClick={(e) => e.stopPropagation()}>
+        <div className="drawer" role="dialog" aria-label="扫描库" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-head">
-          <h3>扫描变更中心</h3>
-          <Badge tone="muted">先预览 · 再确认 · 才写库</Badge>
+          <h3>扫描库</h3>
           <span className="spacer" />
-          {(busy || loading) && <Spinner />}
+          {(busy || loading || openingId !== null) && <Spinner />}
           <button className="btn" onClick={props.onClose}>关闭</button>
         </div>
 
         <div className="preview-body">
           <div className="left">
             <div className="section">
-              <div className="hint" style={{ marginBottom: "6px" }}>生成新预览</div>
-              <select value={rootId} onChange={(e) => setRootId(e.target.value === "" ? "" : Number(e.target.value))} style={{ width: "100%" }}>
-                <option value="">（选择库根）</option>
+              <div className="seg" style={{ marginBottom: "6px" }}>
+                <button className={mode === "preview" ? "on" : ""} onClick={() => setMode("preview")}>预览后应用</button>
+                <button className={mode === "direct" ? "on" : ""} onClick={() => setMode("direct")}>直接扫描</button>
+              </div>
+              <select value={rootId} onChange={(e) => { const id = e.target.value === "" ? "" : Number(e.target.value); setRootId(id); const row = props.roots.find((r) => r.id === id); if (row) setPath(row.path); }} style={{ width: "100%" }}>
+                <option value="">选择扫描根目录</option>
                 {props.roots.map((r) => <option key={r.id} value={r.id}>#{r.id} {shortenPath(r.path, 34)}</option>)}
               </select>
+              <input type="text" aria-label="扫描路径" value={path} onChange={(e) => { const value = e.target.value; setPath(value); if (!props.roots.some((r) => r.id === rootId && r.path === value)) setRootId(""); }} placeholder="扫描路径" style={{ marginTop: "6px" }} />
               <label className="row" style={{ marginTop: "6px", gap: "5px", cursor: "pointer" }}>
-                <input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} /> 深度扫描（最大 10 层）
+                <input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} /> 深度扫描（最多 10 层）
               </label>
-              <button className="btn" style={{ marginTop: "8px", width: "100%" }} disabled={!!busy} onClick={doCreate}>生成预览</button>
-              <div className="hint" style={{ marginTop: "6px" }}>只读：生成阶段不写任何素材，只写预览清单。</div>
+              <button className="btn primary" style={{ marginTop: "8px", width: "100%" }} disabled={!!busy || openingId !== null || !path.trim()} onClick={doCreate}>{mode === "preview" ? "生成预览" : "开始扫描"}</button>
+              <div className="hint" style={{ marginTop: "6px" }}>{mode === "preview" ? "预览只保存待审核清单；确认后再选择要应用的变化。" : "直接扫描会立即更新文件记录；可在任务列表查看进度。"}</div>
             </div>
 
             <div className="row" style={{ gap: "6px" }}>
               <span className="hint">最近预览</span>
               <span className="spacer" />
-              <button className="btn tiny" onClick={() => void loadList()} disabled={!!busy}>刷新</button>
+              <button className="btn tiny" onClick={() => void loadList()} disabled={!!busy || !!loading || openingId !== null}>刷新</button>
             </div>
             {list.map((p) => (
-              <button key={p.id} className={"preview-row" + (sel?.id === p.id ? " on" : "")} onClick={() => void openPreview(p.id)} title={p.path}>
+              <button key={p.id} className={"preview-row" + (sel?.id === p.id ? " on" : "")} onClick={() => void openPreview(p.id)} disabled={!!busy || openingId !== null} title={p.path}>
                 <span className="row" style={{ gap: "6px" }}>
                   <Badge tone={STATE_TONE[p.state] ?? "muted"}>{STATE_LABEL[p.state] ?? p.state}</Badge>
                   <span className="hint mono">#{p.id}</span>
@@ -213,17 +248,17 @@ export function ScanPreviewPanel(props: {
           </div>
 
           <div className="right">
-            {err && <div className="notice bad">变更中心接口不可用（后端版本较旧？）：{err}</div>}
+            {err && <div className="notice bad">无法读取扫描预览：{err}</div>}
             {!sel && !err && <div className="empty">左侧选择一个预览查看详情</div>}
             {sel && (
               <>
                 <div className="row wrap" style={{ gap: "6px" }}>
-                  <b>#{sel.id}</b>
+                  <b>{"扫描预览"} #{sel.id}</b>
                   <Badge tone={STATE_TONE[sel.state] ?? "muted"}>{STATE_LABEL[sel.state] ?? sel.state}</Badge>
-                  {sel.truncated ? <Badge tone="warn">扫描被截断</Badge> : null}
-                  {!sel.complete && sel.state !== "failed" ? <Badge tone="warn">本轮不完整（未提出缺失项）</Badge> : null}
+                  {sel.truncated && <Badge tone="warn">扫描已截断</Badge>}
+                  {!sel.complete && sel.state === "partial" && <Badge tone="warn">扫描不完整，未判定缺失</Badge>}
                   <span className="spacer" />
-                  <span className="hint">文件 {sel.files} · 目录 {sel.dirs} · {formatBytes(sel.bytes)} · 错误 {sel.error_count}</span>
+                  <span className="hint">{"文件"} {sel.files} · {"文件夹"} {sel.dirs} · {formatBytes(sel.bytes)} · {"错误"} {sel.error_count}</span>
                 </div>
                 <div className="hint mono" style={{ wordBreak: "break-all" }}>{sel.path}（{sel.deep ? "深度 10" : "深度 6"}）</div>
                 {sel.error && <div className="notice bad">{sel.error}</div>}
@@ -232,28 +267,30 @@ export function ScanPreviewPanel(props: {
                 )}
 
                 <div className="row wrap" style={{ gap: "6px" }}>
-                  <button className={"cat-chip" + (filter === "" ? " on" : "")} onClick={() => void changeFilter("")}>全部 {counts?.total ?? 0}</button>
+                  <button className={"cat-chip" + (filter === "changes" ? " on" : "")} onClick={() => void changeFilter("changes")}>{"变化"} {(counts?.new ?? 0) + (counts?.changed ?? 0)}</button>
+                  <button className={"cat-chip" + (filter === "" ? " on" : "")} onClick={() => void changeFilter("")}>{"全部"} {counts?.total ?? 0}</button>
                   {(Object.keys(CHANGE_LABEL) as string[]).map((c) => (
-                    <button key={c} className={"cat-chip" + (filter === c ? " on" : "")} onClick={() => void changeFilter(c)}>
-                      {CHANGE_LABEL[c]} {counts ? (counts as any)[c] ?? 0 : 0}
-                    </button>
+                    <button key={c} className={"cat-chip" + (filter === c ? " on" : "")} onClick={() => void changeFilter(c)}>{CHANGE_LABEL[c]} {counts ? (counts as any)[c] ?? 0 : 0}</button>
                   ))}
                 </div>
 
-                <div className="row" style={{ gap: "6px" }}>
-                  <span className="hint">已勾选 {sel.itemCounts.accepted} · 已应用 {sel.itemCounts.applied} · 未应用 {sel.itemCounts.pending}</span>
+                <div className="row wrap" style={{ gap: "6px" }}>
+                  <span className="hint">待应用 {sel.itemCounts.accepted} · 已应用 {sel.itemCounts.applied} · 失败 {sel.itemCounts.failed ?? 0}</span>
                   <span className="spacer" />
-                  <button className="btn tiny" disabled={!!busy || !["ready", "partial"].includes(sel.state)} onClick={doAcceptAll}>全选可应用（{applicable}）</button>
-                  <button className="btn tiny" disabled={!!busy || !["ready", "partial"].includes(sel.state)} onClick={doApply}>应用已勾选</button>
-                  <button className="btn tiny" disabled={!!busy || sel.state === "applying"} onClick={doRetry}>重试失败项</button>
-                  <button className="btn tiny" disabled={!!busy || sel.state === "applying"} onClick={doCancel}>取消</button>
-                  <button className="btn tiny" disabled={!!busy || sel.state === "applying"} onClick={doDelete}>删除预览</button>
+                  <label className="chk"><input type="checkbox" checked={includeDuplicates} disabled={!mayEdit} onChange={(e) => setIncludeDuplicates(e.target.checked)} /> 包含疑似重复 ({counts?.duplicate_suspected ?? 0})</label>
+                  <label className="chk"><input type="checkbox" checked={includeMissing} disabled={!mayEdit} onChange={(e) => setIncludeMissing(e.target.checked)} /> 包含缺失 ({counts?.missing ?? 0})</label>
+                  <button className="btn tiny" disabled={!mayEdit} onClick={doAcceptAll}>勾选变化项</button>
+                  <button className="btn tiny primary" disabled={!mayEdit || sel.itemCounts.accepted === 0} onClick={doApply}>应用已选 ({sel.itemCounts.accepted})</button>
+                  <button className="btn tiny" disabled={!!busy || openingId !== null || !["ready", "partial", "partially_applied", "failed"].includes(sel.state) || !sel.itemCounts.failed} onClick={doRetry}>重试失败项</button>
+                  <button className="btn tiny" disabled={!!busy || openingId !== null || !["ready", "partial", "scanning"].includes(sel.state)} onClick={doCancel}>取消预览</button>
+                  <button className="btn tiny" disabled={!!busy || openingId !== null || sel.state === "applying"} onClick={doDelete}>删除预览</button>
                 </div>
 
                 <div className="preview-list">
                   {items.map((it) => (
                     <div className="preview-item" key={it.id}>
-                      <input type="checkbox" disabled={!!busy || it.applied === 1 || !APPLICABLE.includes(it.change as any)}
+                      <input type="checkbox" aria-label={CHANGE_LABEL[it.change] + " " + it.path} disabled={!mayEdit || it.applied === 1 || !APPLICABLE.includes(it.change as any)
+                        || (it.decision !== "accept" && ((it.change === "duplicate_suspected" && !includeDuplicates) || (it.change === "missing" && !includeMissing)))}
                         checked={it.decision === "accept"} onChange={(e) => void doDecide(it, e.target.checked)} />
                       <Badge tone={CHANGE_TONE[it.change] ?? "muted"}>{CHANGE_LABEL[it.change] ?? it.change}</Badge>
                       <span className="p mono" title={it.path}>{shortenPath(it.path, 80)}</span>

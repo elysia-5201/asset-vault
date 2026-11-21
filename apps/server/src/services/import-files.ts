@@ -14,10 +14,13 @@
  *
  * 本模块只做校验/建 job/查归属，不写 items/assets，不调用任何合并/查重写路径。
  */
-import { statSync } from "node:fs";
+import { constants, statSync } from "node:fs";
+import { link, lstat, mkdtemp, realpath, rm, stat, copyFile } from "node:fs/promises";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { AppError } from "../../../../packages/core/src/contracts";
 import { sha256FileChunked } from "../../../../packages/core/src/hash";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
+import { parseBoothUrl } from "../../../../packages/core/src/source/booth";
 import type { Repo } from "../db/repo";
 
 export interface AcceptedFileExpected { size: number; mtime: string; sha256?: string }
@@ -44,12 +47,19 @@ function expectedOf(f: AcceptedFile): AcceptedFileExpected | null {
  * 建导入作业：`files` 新形状（每文件一个 `import_file` job，payload `{path, expected, group}`）；
  * 否则按 `paths` 旧形状（payload `{path, legacy:true}`，行为与现状一致）。
  */
-export function createImportPathJobs(deps: { repo: Repo }, body: { paths?: string[]; files?: AcceptedFile[] }): ImportPathJobsResult {
+export function createImportPathJobs(deps: { repo: Repo }, body: { paths?: string[]; files?: AcceptedFile[]; destination?: unknown; boothUrl?: unknown }): ImportPathJobsResult {
   const { repo } = deps;
   if (Array.isArray(body?.files)) {
     const jobIds: number[] = [];
     const duplicates: string[] = [];
     const seen = new Set<string>();
+    const destination = body.destination === undefined ? undefined : importDestination(body.destination);
+    const boothUrl = typeof body.boothUrl === "string" ? body.boothUrl.trim() : "";
+    const booth = boothUrl ? parseBoothUrl(boothUrl) : null;
+    if ((boothUrl && !booth) || (body.boothUrl !== undefined && typeof body.boothUrl !== "string")) {
+      throw invalid("INVALID_BOOTH_LINK", "请输入有效的 BOOTH 商品链接或商品编号");
+    }
+    const accepted: AcceptedFile[] = [];
     for (const f of body.files) {
       const path = String(f?.path ?? "");
       if (!path) throw new AppError("INVALID_INPUT", "files 每项必须有 path", 400);
@@ -63,14 +73,72 @@ export function createImportPathJobs(deps: { repo: Repo }, body: { paths?: strin
       const norm = normalizePath(path);
       if (seen.has(norm)) { duplicates.push(path); continue; }
       seen.add(norm);
-      const job = repo.createJob("import_file", null, { path, expected, group: f.group }, 5);
-      jobIds.push(job.id);
+      accepted.push({ path, expected, group: f.group });
     }
+    repo.transaction(() => {
+      for (const file of accepted) {
+        jobIds.push(repo.createJob("import_file", null, { ...file, destination, ...(booth ? { booth } : {}) }, 5).id);
+      }
+    });
     return { jobIds, duplicates, legacy: false };
   }
   const paths = Array.isArray(body?.paths) ? body.paths.map(String) : [];
   const jobIds = paths.map((p) => repo.createJob("import_file", null, { path: p, legacy: true }, 5).id);
   return { jobIds, duplicates: [], legacy: true };
+}
+
+function importDestination(value: unknown): string {
+  const path = typeof value === "string" ? value.trim() : "";
+  if (!isAbsolute(path)) throw invalid("INVALID_DESTINATION", "请选择绝对路径作为导入目录");
+  try {
+    if (statSync(path).isDirectory()) return path;
+  } catch { /* invalid destination */ }
+  throw invalid("INVALID_DESTINATION", "导入目录不存在或无法访问");
+}
+
+/** Copies a verified source without overwriting any existing file. A retry may reuse identical bytes. */
+export async function copyAcceptedFile(file: AcceptedFile, destination: string, checkOwner: (target: string) => void, signal?: AbortSignal): Promise<string> {
+  const requestedDir = resolve(importDestination(destination));
+  const dir = await realpath(requestedDir);
+  const source = await realpath(file.path);
+  const target = join(dir, basename(file.path));
+  const registeredPath = join(requestedDir, basename(file.path));
+  checkOwner(registeredPath);
+  if (registeredPath !== target) checkOwner(target);
+  if (target === source) return registeredPath;
+  const scratch = await mkdtemp(join(dir, ".assetvault-import-"));
+  try {
+    const tempFile = join(scratch, "content");
+    await copyFile(source, tempFile);
+    signal?.throwIfAborted();
+    const expected = file.expected;
+    const snapshot = await sha256FileChunked(tempFile, { signal });
+    const current = await stat(source);
+    if (snapshot.bytes !== expected.size || current.size !== expected.size || current.mtime.getTime() !== Date.parse(expected.mtime)
+      || (expected.sha256 && snapshot.sha256 !== expected.sha256.toLowerCase())) {
+      throw new AppError("CONFLICT", "预检后源文件发生变化，请重新预检", 409, { code: "PRECHECK_STALE" });
+    }
+    if (await realpath(requestedDir) !== dir) throw invalid("INVALID_DESTINATION", "导入目录已变化，请重新选择");
+    checkOwner(registeredPath);
+    if (registeredPath !== target) checkOwner(target);
+    try {
+      try { await link(tempFile, target); }
+      catch (error) {
+        if (!["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await copyFile(tempFile, target, constants.COPYFILE_EXCL);
+      }
+    }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const targetStat = await lstat(target);
+      const existing = targetStat.isFile() && targetStat.size === expected.size
+        ? await sha256FileChunked(target, { signal }).catch(() => null) : null;
+      if (!existing || existing.sha256 !== snapshot.sha256) {
+        throw new AppError("CONFLICT", "导入目录已有不同内容的同名文件：" + basename(target), 409, { code: "DESTINATION_EXISTS" });
+      }
+    }
+    return registeredPath;
+  } finally { await rm(scratch, { recursive: true, force: true }).catch(() => {}); }
 }
 
 /**

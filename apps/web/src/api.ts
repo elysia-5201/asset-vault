@@ -6,7 +6,7 @@
  */
 import type {
   AppErrorCode, ArchiveEntry, AssetRow, AvatarMatch, BoothItemMeta, ContainerKind, ItemStatus,
-  JobEventRow, JobRow, LibraryRootRow, RootMode, SourceSite, TagRow, UnityPackageAsset,
+  ItemAssetScanResult, JobEventRow, JobRow, LibraryRootRow, RootMode, SourceSite, TagRow, UnityPackageAsset,
 } from "@core/contracts";
 import { mockHandle, mockMediaUrl, mockEntry, MockHttpError } from "./mock";
 import type {
@@ -18,14 +18,19 @@ import type {
   PipelineEvent, PipelineOverview, PipelineStage, PipelineTask,
   ImportExecuteAck, ImportPlan, ImportPlanUnit, ImportPrecheck, ImportRun, ImportRunUnit, PlanLatestRun, PlanRisk, RunCounts, StagingCleanupResult, StagingUsage, VerificationStats,
   WorkbenchAvatar, WorkbenchAvatarCounts, WorkbenchItem, WorkbenchItemQuery, WorkbenchItemsResponse,
-  ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
+  ProjectUsageResponse, ReclassifyResponse, RecomputeResponse, RelatedLevel, RelatedMatch, ScanUsageResponse,
   RootsResponse, ScanDryRunResponse, ScanPlanItem, ScanPreview, ScanPreviewCounts, ScanPreviewItem, SettingsResponse, StatsResponse, TagListRow, TagsResponse, UnityPackageResponse, WatchEntry,
   UpdateCheckResponse, ViewMode,
   PrecheckResponse, PrecheckResult, VersionLink,
   Loadout, LoadoutDetail, LoadoutItem, LoadoutState,
   CleanupFilter, CleanupFilterRow, CleanupIgnore, CleanupIgnoresResponse, CleanupRule,
   CleanupTodosResponse, LocalSourcePolicy,
+  UnityInstallApplyResult, UnityInstallOperation, UnityInstallPreview, UnityInstallProbe, UnityInstallStatus,
 } from "./types";
+import {
+  installApplyBody, installCancelRequest, installPreviewRequest, installProbeRequest,
+  installRollbackRequest, installStatusRequest,
+} from "./unity-install-view";
 export type { CategoriesResponse, CategoryConfig, CategoryNode, BatchCategoryResponse, ReclassifyResponse, ScanPreview, ScanPreviewCounts, ScanPreviewItem } from "./types";
 
 // ---------- 扫描变更中心（M1）----------
@@ -43,7 +48,7 @@ export async function listScanPreviewItems(id: number, opts: { cursor?: number |
 export async function decideScanPreviewItems(id: number, body: { keys?: string[]; change?: string; decision: "accept" | "skip" | "pending" }) {
   return request<{ updated: number; itemCounts: ScanPreview["itemCounts"] }>("POST", "/scan/previews/" + id + "/items", body);
 }
-export async function applyScanPreview(id: number, body: { planHash?: string | null; mode?: "all"; itemKeys?: string[]; idempotencyKey?: string }) {
+export async function applyScanPreview(id: number, body: { planHash?: string | null; mode?: "all"; itemKeys?: string[]; idempotencyKey?: string; selectionToken?: string }) {
   return request<{ previewId: number; applyRunId: number; jobId: number; files: number; missing: number; stale: number; requested: number }>("POST", "/scan/previews/" + id + "/apply", body, { timeoutMs: 30000 });
 }
 export async function cancelScanPreview(id: number) { return request<{ preview: ScanPreview }>("POST", "/scan/previews/" + id + "/cancel"); }
@@ -137,8 +142,8 @@ function numOr(x: unknown, dflt: number): number {
 
 function timeoutSignal(ms: number): { signal: AbortSignal; cancel: () => void } {
   const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), ms);
-  return { signal: ctl.signal, cancel: () => clearTimeout(t) };
+  const t = ms > 0 ? setTimeout(() => ctl.abort(), ms) : null;
+  return { signal: ctl.signal, cancel: () => { if (t !== null) clearTimeout(t); } };
 }
 
 /** 探测后端；不可达 → mock 模式（也可用 ?mock=1 强制）。 */
@@ -288,6 +293,9 @@ export async function getItem(id: number): Promise<ItemDetailWeb> {
     avatars: arr(raw?.avatars),
     tags: arr(raw?.tags),
   };
+}
+export function scanItemFiles(id: number): Promise<ItemAssetScanResult> {
+  return request("POST", "/items/" + id + "/assets/scan", undefined, { timeoutMs: 60000 });
 }
 export function createItem(title: string, sourceUrl?: string, notes?: string): Promise<ItemCardWeb> {
   return request("POST", "/items", { title, sourceUrl, notes });
@@ -488,6 +496,33 @@ export function addImages(id: number, body: { paths?: string[]; url?: string; ro
 export function deleteImage(id: number, imageId: number): Promise<unknown> { return request("DELETE", "/items/" + id + "/images/" + imageId); }
 export function setCover(id: number, imageId: number): Promise<unknown> { return request("POST", "/items/" + id + "/images/" + imageId + "/cover"); }
 export function addAsset(id: number, path: string): Promise<AssetRow> { return request("POST", "/items/" + id + "/assets", { path }); }
+export interface AssetRelocationCandidate {
+  assetId: number;
+  itemId: number;
+  title: string;
+  path: string;
+}
+export async function getAssetRelocationCandidates(assetId: number): Promise<{ candidates: AssetRelocationCandidate[]; reason?: string }> {
+  const raw = rec(await request<unknown>("GET", "/assets/" + assetId + "/relocation-candidates"));
+  const candidates = arr<unknown>(raw.candidates).map((value) => {
+    const candidate = rec(value);
+    return {
+      assetId: numOr(candidate.assetId, 0), itemId: numOr(candidate.itemId, 0),
+      title: String(candidate.title ?? ""), path: String(candidate.path ?? ""),
+    };
+  }).filter((candidate) => candidate.assetId > 0 && candidate.itemId > 0 && candidate.path !== "");
+  return { candidates, reason: typeof raw.reason === "string" ? raw.reason : undefined };
+}
+export function relocateMissingAsset(assetId: number, body: {
+  expectedItemId: number; expectedPath: string; candidateId: number;
+  expectedCandidatePath: string; expectedCandidateItemId: number;
+}): Promise<{ ok: true }> {
+  // Hashing the candidate can take longer than the normal API deadline on large or slow disks.
+  return request("POST", "/assets/" + assetId + "/relocate", body, { timeoutMs: 0 });
+}
+export function removeMissingAsset(assetId: number, body: { expectedItemId: number; expectedPath: string }): Promise<{ ok: true }> {
+  return request("POST", "/assets/" + assetId + "/remove-missing", body);
+}
 /**
  * POST /items/:id/assets 的 expected 强验版本（import-precheck spec §6.3/§9.1）。
  *
@@ -762,8 +797,8 @@ export async function precheckPaths(body: {
 }
 
 /** POST /api/import/paths 的新形状：只提交用户看过的 files（每项带 expected），不递归原目录。 */
-export async function importAcceptedFiles(files: AcceptedFilePayload[]): Promise<{ jobIds: number[]; duplicates: string[]; legacy: boolean }> {
-  const raw = rec(await request<unknown>("POST", "/import/paths", { files }));
+export async function importAcceptedFiles(files: AcceptedFilePayload[], options: { destination?: string; boothUrl?: string } = {}): Promise<{ jobIds: number[]; duplicates: string[]; legacy: boolean }> {
+  const raw = rec(await request<unknown>("POST", "/import/paths", { files, ...options }));
   return {
     jobIds: arr<unknown>(raw.jobIds).map((x) => numOr(x, 0)),
     duplicates: arr<unknown>(raw.duplicates).map((x) => String(x)),
@@ -875,6 +910,10 @@ export async function scanDryRun(body: { rootId?: number; path?: string; deep?: 
 export async function listJobs(state?: string, limit = 50): Promise<JobsResponse> {
   const raw = await request<unknown>("GET", "/jobs" + queryString({ state, limit }));
   return { jobs: pickArray<JobRow>(raw, "jobs") };
+}
+export async function getJob(id: number): Promise<JobRow> {
+  const { job } = await request<{ job: JobRow }>("GET", "/jobs/" + id);
+  return job;
 }
 export async function jobEvents(id: number): Promise<JobEventRow[]> {
   return pickArray<JobEventRow>(await request<unknown>("GET", "/jobs/" + id + "/events"), "events");
@@ -1007,8 +1046,23 @@ export interface ProjectRow { id: number; name: string; path: string; created_at
 export async function listProjects(): Promise<{ projects: ProjectRow[] }> {
   return { projects: pickArray<ProjectRow>(await request<unknown>("GET", "/projects"), "projects") };
 }
+export async function registerProject(path: string, name?: string): Promise<number> {
+  const { id } = await request<{ id: number }>("POST", "/projects", { name, path });
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("未收到登记的工程编号");
+  return id;
+}
+
 export function recordImport(projectId: number, itemId: number, assetId?: number): Promise<unknown> {
   return request("POST", "/projects/" + projectId + "/imports", { itemId, assetId });
+}
+
+/** 一次读取所选工程已记录的 GUID 匹配。空结果表示没有引用证据。 */
+export async function getProjectUsage(projectId: number, signal?: AbortSignal): Promise<ProjectUsageResponse> {
+  const usage = await request<ProjectUsageResponse>("GET", "/projects/" + projectId + "/usage", undefined, { signal });
+  if (usage?.projectId !== projectId || !Array.isArray(usage.items)) {
+    throw new Error("未收到所选工程的引用记录");
+  }
+  return usage;
 }
 
 /**
@@ -1230,6 +1284,7 @@ export type { ArchiveEntry, AssetRow, BoothItemMeta, ContainerKind, ItemStatus, 
  * ⚠️ 这里不定义任何新状态：单元执行状态（planned/importing/.../unknown）全部原样透传。
  */
 function errOf(x: unknown): { code: string; message: string } | null {
+  if (typeof x === "string" && x) return { code: "UNKNOWN", message: x };
   if (!x || typeof x !== "object") return null;
   const o = rec(x);
   const code = typeof o.code === "string" ? o.code : "";
@@ -1306,13 +1361,18 @@ function workbenchItemOf(raw: unknown, idx: number): WorkbenchItem {
     sourceSite: strField(o, "sourceSite", "source_site"),
     sourceItemId: strField(o, "sourceItemId", "source_item_id"),
     shopName: strField(o, "shopName", "shop_name"),
-    coverImageId: numField(o, "coverImageId", "cover_image_id"),
+    coverImageId: numField(o, "coverImageId", "cover_image_id") ?? (itemRec ? numField(itemRec, "coverImageId", "cover_image_id") : null),
     packageName: strField(o, "packageName", "package_name") ?? (typeof o.name === "string" ? o.name : null),
     relPath,
-    // 互斥键：优先容器路径（压缩包/unitypackage 的原始资产路径），同一容器只能选一个单元
     containerPath: strField(o, "containerPath", "container_path") ?? (assetRec ? strField(assetRec, "path", "path") : null),
     avatarId: avatar0 ? numField(avatar0, "avatarId", "avatar_id") : numField(o, "avatarId", "avatar_id"),
     avatarName: avatar0 ? (typeof avatar0.name === "string" ? avatar0.name : null) : strField(o, "avatarName", "avatar_name"),
+    avatarMatches: avatars.flatMap((a) => {
+      const id = numField(a, "avatarId", "avatar_id");
+      return id === null ? [] : [{ id, name: String(a.name ?? ""), level: String(a.level ?? "unknown") }];
+    }),
+    variantIds: arr<unknown>(o.variantIds).map(String),
+    assetStatus: assetRec ? strField(assetRec, "status", "status") : null,
     kind: strField(o, "kind", "kind"),
     level,
     evidence: ev
@@ -1321,7 +1381,7 @@ function workbenchItemOf(raw: unknown, idx: number): WorkbenchItem {
     // 后端 policy：single_unitypackage / mixed_unitypackage / multi_package_container / unknown_structure
     policy: typeof o.policy === "string" && o.policy ? o.policy : "unknown_structure",
     mixed: o.mixed === true || o.policy === "mixed_unitypackage",
-    importable: o.importable === true,
+    importable: o.importable === true && o.available !== false,
     parseState: parseState ?? null,
     suggested: o.suggested === true || level === "probable" || level === "weak",
     confirmed: o.confirmed === true || level === "confirmed",
@@ -1335,12 +1395,14 @@ function planUnitOf(raw: unknown, idx: number): ImportPlanUnit {
   const unitId = String(o.unitId ?? o.unit_id ?? o.key ?? "") || [itemId, idx].join(":");
   const path = strField(o, "packagePath", "package_path") ?? strField(o, "path", "path");
   const baseName = path ? (path.split(/[\\/]/).pop() ?? path) : null;
+  const relPath = strField(o, "relPath", "rel_path");
   return {
     unitId,
     itemId,
     assetId: numField(o, "assetId", "asset_id"),
-    title: String(o.title ?? o.name ?? baseName ?? ("unit #" + unitId)),
+    title: String(o.title ?? o.name ?? (relPath ? relPath.split(/[\\/:]/).at(-1) : null) ?? baseName ?? ("包 #" + unitId)),
     packagePath: path,
+    relPath,
     policy: typeof o.policy === "string" && o.policy ? o.policy : "unknown_structure",
     mixed: o.mixed === true || o.policy === "mixed_unitypackage",
     suggested: o.suggested === true || o.status === "suggested",
@@ -1352,7 +1414,7 @@ function precheckOf(raw: unknown): ImportPrecheck {
   const o = rec(raw);
   const warnings = arr<unknown>(o.warnings).map((x) => String(x));
   const errors = arr<unknown>(o.errors).map((x) => errOf(x)).filter((x): x is { code: string; message: string } => !!x);
-  return { ok: o.ok !== false, status: typeof o.status === "string" ? o.status : "", warnings, errors };
+  return { ok: o.ok !== false && errors.length === 0, status: typeof o.status === "string" ? o.status : "", warnings, errors };
 }
 /**
  * 风险扫描归一化：兼容扁平 { risk_state, risk_hits, risk_scan } 与嵌套 { risk:{state,hits,scan} }。
@@ -1464,6 +1526,7 @@ function planOf(raw: unknown): ImportPlan {
   return {
     id: numOr(p.id ?? p.planId, 0),
     itemId: numField(p, "itemId", "item_id"),
+    itemTitle: strField(outer, "itemTitle", "item_title"),
     state: String(p.state ?? p.status ?? ""),
     avatarId: numField(p, "avatarId", "avatar_id"),
     avatarName: strField(p, "avatarName", "avatar_name"),
@@ -1473,16 +1536,16 @@ function planOf(raw: unknown): ImportPlan {
     units: arr<unknown>(unitsSrc).map(planUnitOf),
     mixedWarning: strField(p, "mixedWarning", "mixed_warning"),
     risk: riskOf(
-      (p.risk ?? outer.risk)
+      (p.risk ?? outer.risk ?? (outer.risks && { ...rec(outer.risks), state: outer.risk_state ?? p.risk_state ?? rec(outer.risks).state }))
       ?? { state: p.risk_state ?? outer.risk_state, hits: p.risk_hits ?? outer.risk_hits, scan: p.risk_scan ?? outer.risk_scan },
     ),
     verification: verificationOf(outer.verification ?? p.verification) ?? latestRun?.verification ?? null,
     // run 是在 import job 里建出来的：后端若在 plan 视图里暴露 run_id / latestRun.id 就能自动接上轮询
     runId,
     latestRun,
-    jobId: numField(p, "jobId", "job_id"),
+    jobId: numField(p, "jobId", "job_id") ?? numField(outer, "jobId", "job_id"),
     createdAt: strField(p, "createdAt", "created_at"),
-    error: errOf(p.error),
+    error: errOf(outer.lastError ?? p.error ?? outer.error),
   };
 }
 function runUnitOf(raw: unknown, idx: number): ImportRunUnit {
@@ -1531,13 +1594,12 @@ export async function workbenchAvatars(itemId?: number): Promise<WorkbenchAvatar
   return pickArray<unknown>(raw, "avatars").map(workbenchAvatarOf);
 }
 /**
- * GET /api/workbench/units —— 资源单元视图（后端只认 itemId/avatarId/policy/level/itemStatus/limit）。
- * 关键词与分类由调用方本地过滤（后端不提供这两个参数，别假装发过去就生效）。
+ * GET /api/workbench/units —— 资源单元视图。
  */
 export async function workbenchItems(q: WorkbenchItemQuery = {}): Promise<WorkbenchItemsResponse> {
   const raw = await request<unknown>("GET", "/workbench/units" + queryString({
     itemId: q.itemId, avatarId: q.avatarId, policy: q.policy || undefined, level: q.level || undefined,
-    itemStatus: q.itemStatus || undefined, limit: q.limit ?? 500,
+    itemStatus: q.itemStatus || undefined, limit: q.limit ?? 500, q: q.q || undefined, offset: q.offset,
   }));
   const items = pickArray<unknown>(raw, "items").map(workbenchItemOf);
   return { items, total: items.length };
@@ -1552,7 +1614,7 @@ export async function createImportPlans(body: {
   unitIds: string[];
   /** 是否把伴生单元作为 suggested 一起放进计划（会以未勾选状态出现） */
   includeSuggested?: boolean;
-}): Promise<ImportPlan[]> {
+}): Promise<{ plans: ImportPlan[]; errors: { itemId: number | null; message: string }[] }> {
   const raw = await request<unknown>("POST", "/import-plans", {
     unitIds: body.unitIds.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0),
     projectPath: body.projectPath,
@@ -1561,7 +1623,17 @@ export async function createImportPlans(body: {
   const r = rec(raw);
   // 三种返回都吃：{plan,items,precheck} / {plans:[...]} / 裸数组
   const list = Array.isArray(r.plans) ? arr<unknown>(r.plans) : Array.isArray(raw) ? arr<unknown>(raw) : [raw];
-  return list.map(planOf).filter((p) => p.id > 0 || p.units.length > 0);
+  const plans = list.map(planOf);
+  return {
+    plans: plans.filter((p) => p.id > 0),
+    errors: plans.filter((p) => p.id <= 0).map((p) => ({
+      itemId: p.itemId, message: p.error?.message ?? "未生成导入检查结果",
+    })),
+  };
+}
+export async function listImportPlans(itemId?: number): Promise<ImportPlan[]> {
+  const raw = await request<unknown>("GET", "/import-plans" + queryString({ itemId, limit: 40 }));
+  return pickArray<unknown>(raw, "plans").map(planOf);
 }
 /** GET /api/import-plans/:id —— 计划状态 + precheck + 每单元。 */
 export async function getImportPlan(id: number): Promise<ImportPlan> {
@@ -1571,8 +1643,8 @@ export async function getImportPlan(id: number): Promise<ImportPlan> {
  * POST /api/import-plans/:id/confirm —— **只做人工确认**（suggested → pending、user_confirmed=1、状态回 ready）。
  * 它不执行导入；执行是下一个 execute。返回 PlanView。
  */
-export async function confirmImportPlan(id: number): Promise<{ plan: ImportPlan }> {
-  const raw = await request<unknown>("POST", "/import-plans/" + id + "/confirm", {});
+export async function confirmImportPlan(id: number, riskAck: boolean): Promise<{ plan: ImportPlan }> {
+  const raw = await request<unknown>("POST", "/import-plans/" + id + "/confirm", { riskAck });
   return { plan: planOf(raw) };
 }
 /**
@@ -1591,12 +1663,15 @@ export async function executeImportPlan(id: number): Promise<ImportExecuteAck> {
 
 /**
  * POST /api/workbench/scan-all —— 批量结构分析（默认只补缺单元），返回 **202 {jobId, state}**。
- * 完成后需要重新拉 avatars/units；调用方用 GET /api/jobs 轮询该 job（不依赖 /jobs/:id）。
+ * 完成后重新读取素材列表与 Avatar 筛选项。
  */
 export async function scanAllWorkbench(onlyMissing = true): Promise<{ jobId: number; state: string }> {
   const raw = await request<unknown>("POST", "/workbench/scan-all", { onlyMissing }, { timeoutMs: 30000 });
   const r = rec(raw);
   return { jobId: numOr(r.jobId ?? r.job_id, 0), state: String(r.state ?? "") };
+}
+export function analyzeWorkbenchItem(itemId: number, refresh = false): Promise<{ jobId: number }> {
+  return request("POST", "/workbench/scan", { itemId, refresh });
 }
 /** GET /api/import-runs/:id —— 执行进度（每单元 state 原样透传）。 */
 export async function getImportRun(id: number): Promise<ImportRun> {
@@ -1698,6 +1773,89 @@ export function removeLoadoutItem(id: number, itemId: number): Promise<{ removed
   return request("DELETE", "/loadouts/" + id + "/items/" + itemId);
 }
 
+// ---------- 条目设为模型本体（SALT 首次确认；契约 salt-approval-and-contract.md） ----------
+// 新建与复用是两个互斥请求体：复用只带 existingAvatarId，绝不混传 name/aliases，也不用 force。
+
+export interface RegisterAvatarNewBody {
+  name: string;
+  aliases?: string[];
+  owned: boolean;
+}
+
+export interface RegisterAvatarReuseBody {
+  existingAvatarId: number;
+  owned: boolean;
+}
+
+export interface RegisterAvatarResult {
+  avatarId: number;
+  created: boolean;
+}
+
+export function registerAvatar(
+  itemId: number,
+  body: RegisterAvatarNewBody | RegisterAvatarReuseBody,
+): Promise<RegisterAvatarResult> {
+  return request("POST", "/items/" + itemId + "/register-avatar", body);
+}
+
+export interface AvatarConflict {
+  code: "AVATAR_NAME_CONFLICT" | "AVATAR_ALIAS_CONFLICT";
+  avatarId: number;
+  avatarName: string;
+}
+
+/**
+ * 409 冲突识别：只认 details.code 为两种 AVATAR_*_CONFLICT 且带合法 avatarId/avatarName 的响应。
+ * 其它错误（400/404/500/普通 409）返回 null —— 调用方据此决定「提示复用」还是「普通报错」。
+ */
+// ---------- Unity 一键安装（spec 2026-11-05-unity-mcp-install-design §7-§10） ----------
+// 请求体由 unity-install-view 的 builder 统一构造，避免 UI/传输两处漂移。
+// 超时：preview/apply/probe 30000（要读工程/探测 Editor），status 10000（只读磁盘）。
+
+export function unityInstallPreview(projectPath: string): Promise<UnityInstallPreview> {
+  return request("POST", "/unity/install/preview", installPreviewRequest(projectPath), { timeoutMs: 30000 });
+}
+
+export function unityInstallApply(previewId: string, confirmReplace = false): Promise<UnityInstallApplyResult> {
+  return request("POST", "/unity/install/apply", installApplyBody(previewId, confirmReplace), { timeoutMs: 30000 });
+}
+
+export function unityInstallOperation(operationId: string): Promise<UnityInstallOperation> {
+  return request("GET", "/unity/install/operations/" + operationId);
+}
+
+export function unityInstallRollback(operationId: string): Promise<UnityInstallOperation> {
+  // 路径身份来自 installRollbackRequest；wire body 按 spec §10 固定 {confirm:true}。
+  const target = installRollbackRequest(operationId);
+  return request("POST", "/unity/install/operations/" + target.operationId + "/rollback", { confirm: true }, { timeoutMs: 30000 });
+}
+
+export function unityInstallCancelPreview(previewId: string): Promise<{ cancelled: boolean }> {
+  const target = installCancelRequest(previewId);
+  return request("POST", "/unity/install/previews/" + target.previewId + "/cancel");
+}
+
+export function unityInstallStatus(projectPath: string): Promise<UnityInstallStatus> {
+  return request("GET", "/unity/install/status" + queryString(installStatusRequest(projectPath)), undefined, { timeoutMs: 10000 });
+}
+
+export function unityInstallProbe(input: { previewId?: string; operationId?: string }): Promise<UnityInstallProbe> {
+  return request("POST", "/unity/install/probe", installProbeRequest(input), { timeoutMs: 30000 });
+}
+
+export function avatarConflictOf(e: unknown): AvatarConflict | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const d = e.details as { code?: unknown; avatarId?: unknown; avatarName?: unknown } | undefined;
+  if (!d || typeof d !== "object") return null;
+  const code = d.code;
+  if (code !== "AVATAR_NAME_CONFLICT" && code !== "AVATAR_ALIAS_CONFLICT") return null;
+  const avatarId = Number(d.avatarId);
+  if (!Number.isInteger(avatarId) || avatarId <= 0) return null;
+  if (typeof d.avatarName !== "string" || d.avatarName === "") return null;
+  return { code, avatarId, avatarName: d.avatarName };
+}
+
 export function reorderLoadoutItems(id: number, itemIds: number[]): Promise<{ items: LoadoutItem[] }> {
   return request("POST", "/loadouts/" + id + "/items/reorder", { itemIds });
 }
@@ -1782,4 +1940,65 @@ export function updateCleanupFilter(
 /** DELETE /api/cleanup/filters/:id —— 幂等 0/1，不 404。 */
 export function deleteCleanupFilter(id: number): Promise<{ deleted: 0 | 1 }> {
   return request("DELETE", "/cleanup/filters/" + id);
+}
+
+// ---------- BOOTH 更正（frozen-interface-B1.md；只新更正模式，不动旧 link-booth/PATCH） ----------
+// DTO 按冻结接口自定义在本文件（不改 types.ts）；错误 details 由既有 request 原样透传。
+
+export interface BoothCorrectionBinding {
+  sourceSite: SourceSite | null;
+  sourceItemId: string | null;
+  sourceUrl: string | null;
+  canonicalUrl: string | null;
+  sourceGone: boolean;
+}
+
+export interface BoothCorrectionTarget {
+  itemId: string;
+  url: string;
+  canonicalUrl: string;
+  title: string;
+  shop: { name: string; subdomain: string } | null;
+  priceText: string | null;
+  priceYen: number | null;
+  publishedAt: string | null;
+  isAdult: boolean;
+  category: { name: string; parent: string | null } | null;
+  tags: string[];
+  imageCount: number;
+  fileCount: number;
+}
+
+export interface BoothCorrectionPreview {
+  itemId: number;
+  current: BoothCorrectionBinding;
+  target: BoothCorrectionTarget;
+  willChange: string[];
+  willPreserve: string[];
+  conflict: null | { itemId: number; title: string };
+}
+
+export interface BoothCorrectionConfirmBody {
+  url: string;
+  expectedSourceSite: SourceSite | null;
+  expectedSourceItemId: string | null;
+  expectedSourceUrl: string | null;
+  expectedTargetItemId: string;
+  confirm: true;
+}
+
+export interface BoothCorrectionConfirmResult {
+  changed: boolean;
+  itemId: number;
+  previousBinding: BoothCorrectionBinding;
+  currentBinding: BoothCorrectionBinding;
+  item: ItemDetailWeb;
+}
+
+export function boothCorrectionPreview(itemId: number, url: string): Promise<BoothCorrectionPreview> {
+  return request("POST", "/items/" + itemId + "/booth-correction/preview", { url }, { timeoutMs: 30000 });
+}
+
+export function boothCorrectionConfirm(itemId: number, body: BoothCorrectionConfirmBody): Promise<BoothCorrectionConfirmResult> {
+  return request("POST", "/items/" + itemId + "/booth-correction/confirm", body, { timeoutMs: 30000 });
 }

@@ -1,7 +1,7 @@
 // AssetVault 桌面壳（Electron 主进程）。
 // 顺序很重要：①单实例锁（第二实例只转交 URL 后立刻退出，绝不再起服务/DB）②起 HTTP 服务 ③等 GUI ready 再建窗口。
-import { app, BrowserWindow, Menu, Notification, dialog, shell } from "electron";
-import { join, dirname } from "node:path";
+import { app, BrowserWindow, Menu, Notification, dialog, ipcMain, nativeImage, shell } from "electron";
+import { join, dirname, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, mkdirSync, appendFileSync } from "node:fs";
 
@@ -47,6 +47,10 @@ if (!isFirstInstance) {
   let win = null;
   let handle = null;
   let pendingUrl = null;
+  let nativeDragActive = false;
+  const dragIcon = nativeImage.createFromDataURL(
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAMUlEQVQ4jWNgGHLg7rv//0nBDKMGYoARHoampRux4sHjwrujXr476MLw7qA0kGGwAQDPJMWrevE5NQAAAABJRU5ErkJggg==",
+  );
 
   async function startServer() {
     const mod = await import(pathToFileURL(join(here, "build", "server.mjs")).href);
@@ -54,21 +58,61 @@ if (!isFirstInstance) {
     let lastErr = null;
     for (const port of [7317, 7318, 7319, 7320, 7321]) {
       try {
-        return await mod.startAssetVault({
+        const h = await mod.startAssetVault({
           port, host: "127.0.0.1", dataDir, version: app.getVersion(), onLog: logLine, logsDir,
           webDistDir: join(appRoot, "apps", "web", "dist"),
           seedFile: join(appRoot, "config", "avatars.seed.json"),
           schemaFile: join(here, "build", "schema.sql"),
         });
+        return { ...h, archiveDrag: SERVER_ONLY ? null : mod.createArchiveDragStaging((id) => h.repo.getAsset(id)) };
       } catch (e) { lastErr = e; logLine("port " + port + " failed: " + String((e && e.message) || e)); }
     }
     throw lastErr ?? new Error("no free port");
   }
 
+  function isAppFrame(event) {
+    const frame = event.senderFrame;
+    if (!win || !handle || !frame || event.sender !== win.webContents || frame !== win.webContents.mainFrame) return false;
+    try { return new URL(frame.url).origin === handle.url; } catch { return false; }
+  }
+
+  if (!SERVER_ONLY) {
+    ipcMain.handle("import-folder:choose", async (event, defaultPath) => {
+      if (!isAppFrame(event)) return null;
+      const result = await dialog.showOpenDialog(win, {
+        title: "选择导入位置",
+        defaultPath: typeof defaultPath === "string" && isAbsolute(defaultPath) ? defaultPath : undefined,
+        properties: ["openDirectory"],
+      });
+      return result.canceled ? null : result.filePaths[0] ?? null;
+    });
+    ipcMain.handle("archive-drag:prepare", async (event, entry) => {
+      if (!isAppFrame(event)) return { error: "此页面不能拖出包内文件" };
+      try {
+        return { token: await handle.archiveDrag.prepare(entry) };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "无法准备包内文件" };
+      }
+    });
+    ipcMain.handle("archive-drag:start", (event, token) => {
+      if (!isAppFrame(event)) return { ok: false, error: "此页面不能拖出包内文件" };
+      if (nativeDragActive) return { ok: false, error: "已有一个文件正在拖动" };
+      const file = handle.archiveDrag.fileForToken(token);
+      if (!file) return { ok: false, retry: true, error: "文件需要重新准备" };
+      nativeDragActive = true;
+      try {
+        event.sender.startDrag({ file, icon: dragIcon });
+        return { ok: true };
+      } catch {
+        return { ok: false, error: "系统未能启动文件拖动" };
+      } finally { nativeDragActive = false; }
+    });
+  }
+
   function createWindow(url) {
     win = new BrowserWindow({
       width: 1560, height: 980, minWidth: 1100, minHeight: 700, backgroundColor: "#0f1115",
-      title: "AssetVault 资源库", webPreferences: { contextIsolation: true, nodeIntegration: false },
+      title: "AssetVault 资源库", webPreferences: { contextIsolation: true, nodeIntegration: false, preload: join(here, "preload.cjs") },
     });
     win.loadURL(url);
     win.on("closed", () => { win = null; });
@@ -135,9 +179,17 @@ if (!isFirstInstance) {
 
   app.on("window-all-closed", () => { void shutdown(); });
   let shuttingDown = false;
+  app.on("before-quit", (event) => {
+    if (shuttingDown) return;
+    event.preventDefault();
+    void shutdown();
+  });
   async function shutdown() {
     if (shuttingDown) return; shuttingDown = true;
-    try { const h = await serverPromise; await h.close(); } catch { /* ignore */ }
+    try {
+      const h = await serverPromise;
+      try { await h.archiveDrag?.dispose(); } finally { await h.close(); }
+    } catch { /* ignore */ }
     app.quit();
   }
 }

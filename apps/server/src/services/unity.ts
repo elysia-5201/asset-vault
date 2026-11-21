@@ -288,6 +288,30 @@ export class UnityMcp {
     }
   }
 
+  /** 列出 MCP 工具（tools/list）；会话失效重连一次。只读，不触发任何编辑器动作。 */
+  async listTools(): Promise<Array<{ name: string; inputSchema?: unknown }>> {
+    const s = await this.connect();
+    try { return await this.listToolsOn(s); }
+    catch (e) {
+      if ((e as { code?: string })?.code !== "SESSION_LOST") throw e;
+      const fresh = await this.connect(true);
+      return await this.listToolsOn(fresh);
+    }
+  }
+
+  private async listToolsOn(s: McpSession): Promise<Array<{ name: string; inputSchema?: unknown }>> {
+    const r = await this.post(s.url, { jsonrpc: "2.0", id: this.id++, method: "tools/list", params: {} }, s.sid);
+    if (r.status !== 200) throw Object.assign(new Error("Unity MCP tools/list HTTP " + r.status), { status: 502 });
+    if (r.json?.error) {
+      const msg = String(r.json.error.message ?? "MCP tools/list 失败");
+      if (/session|initialized/i.test(msg)) throw Object.assign(new Error(msg), { code: "SESSION_LOST" });
+      throw Object.assign(new Error(msg), { status: 502 });
+    }
+    const tools = r.json?.result?.tools;
+    if (!Array.isArray(tools)) return [];
+    return tools.map((t: { name?: unknown; inputSchema?: unknown }) => ({ name: String(t?.name ?? ""), inputSchema: t?.inputSchema }));
+  }
+
   /** 在编辑器主线程跑一段 C#（方法体，可 return），返回它的返回值。 */
   async csharp(code: string): Promise<string> {
     const r = await this.call("execute_code", { action: "execute", code, safety_checks: true });

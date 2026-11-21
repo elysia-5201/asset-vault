@@ -20,6 +20,7 @@ import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { listUnityPackage } from "../../../../packages/core/src/unitypackage";
 import { scanPaths, RISK_SCANNER_VERSION, type RiskHit, type RiskState, type RiskScanResult } from "../../../../packages/core/src/risk";
 import { sha256FileWithSize } from "../../../../packages/core/src/hash";
+import type { AssetRow } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 import {
   UnityMcp, unityEditorInfo, importPackagesIntoUnity,
@@ -48,6 +49,35 @@ interface UnitRowInput {
 
 function fingerprintOf(asset: { size?: number | null; mtime?: string | null; sha256?: string | null }, size?: number): string {
   return `${Number(size ?? asset.size ?? 0)}:${String(asset.mtime ?? "")}:${String(asset.sha256 ?? "").slice(0, 8)}`;
+}
+
+/**
+ * Keep already indexed unit rows usable after a verified same-content relocation.
+ * Only advance fingerprints that exactly represented the previous asset snapshot;
+ * stale/unknown unit evidence remains stale. Plan-item fingerprints and source snapshots
+ * are immutable history and deliberately are not rewritten here.
+ */
+export function refreshRelocatedUnitFingerprints(
+  repo: Repo,
+  previousAsset: Pick<AssetRow, "id" | "path" | "size" | "mtime" | "sha256" | "kind" | "container">,
+  updatedAsset: Pick<AssetRow, "id" | "path" | "size" | "mtime" | "sha256" | "kind" | "container">,
+): void {
+  if (previousAsset.id !== updatedAsset.id) throw new Error("relocation must preserve asset identity");
+  const units = repo.connection.prepare("SELECT id, rel_path, name, size, fingerprint FROM asset_units WHERE asset_id=? ORDER BY id")
+    .all(previousAsset.id) as { id: number; rel_path: string; name: string; size: number; fingerprint: string | null }[];
+  const oldName = baseName(previousAsset.path);
+  const newName = baseName(updatedAsset.path);
+  const directUnityPackage = previousAsset.kind === "unitypackage" || previousAsset.container === "unitypackage";
+  const update = repo.connection.prepare("UPDATE asset_units SET fingerprint=?, rel_path=?, name=?, updated_at=? WHERE id=? AND fingerprint=?");
+  for (const unit of units) {
+    const oldFingerprint = fingerprintOf(previousAsset, Number(unit.size) || undefined);
+    if (!unit.fingerprint || unit.fingerprint !== oldFingerprint) continue;
+    const directPackageUnit = directUnityPackage && unit.rel_path === oldName && unit.name === oldName;
+    const containerUnit = unit.rel_path === "" && unit.name === oldName;
+    const relPath = directPackageUnit ? newName : unit.rel_path;
+    const name = directPackageUnit || containerUnit ? newName : unit.name;
+    update.run(fingerprintOf(updatedAsset, Number(unit.size) || undefined), relPath, name, nowIso(), unit.id, oldFingerprint);
+  }
 }
 
 // ---------------------------------------------------------------- 源文件物理快照（Task 2）
@@ -596,6 +626,8 @@ export interface PrecheckUnit {
 
 export interface PlanView {
   plan: any; items: any[]; precheck: any;
+  itemTitle: string | null;
+  jobId: number | null;
   /** 最新一次执行批次 id（无执行过则为 null），前端据此轮询 /api/import-runs/:id。 */
   run_id: number | null;
   latestRun: { id: number; status: string; started_at: string | null; finished_at: string | null; summary: any; console_errors: any } | null;
@@ -610,7 +642,7 @@ function nowIso(): string { return new Date().toISOString(); }
 
 function fingerprintNowOf(repo: Repo, planItem: any): string | null {
   const asset = repo.getAsset(Number(planItem.asset_id));
-  if (!asset) return null;
+  if (!asset || asset.status !== "present") return null;
   // 指纹含"单元大小"（压缩包内条目与整包 size 不同）；plan_item 不冗余 size，统一从 unit 读。
   const unit = repo.getUnitsByIds([Number(planItem.unit_id)])[0];
   return fingerprintOf(asset, Number(unit?.size ?? NaN) || undefined);
@@ -662,12 +694,14 @@ export async function createImportPlan(repo: Repo, input: { unitIds: number[]; p
     if (asset) assetById.set(Number(u.asset_id), asset);
     const fpNow = asset ? fingerprintOf(asset, Number(u.size) || undefined) : null;
     const changed = !asset || String(fpNow) !== String(u.fingerprint);
-    const exists = !!asset && existsSync(String(asset.path));
+    const exists = !!asset && String((asset as any).status ?? "present") === "present" && existsSync(String(asset.path));
     const mixed = u.policy === "mixed_unitypackage";
     const suggested = !selectedIds.has(Number(u.id));
     const status = changed ? "blocked" : suggested ? "suggested" : "pending";
     const error = changed ? "指纹已变化（单元=" + u.fingerprint + "，当前=" + fpNow + "）"
-      : !exists ? "原始文件不存在：" + String(asset?.path ?? "")
+      : !exists ? (asset && String((asset as any).status ?? "present") !== "present"
+        ? "素材不可用（status=" + String((asset as any).status) + "）：" + String(asset.path ?? "")
+        : "原始文件不存在：" + String(asset?.path ?? ""))
       : null;
     relPaths.set(Number(u.id), String(u.rel_path ?? ""));
     return {
@@ -774,10 +808,12 @@ export function getPlanView(repo: Repo, planId: number): PlanView | null {
   const plan = repo.getImportPlan(planId);
   if (!plan) return null;
   const latest = repo.latestImportRun(planId);
+  const inflight = repo.findInflightImportJob(planId);
   const summary = latest ? safeJson(latest.summary_json) : null;
   const err = summary && typeof summary === "object" ? (summary as any).error : null;
   return {
-    plan, items: repo.listImportPlanItems(planId), precheck: safeJson(plan.precheck_json),
+    plan, items: repo.listImportPlanItems(planId), precheck: safeJson(plan.precheck_json), jobId: inflight ? Number(inflight.id) : null,
+    itemTitle: plan.item_title ?? null,
     run_id: latest ? Number(latest.id) : null,
     latestRun: latest ? {
       id: Number(latest.id), status: String(latest.status),
@@ -804,6 +840,9 @@ export function confirmImportPlan(repo: Repo, planId: number, opts: { riskAck?: 
   if (!plan) throw appErr("NOT_FOUND", "计划不存在", 404);
   if (plan.status === "blocked" || plan.risk_state === "blocked") {
     throw appErr("RISK_BLOCKED", "计划被风险规则阻断，不能确认执行", 409);
+  }
+  if (Number(plan.user_confirmed) === 1 || !["ready", "needs_confirmation"].includes(String(plan.status))) {
+    throw appErr("PLAN_NOT_CONFIRMABLE", "计划已确认、已开始或已结束，不能再次确认", 409);
   }
   const riskState = String(plan.risk_state ?? "");
   if ((riskState === "warning" || riskState === "unknown") && opts.riskAck !== true) {
@@ -939,7 +978,7 @@ export async function applyPlanRisk(repo: Repo, planId: number): Promise<PlanVie
   const plan = repo.getImportPlan(planId);
   if (!plan) return null;
   let status = String(plan.status);
-  if (!plan.user_confirmed) {
+  if (!plan.user_confirmed && status !== "blocked") {
     if (risk.state === "blocked") status = "blocked";
     else if (risk.state === "warning" || risk.state === "unknown") status = "needs_confirmation";
   }

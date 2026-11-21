@@ -207,7 +207,7 @@ export function listCleanupTodos(repo: Repo, q: CleanupQuery): CleanupTodosResul
     "i.source_site AS source_site, i.source_gone AS source_gone," +
     " (SELECT COUNT(*) FROM item_images im WHERE im.item_id = X.item_id) AS image_count," +
     " (SELECT COUNT(*) FROM item_avatars ia WHERE ia.item_id = X.item_id) AS item_avatar_count," +
-    " (SELECT COUNT(*) FROM asset_avatars aa JOIN assets a ON a.id = aa.asset_id WHERE a.item_id = X.item_id) AS asset_avatar_count," +
+    " (SELECT COUNT(*) FROM asset_avatars aa JOIN assets a ON a.id = aa.asset_id WHERE a.item_id = X.item_id AND a.status<>'trashed') AS asset_avatar_count," +
     " (SELECT COUNT(*) FROM assets a2 WHERE a2.item_id = X.item_id AND a2.status = 'missing') AS missing_asset_count";
 
   if (ignored !== "only") {

@@ -43,17 +43,17 @@ describe("focusApplyAllowed：未分析条目扫描后仍可带入一次", () =>
 describe("AvatarWorkbench 源码级防回退（N1 + 刷新按钮）", () => {
   const src = () => readFileSync(fileURLToPath(new URL("../../apps/web/src/components/AvatarWorkbench.tsx", import.meta.url)), "utf8");
 
-  test("映射逻辑走纯函数：无单元时不置位 focusAppliedRef，有单元才置位", () => {
+  test("结构未加载时等待，自动预选只触发一次", () => {
     const s = src();
-    assert.ok(s.includes("focusApplyAllowed"), "必须复用可单测的纯函数");
+    assert.ok(s.includes("mapFocusToUnits"), "复用可测的精确映射");
     assert.ok(s.includes('from "../workbench-focus"'), "必须从纯函数模块导入（不内联映射逻辑）");
-    assert.ok(s.includes("if (!focusApplyAllowed(focus, items, focusAppliedRef.current)) return;"), "无单元/已带入都不得置位");
-    assert.match(s, /focusAppliedRef.current = key;/, "只有成功带入后才置位（避免每次 reload 覆盖手动选择）");
+    assert.match(s, /!units\.length \|\| preferenceApplied\.current\) return/);
+    assert.match(s, /preferenceApplied\.current = true;/);
   });
 
   test("focus 视图下刷新按钮不再被 avatarId === null 禁用", () => {
     const s = src();
     assert.ok(!/disabled=\{avatarId === null\}/.test(s), "focus 模式 avatarId 通常为 null，按钮不能再因此禁用");
-    assert.match(s, /disabled=\{avatarId === null && !\(focusOnly && focus\)\}/, "只在非 focus 且没选 Avatar 时才禁用");
+    assert.match(s, /launchAnalysis\(focus\.itemId\).*分析本条/);
   });
 });

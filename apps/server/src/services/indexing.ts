@@ -9,7 +9,6 @@
  * 扫描 / 导入 / 应用 走 IndexPipeline（后台、有界并发、可取消），不调用这里。
  * 两边共用 stage* 实现，避免"两条索引路径行为不一致"。
  */
-import type { AssetRow } from "../../../../packages/core/src/contracts";
 import type { Repo } from "../db/repo";
 import type { MediaStore } from "./media";
 import type { CacheLike, CacheMeta } from "./pipeline/cache";
@@ -36,7 +35,7 @@ class MemoryCache implements CacheLike {
 
 /** 列目录 / 解析 unitypackage / 抽取缩略图 / 哈希 / 结构签名。不启动 Unity，不搬动素材本体。 */
 export async function indexAsset(repo: Repo, media: MediaStore, assetId: number, opts: IndexOptions = {}): Promise<IndexResult> {
-  const asset = repo.getAsset(assetId) as AssetRow | null;
+  const asset = repo.getActiveAsset(assetId);
   if (!asset) throw new Error(`asset ${assetId} not found`);
   const limits: PipelineLimits = { ...DEFAULT_LIMITS, ...(opts.limits ?? {}) };
   if (opts.hashMaxBytes !== undefined) limits.maxHashBytes = Math.max(0, opts.hashMaxBytes);

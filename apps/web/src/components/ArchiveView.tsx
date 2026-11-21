@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type HTMLAttributes } from "react";
 import type { ArchiveEntry, AssetRow, UnityPackageAsset } from "@core/contracts";
 import { getAsset, getAssetTree, getUnityPackage, readEntry, reindexAsset, describeError, type EntryPreview } from "../api";
+import { useArchiveFileDrag } from "../archive-file-drag";
 import { buildTree, extOf, filterTree, formatBytes, isImageish, isTextish, type TreeNode } from "../util";
 import { Badge, Collapsible, EvidenceLine, Section } from "./ui";
 
@@ -14,12 +15,14 @@ const NESTABLE = /\.(zip|7z|rar)$/i;
 function TreeNodeView(props: {
   node: TreeNode; depth: number; expanded: Set<string>; toggle: (p: string) => void; onFile: (p: string) => void;
   canNest: boolean; nestedOpen: Set<string>; nested: Record<string, ArchiveEntry[]>; nestedBusy: string | null; onNested: (p: string) => void;
+  dragFile?: (path: string, nested?: string) => HTMLAttributes<HTMLSpanElement> | undefined;
 }) {
   const { node } = props;
   const open = node.isDir ? props.expanded.has(node.path) : false;
   const nestable = props.canNest && !node.isDir && NESTABLE.test(node.path);
   const nOpen = props.nestedOpen.has(node.path);
   const kids = props.nested[node.path] ?? [];
+  const fileDrag = node.isDir ? undefined : props.dragFile?.(node.path);
   const pad = (d: number) => ({ paddingLeft: 4 + d * 12 });
   return (
     <>
@@ -27,8 +30,8 @@ function TreeNodeView(props: {
         {node.isDir
           ? <span className="nm" onClick={() => props.toggle(node.path)}>{open ? "▾" : "▸"} 📁 {node.name}</span>
           : nestable
-            ? <span className="nm" onClick={() => props.onNested(node.path)} title="点开看这个内层压缩包的目录（嵌套只展开一层）">{nOpen ? "▾" : "▸"} 📦 {node.name}</span>
-            : <span className="nm" onClick={() => props.onFile(node.path)} title="读取包内文件预览">📄 {node.name}</span>}
+            ? <span className="nm" {...fileDrag} onClick={() => props.onNested(node.path)} title={fileDrag ? "点开目录，或拖出整个内层压缩包" : "点开看这个内层压缩包的目录"}>{nOpen ? "▾" : "▸"} 📦 {node.name}</span>
+            : <span className="nm" {...fileDrag} onClick={() => props.onFile(node.path)} title={fileDrag ? "单击预览，拖动到 Unity 的 Project 面板" : "读取包内文件预览"}>📄 {node.name}</span>}
         <span className="sz">{node.isDir ? node.fileCount + " 项 · " + formatBytes(node.totalSize) : formatBytes(node.size)}</span>
       </div>
       {open && node.children.map((c) => <TreeNodeView key={c.path} {...props} node={c} depth={props.depth + 1} />)}
@@ -39,7 +42,7 @@ function TreeNodeView(props: {
             ? <div className="tree-node file" style={pad(props.depth + 1)}><span className="hint">（内层包读不出条目）</span></div>
             : kids.map((e) => (
                 <div className={"tree-node " + (e.isDir ? "dir" : "file")} key={node.path + "/" + e.path} style={pad(props.depth + 1)} title="内层包内容（预览请先解出来再看）">
-                  <span className="nm">{e.isDir ? "📁 " : "📄 "}{e.path}</span>
+                  <span className="nm" {...(!e.isDir ? props.dragFile?.(e.path, node.path) : undefined)}>{e.isDir ? "📁 " : "📄 "}{e.path}</span>
                   {!e.isDir && <span className="sz">{formatBytes(e.size)}</span>}
                 </div>
               ))
@@ -79,6 +82,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
   const [nestedBusy, setNestedBusy] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ path: string; data: EntryPreview } | null>(null);
   const [assetAvatars, setAssetAvatars] = useState<{ avatar_id: number; entry_prefix: string | null; confidence: number; evidence: string | null }[]>([]);
+  const dragFile = useArchiveFileDrag(asset.id, asset.status === "present" && /^(zip|7z|rar)$/.test(asset.container ?? "") && !meta.passwordProtected, props.onToast);
 
   // 资产切换：重置 + 拉"包内目录"（压缩包）或直接进 unitypackage 页（.unitypackage 本体）
   useEffect(() => {
@@ -235,6 +239,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
 
       {tab === "tree" && !loading && !err && (
         <>
+          {dragFile && tree.length > 0 && <div className="hint archive-drag-hint">按住文件名拖到 Unity 的 Project 面板</div>}
           {!isUp && entries.some((e) => NESTABLE.test(e.path)) && (
             <div className="hint" style={{ marginBottom: "4px" }}>📦 的行是内层压缩包，点一下展开它的目录</div>
           )}
@@ -242,7 +247,7 @@ export function ArchiveView(props: { asset: AssetRow; onToast: (kind: "ok" | "ba
             ? <div className="tree">{tree.map((n) => (
                 <TreeNodeView
                   key={n.path} node={n} depth={0} expanded={expanded} toggle={toggle} onFile={openFile}
-                  canNest nestedOpen={nestedOpen} nested={nested} nestedBusy={nestedBusy} onNested={openNested}
+                  canNest nestedOpen={nestedOpen} nested={nested} nestedBusy={nestedBusy} onNested={openNested} dragFile={dragFile}
                 />
               ))}</div>
             : <div className="hint">无条目</div>}
