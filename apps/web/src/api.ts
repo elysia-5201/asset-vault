@@ -1,3 +1,4 @@
+import type { SearchFacet } from "@core/search-query";
 /**
  * 统一 HTTP 层 —— 所有 fetch 只从这里发出（组件不得直接 fetch）。
  * 服务不可达时自动回退内置 mock（形状严格同 docs/api.md）。
@@ -269,7 +270,7 @@ function itemFilterParams(q: ItemQuery): Record<string, unknown> {
   };
 }
 
-export async function listItems(q: ItemQuery): Promise<ItemsResponse> {
+export async function listItems(q: ItemQuery, signal?: AbortSignal): Promise<ItemsResponse> {
   const raw = await request<unknown>("GET", "/items" + queryString({
     ...itemFilterParams(q),
     // 契约写法是 catIds=clothing,clothing.tops（服务端按 avatar 的方式 String(x).split(",")，逗号串两种实现都吃）
@@ -278,10 +279,35 @@ export async function listItems(q: ItemQuery): Promise<ItemsResponse> {
     uncategorized: q.uncategorized ? 1 : undefined,
     pendingCategory: q.pendingCategory ? 1 : undefined,
     sort: q.sort, limit: q.limit, offset: q.offset,
-  }));
+  }), undefined, { signal });
   const items = pickArray<ItemCardWeb>(raw, "items");
   const total = numOr(rec(raw).total, items.length);
-  return { total, items };
+  return { total, items, search: rec(raw).search as ItemsResponse["search"] };
+}
+
+export type { SearchFacet } from "@core/search-query";
+export interface SearchIndexState {
+  version: number; lexiconVersion: number; total: number; indexed: number; pending: number; failed: number; paused?: boolean;
+  contentPending: number; contentFailed: number; contentLimited: number; pathLimitedItems: number;
+}
+export function getSearchSuggestions(q: string, signal?: AbortSignal): Promise<{ suggestions: { query: string; label: string }[] }> {
+  return request("GET", "/search/suggestions" + queryString({ q }), undefined, { signal });
+}
+export function getSearchFacets(q: ItemQuery, dimension: SearchFacet, signal?: AbortSignal): Promise<{ options: { value: string; count: number }[] }> {
+  return request("GET", "/search/facets" + queryString({
+    ...itemFilterParams(q), dimension, catIds: q.categoryIds?.join(","), uncategorized: q.uncategorized ? 1 : undefined,
+  }), undefined, { signal });
+}
+export function getSearchAlternatives(q: ItemQuery, signal?: AbortSignal): Promise<{
+  relaxations: { query: string; removed: string; count: number }[]; index: SearchIndexState;
+}> {
+  return request("GET", "/search/alternatives" + queryString({
+    ...itemFilterParams(q), catIds: q.categoryIds?.join(","), uncategorized: q.uncategorized ? 1 : undefined,
+  }), undefined, { signal });
+}
+export function getSearchIndex(): Promise<SearchIndexState> { return request("GET", "/search/index"); }
+export function maintainSearchIndex(action: "pause" | "resume" | "repair" | "rebuild" | "cancel-rebuild"): Promise<SearchIndexState | { jobId: number }> {
+  return request("POST", "/search/index", { action });
 }
 
 export async function getItem(id: number): Promise<ItemDetailWeb> {
@@ -373,8 +399,8 @@ function countMap(x: unknown): Record<string, number> {
  * GET /api/categories/counts?<与 /api/items 相同的筛选参数> → { all, uncategorized, tops, subs }
  * 一级分类栏显示的就是这份**当前筛选下**的计数（随关键词/标签/头像/来源/状态/容器/已导入/收藏变化）。
  */
-export async function getCategoryCounts(q: ItemQuery = {}): Promise<CategoryCounts> {
-  const raw = rec(await request<unknown>("GET", "/categories/counts" + queryString(itemFilterParams(q))));
+export async function getCategoryCounts(q: ItemQuery = {}, signal?: AbortSignal): Promise<CategoryCounts> {
+  const raw = rec(await request<unknown>("GET", "/categories/counts" + queryString(itemFilterParams(q)), undefined, { signal }));
   return {
     all: numOr(raw.all, 0),
     uncategorized: numOr(raw.uncategorized, 0),

@@ -1,3 +1,4 @@
+import { enqueueSearchBackfill } from "../services/search-index";
 import { readdirSync, statSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
@@ -605,8 +606,20 @@ export async function runJob(deps: JobDeps, jobId: number, opts: RunJobOptions =
         throw e;
       }
     } else if (job().kind === "reindex") {
-      const id = payload.assetId ? Number(payload.assetId) : 0;
-      if (id > 0) { scratch.directIndexIds.push(id); const a = repo.getAsset(id); if (a) scratch.directItemIds.push(a.item_id); }
+      if (payload.searchMaintenance === "rebuild" || payload.searchMaintenance === "repair") {
+        repo.connection.transaction(() => {
+          ensureLease();
+          if (lease && !repo.connection.prepare("SELECT 1 FROM jobs WHERE id=? AND holder=? AND lease_token=? AND state='resolving'").get(jobId, lease.holder, lease.token)) {
+            throw new LeaseLostError("搜索维护作业租约已失效");
+          }
+          enqueueSearchBackfill(repo.connection, payload.searchMaintenance === "rebuild", payload.searchMaintenance === "repair");
+          if (payload.searchMaintenance === "repair") repo.connection.prepare("UPDATE search_dirty SET failures=0,error=NULL WHERE failures>0").run();
+        }).immediate();
+        scratch.note = "search index maintenance queued for background worker";
+      } else {
+        const id = payload.assetId ? Number(payload.assetId) : 0;
+        if (id > 0) { scratch.directIndexIds.push(id); const a = repo.getAsset(id); if (a) scratch.directItemIds.push(a.item_id); }
+      }
     } else if (job().kind === "match_avatars") {
       if (!job().item_id) throw new Error("match_avatars 需要 item_id");
       scratch.directItemIds.push(job().item_id!);

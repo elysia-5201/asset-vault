@@ -7,8 +7,29 @@ import { Badge, CATEGORY_SOURCE_LABEL, SITE_LABEL, STATUS_LABEL } from "./ui";
 /** 卡片多图轮播：ItemCard 只有 coverUrl，故首次悬停/聚焦时按需 GET /items/:id 取 images（缓存）。 */
 const imageCache = new Map<number, string[]>();
 
+const searchReasons: Record<string, string> = {
+  "exact-id": "BOOTH 商品号", "exact-path": "完整文件路径", "exact-title": "完整商品名",
+  title: "商品名称", tags: "标签", author: "作者／店铺", description: "商品说明", files: "本地文件名",
+  contents: "包内文件", "avatar:confirmed": "已确认适配", "avatar:possible": "可能适配", "tag:manual": "用户标签",
+  type: "主体分类", component: "包含部件", typo: "近似拼写", filter: "符合筛选", legacy: "文字匹配",
+};
+const pathKinds: Record<string, string> = {
+  file: "本地文件", archive: "压缩包内", unitypackage: "UnityPackage 内",
+  "verified-dependency": "已验证依赖", "inferred-dependency": "推断依赖",
+};
+
+function highlightTitle(title: string, text?: string) {
+  const tokens = (text ?? "").split(/\s+/u).filter((v) => v.length >= 2 && !v.includes(":")).slice(0, 8);
+  const pattern = tokens.map((v) => v.replace(/[.*+?^$\{\}()|[\]\\]/gu, "\\$&")).join("|");
+  if (!pattern) return title;
+  const parts = title.split(new RegExp("(" + pattern + ")", "giu"));
+  return parts.map((part, i) => i % 2 ? <mark key={i}>{part}</mark> : part);
+}
+const MAX_CACHED_GALLERIES = 120;
+
 export function ItemCardView(props: {
   item: ItemCardWeb;
+  searchText?: string;
   onOpen: (id: number) => void;
   onToggleFavorite: (item: ItemCardWeb) => void;
   imported: boolean;
@@ -114,13 +135,24 @@ export function ItemCardView(props: {
       </div>
       <div className="card-body">
         {/* 标题截断（.card-title 两行 clamp）+ 完整标题可见（title 属性 / 悬停原生 tooltip） */}
-        <div className="card-title" title={item.title}>{item.title}</div>
+        <div className="card-title" title={item.title}>{highlightTitle(item.title, props.searchText)}</div>
         <div className="card-meta">
           <span>{SITE_LABEL[item.sourceSite]}</span>
           <span>· {item.imageCount} 图 / {item.assetCount} 资产</span>
           <span>· {formatBytes(item.totalBytes)}</span>
           {item.shopName && <span>· {item.shopName}</span>}
         </div>
+        {item.search && <div className="card-search-reasons" title={item.search.reasons.map((reason) => {
+          const label = searchReasons[reason.replace(/:expanded$/u, "")] ?? reason;
+          return reason.endsWith(":expanded") ? label + "（同义词）" : label;
+        }).join(" · ")}>
+          {item.search.paths?.[0] ? <span title={item.search.paths[0].path}>
+            {pathKinds[item.search.paths[0].kind]} · {item.search.paths[0].path.split(/[\\/]/u).at(-1)}
+          </span> : item.search.reasons.slice(0, 3).map((reason) => {
+            const label = searchReasons[reason.replace(/:expanded$/u, "")] ?? reason;
+            return reason.endsWith(":expanded") ? label + "（同义词）" : label;
+          }).join(" · ")}
+        </div>}
         <div className="row wrap" style={{ gap: "4px" }}>
           {catLabel
             ? <Badge tone="busy" title={"物品分类：" + catLabel + (cat?.source ? "（" + CATEGORY_SOURCE_LABEL[cat.source] + "）" : "")}>{catLabel}</Badge>

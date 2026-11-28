@@ -5,7 +5,6 @@
 [![Version](https://img.shields.io/badge/version-0.7.2-blue.svg)](#-快速开始)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-brightgreen.svg)](https://nodejs.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20WSL%20%7C%20Linux%20%7C%20macOS-blue.svg)](#-快速开始)
-[![Tests](https://img.shields.io/badge/tests-768%20pass%20%2F%200%20fail-brightgreen.svg)](#-测试与验收)
 
 > 把散落在各个下载目录里的 BOOTH / Unity / VRChat 素材，收成一个**可检索、能直接导进 Unity** 的本地资源库。
 
@@ -35,7 +34,7 @@
 | **分类管理页** | 树形管理：新增/重命名/排序/移动子分类到别的一级/停用/删除/**合并**；删除与合并前显示**影响面**（多少素材、多少子分类）并二次确认，素材只能**转移**到指定分类或「未分类」，系统分类不可删 |
 | **可解释自动分类** | 按标题·标签·描述·文件名·包内路径·unitypackage 路径·BOOTH 分类打分：每条都带命中词与权重；高置信度自动应用、中置信度只出建议、低置信度保持未分类；**手动/采纳的分类永不被自动任务覆盖** |
 | **标签（与分类分开）** | 默认 11 个标签（哥特风/可爱风/赛博风/黑色/白色/免费/已购买/PhysBones/Modular Avatar/Quest 兼容/待检查，带颜色）；支持新建/改名/改色/删除，素材可挂多个标签，筛选支持 **ANY / ALL** |
-| **中日文子串搜索** | SQLite FTS5 **trigram**（`Shinano` / `ミルフィ` / `しなの` / `milky` 都能中段命中；<3 字符回退 LIKE） |
+| **Search 2.0** | 中日英关键词、Avatar 别名、BOOTH 商品号、文件名和已索引的包内路径可组合搜索。支持相关度排序、命中解释、动态筛选及后台增量索引。 |
 | **大库浏览** | 列表分页：首屏 120 条，滚到底自动续页（「加载更多」兜底）；排序带 id 兜底列，批量扫描的同毫秒条目翻页也**不重复、不遗漏** |
 | **设置** | 库根（增删 + 一键扫描）、收件箱监听、BOOTH 下载目录、Unity MCP 地址、检查更新仓库与 GitHub token（只进不出）——都在一个面板里，不用再调 API |
 | **更新检测** | 快照 `variations[].downloadable` 文件名/大小 + 价格 + 图集，一键「检查更新」出差异 |
@@ -116,7 +115,7 @@ npm run desktop:dist                    # electron-builder → dist-desktop/win-
 ### 测试与验收
 
 ```bash
-node scripts/test.mjs            # 全仓单测（790 用例：768 pass / 0 fail / 22 skip / 0 todo；真实素材 fixture 需环境变量，未设则 SKIP）
+npm test                        # 全仓测试，部分真实素材测试需要独立环境
 node --import tsx scripts/acceptance-pipeline.mjs   # 流水线验收（36 项：依赖/降级/缓存/取消/stale/锁/schema v9）
 node --import tsx scripts/bench-pipeline.mjs        # 流水线基准（生成 1000 小文件 + 100MB 大包，输出 logs/bench-v06-*.json）
 npx tsc --noEmit                 # 类型检查（0 error）
@@ -143,7 +142,10 @@ bash scripts/ac06-crash.sh       # AC6 真·kill -9（直接读 DB 取证）
 ### 2. 找素材
 
 - 头像轨点模型名 → 只看适配它的素材；多选时用 **ANY / ALL** 切换口径；勾「只看已拥有」过滤掉没买的 base。
-- 搜索框支持中日文子串，也支持 ` @Manuka 裙子 ` 这种把头像名写进查询的语法。
+- 按 `Ctrl+K` 聚焦搜索框。可以搜商品名称、BOOTH 编号、文件名或自然语言，例如「桔梗长发」。
+- 组合条件示例 `avatar:manuka type:clothes -type:shoes`。用 `file:*.fbx` 查已索引的模型文件，用 `size:>1GB` 筛素材大小。
+- 条件标签可编辑或移除。结果支持卡片和列表视图，并显示名称、适配证据或包内路径的命中原因。
+- 打开「搜索索引」查看后台进度，或执行修复、重建和暂停。详见 [Search 2.0 使用与验收](docs/search-2.0.md)。
 - 卡片角标：`在库 / 待整理 / 已导入 / 收藏`；绿标是套装名。
 
 ### 3. 校正「适配模型」

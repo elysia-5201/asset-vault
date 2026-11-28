@@ -7,7 +7,12 @@ Base: `http://127.0.0.1:7317/api`。所有响应 JSON；错误：`{ "error": { "
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | `{ok, version, dbPath, roots, counts}` |
-| GET | `/items?q=&avatar=&avatarMatch=any|all&ownedOnly=&site=&status=&tag=&container=&imported=1|0&sort=updated|title|size&limit=&offset=&catIds=&catMatch=any|all&uncategorized=1&pendingCategory=1&tags=&tagsMatch=any|all&favoriteOnly=1` | `{total, items: ItemCard[]}`；`q` 为 FTS5 trigram 子串（<3 字符回退 LIKE），`avatar` 支持逗号分隔多值；`catIds`/`tags` 支持逗号分隔与重复键（见「物品分类」「分类体系 v3」） |
+| GET | `/items?q=&sort=relevance&limit=&offset=` | `{total, items, search?}`。统一搜索支持中日英关键词、商品号、路径及高级条件。已有 Avatar、分类、标签和状态参数继续生效。 |
+| GET | `/search/suggestions?q=` | 返回搜索建议。 |
+| GET | `/search/facets?dimension=avatar` | 返回指定筛选维度的值与计数。 |
+| GET | `/search/alternatives?q=` | 返回单独放宽条件后的数量与索引状态。 |
+| GET / POST | `/search/index` | 查看索引进度，或提交修复、重建、暂停等维护操作。 |
+| GET / PUT / DELETE | `/search/lexicon` | 查看自定义词库。写入和删除使用 `/search/lexicon/:id`。 |
 | GET | `/items/:id` | `ItemDetail`（item/images/assets/avatars/tags/updates） |
 | POST | `/items` `{title, sourceUrl?, notes?}` | 手动建条目 |
 | PATCH | `/items/:id` `{title?, status?, notes?, rating?, favorite?, shopName?, author?, categoryName?, tags?: string[]}` | `tags` 为**全量替换**；返回更新后的 ItemDetail |

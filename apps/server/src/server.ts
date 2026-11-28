@@ -1,3 +1,7 @@
+import { startSearchIndexWorker } from "./services/search-index";
+import { SearchReader } from "./services/search-reader";
+export { runSearchIndexWorker } from "./services/search-index";
+export { runSearchReadWorker } from "./services/search-reader";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -114,10 +118,14 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
   const recovered = lock.acquired ? repo.recoverInFlight() : 0;
 
   let app: FastifyInstance | null = null;
+  let searchIndexer: ReturnType<typeof startSearchIndexWorker> | undefined;
+  const searchReader = new SearchReader(import.meta.url, dbPath, log);
   const watcher = new InboxWatcher(repo, log);
   const runner = new JobRunner({ repo, media, booth, log, pipeline: pipeline ?? undefined, limits, dataDir });
   const close = async () => {
     runner.stop();
+    await searchIndexer?.terminate().catch(() => {});
+    await searchReader.close().catch(() => {});
     try { await pipeline?.stop(); } catch { /* noop */ }
     try { await watcher.close(); } catch { /* noop */ }
     try { await app?.close(); } catch { /* noop */ }
@@ -130,7 +138,7 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
 
   if (opts.listen !== false) {
     const fastify = Fastify({ logger: false, bodyLimit: 64 * 1024 * 1024 });
-    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits, build: readBuildInfo() });
+    registerRoutes(fastify, { repo, media, booth, runner, watcher, log, version: opts.version ?? "0.1.0", dbPath, dataDir, pipeline, cache, limits, build: readBuildInfo(), searchReader });
     registerMediaCacheRoutes(fastify, { repo, dataDir, log });
     const distDir = opts.webDistDir ?? join(repoRoot, "apps", "web", "dist");
     if (existsSync(join(distDir, "index.html"))) {
@@ -157,7 +165,10 @@ export async function startAssetVault(opts: StartOptions = {}): Promise<AssetVau
     catch (e) { await close(); throw e; }
     // v6 租约：只有取得单写入者锁的实例才跑 jobs。未取得锁的实例只提供 HTTP 接口，
     // 否则两个进程会同时领取/接管作业（recoverInFlight 本来就在 lock 分支内）。
-    if (lock.acquired) runner.start(400);
+    if (lock.acquired) {
+      runner.start(400);
+      searchIndexer = startSearchIndexWorker(import.meta.url, dbPath, log);
+    }
     pipeline?.start();
     watcher.sync();
     log("AssetVault up on http://" + host + ":" + port + " (db=" + dbPath + ", seeded=" + seeded + ", recovered=" + recovered + ")");

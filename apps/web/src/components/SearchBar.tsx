@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { AvatarMatch, CategoryNode, ContainerKind, ItemStatus, SourceSite } from "@core/contracts";
 import type { CategoryCounts } from "../types";
 import { CategoryBars } from "./CategoryBars";
-import { CONTAINERS, CONTAINER_LABEL, SITES, SITE_LABEL, STATUSES, STATUS_LABEL } from "./ui";
+import { CONTAINERS, CONTAINER_LABEL, SITES, SITE_LABEL, STATUSES, STATUS_LABEL, useDebounced } from "./ui";
+import { getSearchSuggestions } from "../api";
 import {
   activeConditions, activeFilterCount, clearFilters, hasAnyCondition,
   type CategoryLike, type FilterState,
@@ -29,9 +30,39 @@ export function SearchBar(props: {
   avatarCount: number;
   /** 清空全部：搜索词 + 头像选择 + 全部筛选条件 */
   onClearAll: () => void;
+  homeSearchActions?: ReactNode;
+  searchSuggestions?: boolean;
 }) {
   const f = props.filters;
   const [advOpen, setAdvOpen] = useState(false);
+  const search = useRef<HTMLInputElement>(null);
+  const [focused, setFocused] = useState(false);
+  const [suggestions, setSuggestions] = useState<{ query: string; label: string }[]>([]);
+  const [activeSuggestion, setActiveSuggestion] = useState(-1);
+  const suggestionTerm = useDebounced(props.text, 180);
+  useEffect(() => {
+    const focus = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k" && !document.querySelector('[role="dialog"]:not([hidden])')) {
+        event.preventDefault();
+        search.current?.focus();
+        search.current?.select();
+      }
+    };
+    window.addEventListener("keydown", focus);
+    return () => window.removeEventListener("keydown", focus);
+  }, []);
+  useEffect(() => {
+    setSuggestions([]);
+    setActiveSuggestion(-1);
+    if (!props.searchSuggestions || !focused || !suggestionTerm.trim()) return;
+    const request = new AbortController();
+    getSearchSuggestions(suggestionTerm, request.signal).then((r) => {
+      if (!request.signal.aborted) setSuggestions(r.suggestions);
+    }).catch(() => {});
+    return () => request.abort();
+  }, [focused, suggestionTerm, props.searchSuggestions]);
+  const visibleSuggestions = focused && suggestionTerm === props.text ? suggestions : [];
+  const selectSuggestion = (query: string) => { props.onText(query); setSuggestions([]); setActiveSuggestion(-1); };
   const set = (patch: Partial<FilterState>) => props.onFilters({ ...f, ...patch });
 
   const cats = (props.categories ?? []) as CategoryLike[];
@@ -45,16 +76,40 @@ export function SearchBar(props: {
         <div className="search-wrap">
           <span className="ico" aria-hidden="true">⌕</span>
           <input
+            ref={search}
             type="search"
-            placeholder="搜索标题/店铺/作者/标签（中日文子串），@头像名 过滤，如：@MANUKA 哥特风"
+            placeholder="搜商品名、BOOTH 编号、Avatar 或包内文件"
             aria-label="搜索素材"
+            aria-keyshortcuts="Control+k Meta+k"
+            aria-controls={visibleSuggestions.length ? "asset-search-suggestions" : undefined}
+            aria-activedescendant={activeSuggestion >= 0 && visibleSuggestions[activeSuggestion] ? "asset-search-option-" + activeSuggestion : undefined}
             value={props.text}
             onChange={(e) => props.onText(e.target.value)}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || !visibleSuggestions.length) return;
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                const length = visibleSuggestions.length;
+                setActiveSuggestion((i) => (i < 0 ? (e.key === "ArrowDown" ? 0 : length - 1)
+                  : (i + (e.key === "ArrowDown" ? 1 : length - 1)) % length));
+              } else if (e.key === "Enter" && visibleSuggestions[activeSuggestion]) {
+                e.preventDefault();
+                selectSuggestion(visibleSuggestions[activeSuggestion]!.query);
+              } else if (e.key === "Escape") { e.preventDefault(); setSuggestions([]); setActiveSuggestion(-1); }
+            }}
           />
+          {!!visibleSuggestions.length && <div className="search-suggestions" id="asset-search-suggestions" role="listbox" aria-label="搜索补全">
+            {visibleSuggestions.map((option, index) => <button id={"asset-search-option-" + index} type="button" role="option"
+              aria-selected={index === activeSuggestion} key={option.query} onMouseDown={(e) => e.preventDefault()}
+              onClick={() => selectSuggestion(option.query)}>{option.label}</button>)}
+          </div>}
         </div>
         <label className="sb-sort" title="排序方式">
           <span className="hint">排序</span>
           <select aria-label="排序方式" value={f.sort} onChange={(e) => set({ sort: e.target.value as FilterState["sort"] })}>
+            <option value="relevance">相关度</option>
             <option value="updated">最近更新</option>
             <option value="title">标题</option>
             <option value="size">体积</option>
@@ -93,7 +148,7 @@ export function SearchBar(props: {
           className={"btn tiny sb-adv" + (advCount > 0 ? " on" : "")}
           aria-expanded={advOpen}
           aria-controls="sb-advanced"
-          title={advOpen ? "收起高级筛选" : "展开高级筛选（来源/状态/容器/已导入/收藏/待确认）"}
+          title={advOpen ? "收起高级筛选" : "展开高级筛选"}
           onClick={() => setAdvOpen((v) => !v)}
         >
           高级筛选{advCount > 0 ? " (" + advCount + ")" : ""} {advOpen ? "▴" : "▾"}
@@ -169,9 +224,10 @@ export function SearchBar(props: {
         <span className="hint">
           {props.loading ? <><span className="spin" /> 查询中…</> : <>命中 <b style={{ color: "var(--fg)" }}>{props.total}</b> 条</>}
         </span>
+        {props.homeSearchActions}
         <span className="spacer" />
         <span className="hint" title="分类 chip 上的计数口径">
-          {props.countsScope === "filtered" ? "分类计数 = 当前筛选" : "分类计数 = 全局（counts 接口不可用）"}
+          {props.countsScope === "filtered" ? "分类计数 = 当前筛选" : "分类计数 = 全局"}
         </span>
       </div>
     </div>

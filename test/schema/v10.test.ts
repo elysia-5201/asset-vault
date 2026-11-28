@@ -14,8 +14,8 @@ test("v9 → v10 幂等迁移，既有行数不变", () => {
   t.db.prepare("INSERT INTO schema_meta(key,value) VALUES('version','9') ON CONFLICT(key) DO UPDATE SET value='9'").run();
   const before = { items: count(t.db, "items"), assets: count(t.db, "assets") };
   migrate(t.db);
-  assert.equal(SCHEMA_VERSION, 10);
-  assert.equal((t.db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value, "10");
+  assert.ok(SCHEMA_VERSION >= 10);
+  assert.equal((t.db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as any).value, String(SCHEMA_VERSION));
   for (const tbl of NEW_TABLES) assert.equal(count(t.db, "sqlite_master", "type='table' AND name=?", tbl), 1, tbl);
   assert.deepEqual({ items: count(t.db, "items"), assets: count(t.db, "assets") }, before);
   migrate(t.db);

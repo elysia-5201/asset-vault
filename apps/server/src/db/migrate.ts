@@ -9,7 +9,7 @@ import { DEFAULT_TAXONOMY, UNCATEGORIZED_ID } from "../../../../packages/core/sr
  *  v8=工作台：asset_units/unit_relations + import_plans/plan_items/runs/run_items（新表，无老表改列）；
  *  v9=导入可靠性：import_plans.risk_json/risk_state、import_runs.verification_scope/checked/expected + staging_files；
  *  v10=feature123：asset_version_links（+2 触发器）/import_stage_commits/loadouts/loadout_items/cleanup_ignores/cleanup_saved_filters（新表，无老表改列） */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 14;
 /** 分类体系模板版本（与 SCHEMA_VERSION 独立：以后只调分类模板时不必动表结构版本） */
 export const TAXONOMY_VERSION = "3";
 

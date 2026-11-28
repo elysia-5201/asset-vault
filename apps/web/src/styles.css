@@ -128,6 +128,26 @@ input[type=checkbox] { accent-color: var(--accent); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; padding: 12px; }
 @media (min-width: 1500px) { .grid { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); } }
 .card { border: 1px solid var(--line); background: var(--bg-card); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; cursor: pointer; }
+.search-results-window { position: relative; width: 100%; }
+.search-results-grid { position: absolute; left: 0; right: 0; }
+.search-results-grid .thumb { flex-shrink: 0; }
+.search-results-grid .card-body { min-width: 0; }
+.search-results-grid .card-body > .row.wrap { max-height: 48px; overflow: hidden; }
+.search-results-grid .card-body > .row:last-child { margin-top: auto; }
+.search-results-list .card { flex-direction: row; }
+.search-results-list .thumb { width: 82px; height: 100%; aspect-ratio: auto; }
+.search-results-list .card-body { flex: 1; }
+.search-results-list .card-body > .row.wrap { max-height: 24px; }
+.card-search-reasons { font-size: 11px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-title mark { color: inherit; background: color-mix(in srgb, var(--accent) 33%, transparent); border-radius: 2px; }
+.search-tools { display: grid; gap: 6px; padding: 5px 12px 8px; border-bottom: 1px solid var(--line-soft); }
+.search-tools > .row:empty { display: none; }
+.search-intent { color: var(--fg-dim); }
+.search-saved { display: grid; gap: 5px; }
+.search-suggestions { position: absolute; top: 100%; left: 0; right: 0; z-index: 8; display: grid; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg-card); box-shadow: 0 7px 20px #0008; padding: 3px; }
+.search-suggestions button { text-align: left; padding: 6px 9px; border: 0; background: transparent; color: var(--fg); }
+.search-suggestions button:hover, .search-suggestions button[aria-selected="true"] { background: var(--bg-soft); color: var(--accent); }
 .card:hover { border-color: var(--accent); }
 .card.sel { box-shadow: 0 0 0 1px var(--accent); }
 .thumb { position: relative; aspect-ratio: 3 / 4; background: #0b0f14; overflow: hidden; }

@@ -566,6 +566,97 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   tokenize='trigram'
 );
 
+-- Search 2.0 derived data. The old index remains available during backfill.
+CREATE TABLE IF NOT EXISTS search_documents (
+  item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  title_key TEXT NOT NULL,
+  path_limited INTEGER NOT NULL DEFAULT 0,
+  version INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_search_title ON search_documents(title_key);
+CREATE INDEX IF NOT EXISTS ix_search_limited_path ON search_documents(item_id) WHERE path_limited=1;
+CREATE INDEX IF NOT EXISTS ix_items_title_search ON items(title COLLATE NOCASE);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_text_fts USING fts5(
+  title, tags, author, description, files, contents, tokenize='trigram'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS search_terms_fts USING fts5(
+  title, tags, author, description, files, contents, typos, formats, tokenize='unicode61'
+);
+CREATE TABLE IF NOT EXISTS search_dirty (
+  item_id INTEGER PRIMARY KEY,
+  failures INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  refresh_only INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS search_lexicon (
+  id TEXT PRIMARY KEY,
+  concept_json TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS search_items_insert AFTER INSERT ON items BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_items_update AFTER UPDATE OF title,title_ja,author,shop_name,description,notes ON items BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_items_delete AFTER DELETE ON items BEGIN
+  DELETE FROM search_documents WHERE item_id=old.id;
+  DELETE FROM search_text_fts WHERE rowid=old.id;
+  DELETE FROM search_terms_fts WHERE rowid=old.id;
+  DELETE FROM search_dirty WHERE item_id=old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_item_tags_insert AFTER INSERT ON item_tags BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(new.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_item_tags_delete AFTER DELETE ON item_tags BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT old.item_id WHERE EXISTS (SELECT 1 FROM items WHERE id=old.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_item_tags_update AFTER UPDATE OF item_id,tag_id ON item_tags BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(old.item_id),(new.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_tags_rename AFTER UPDATE OF name,namespace ON tags BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM item_tags WHERE tag_id=new.id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_assets_insert AFTER INSERT ON assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(new.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_assets_update AFTER UPDATE OF item_id,path,path_norm,status,content_version,index_state ON assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) VALUES(old.item_id),(new.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_assets_delete AFTER DELETE ON assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT old.item_id WHERE EXISTS (SELECT 1 FROM items WHERE id=old.item_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_archive_insert AFTER INSERT ON archive_entries BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=new.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_archive_update AFTER UPDATE OF entry_path,ext ON archive_entries BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=new.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_archive_delete AFTER DELETE ON archive_entries BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=old.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_unity_insert AFTER INSERT ON unitypackage_assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=new.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_unity_update AFTER UPDATE OF asset_path,type ON unitypackage_assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=new.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_unity_delete AFTER DELETE ON unitypackage_assets BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=old.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_unit_insert AFTER INSERT ON asset_units BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=new.asset_id;
+END;
+CREATE TRIGGER IF NOT EXISTS search_unit_update AFTER UPDATE OF asset_id,rel_path ON asset_units BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id IN (old.asset_id,new.asset_id);
+END;
+CREATE TRIGGER IF NOT EXISTS search_unit_delete AFTER DELETE ON asset_units BEGIN
+  INSERT OR REPLACE INTO search_dirty(item_id) SELECT item_id FROM assets WHERE id=old.asset_id;
+END;
+CREATE INDEX IF NOT EXISTS ix_project_imports_item ON project_imports(item_id);
+CREATE INDEX IF NOT EXISTS ix_item_avatars_search ON item_avatars(avatar_id,match,item_id);
+CREATE INDEX IF NOT EXISTS ix_item_tags_search ON item_tags(tag_id,item_id);
+
 -- ===== v10：导入预检/版本关系（import-precheck §5.1/§5.2/§5.4）=====
 -- 同一 item 内两个 asset 的版本/配套关系；规范顺序 asset_a_id < asset_b_id 避免 (A,B)/(B,A) 重复行
 CREATE TABLE IF NOT EXISTS asset_version_links (

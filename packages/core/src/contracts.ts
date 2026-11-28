@@ -160,6 +160,8 @@ export interface LibraryRootRow { id: number; path: string; path_norm: string; m
 
 // ---------- API 形状 ----------
 export interface ItemCard {
+  search?: { reasons: string[]; score?: number; paths?: { path: string; kind: string }[];
+    contributions?: { term: string; score: number; reason: string; channels: string[] }[] };
   id: number; title: string; sourceSite: SourceSite; sourceItemId: string | null; sourceUrl: string | null;
   shopName: string | null; status: ItemStatus; favorite: number; adult: number;
   coverImageId: number | null; coverUrl: string | null; imageCount: number; assetCount: number; totalBytes: number;

@@ -6,11 +6,13 @@ import {
   onModeChange, patchItem, recordImport, registerProject, retryConnect, unityStatus, jobAction as apiJobAction,
   type ProjectRow,
 } from "./api";
-import type { AvatarCard, CategoryCounts, CategoryStats, HealthResponse, ItemCardWeb, UpdateCheckResponse, ViewMode } from "./types";
+import type { AvatarCard, CategoryCounts, CategoryStats, HealthResponse, ItemCardWeb, ItemsResponse, UpdateCheckResponse, ViewMode } from "./types";
 import { formatBytes, formatDate, parseAtQuery, resolveAvatarNames } from "./util";
 import { AvatarRail } from "./components/AvatarRail";
 import { CategoryManager } from "./components/CategoryManager";
 import { SearchBar } from "./components/SearchBar";
+import { SearchTools } from "./components/SearchTools";
+import { VirtualSearchResults } from "./components/VirtualSearchResults";
 import { EMPTY_FILTERS, clearFilters, pushEscLayer, dropEscLayer, isTopEscLayer, type FilterState } from "./ui-state";
 import { ItemCardView } from "./components/ItemCardView";
 import { ItemDetail } from "./components/ItemDetail";
@@ -60,7 +62,9 @@ export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
   const [text, setText] = useState("");
-  const debounced = useDebounced(text, 250);
+  const debounced = useDebounced(text, 180);
+  const [searchListView, setSearchListView] = useState(false);
+  const [searchInfo, setSearchInfo] = useState<ItemsResponse["search"]>();
   const [selectedAvatarIds, setSelectedAvatarIds] = useState<number[]>([]);
   const [avatarMatch, setAvatarMatch] = useState<AvatarMatch>("any");
   const [ownedOnly, setOwnedOnly] = useState(false);
@@ -221,17 +225,29 @@ export default function App() {
   }, [filters.catTop, filters.catSub]);
 
   /** 除分类以外的全部筛选（/api/items 与 /api/categories/counts 共用这一份口径）。 */
+  const scopedAvatars = mode === "live" ? selectedAvatarIds : effAvatarIds;
+  const searchText = mode === "live" ? debounced.trim() : parsed.q;
   const commonQuery = useMemo(() => ({
-    q: parsed.q || undefined,
-    avatar: effAvatarIds.length ? effAvatarIds : undefined,
+    q: searchText || undefined,
+    avatar: scopedAvatars.length ? scopedAvatars : undefined,
     avatarMatch, ownedOnly,
     site: filters.site, status: filters.status,
     container: filters.container,
     favoriteOnly: filters.favoriteOnly || undefined,
     imported: (filters.imported === "any" ? undefined : filters.imported === "yes" ? 1 : 0) as 1 | 0 | undefined,
-  }), [parsed.q, effAvatarIds.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.container, filters.favoriteOnly, filters.imported]);
+  }), [searchText, scopedAvatars.join(","), avatarMatch, ownedOnly, filters.site, filters.status, filters.container, filters.favoriteOnly, filters.imported]);
+  const searchScope = useMemo(() => ({
+    ...commonQuery, categoryIds: catQuery.categoryIds, uncategorized: catQuery.uncategorized || undefined,
+    pendingCategory: filters.pendingCategory || undefined,
+  }), [commonQuery, catQuery, filters.pendingCategory]);
+  const searchGlobally = useCallback(() => {
+    setSelectedAvatarIds([]);
+    setFilters((current) => ({ ...current, catTop: "", catSub: "" }));
+  }, []);
 
-  const queryScope = JSON.stringify([commonQuery, catQuery, filters.pendingCategory]);
+  const queryScope = JSON.stringify([commonQuery, catQuery, filters.pendingCategory, filters.sort]);
+  const searchScroller = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (searchScroller.current) searchScroller.current.scrollTop = 0; }, [queryScope]);
   const batchScope = JSON.stringify([text, queryScope]);
   const [itemsScope, setItemsScope] = useState("");
   useEffect(() => {
@@ -249,12 +265,16 @@ export default function App() {
   const PAGE_SIZE = 120;
   const itemsRef = useRef<ItemCardWeb[]>([]);
   const loadToken = useRef(0);
+  const itemsRequest = useRef<AbortController | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   useEffect(() => { itemsRef.current = items; }, [items]);
 
   const loadItems = useCallback((opts: { append?: boolean } = {}) => {
     const append = !!opts.append;
     const token = ++loadToken.current;
+    itemsRequest.current?.abort();
+    const controller = new AbortController();
+    itemsRequest.current = controller;
     if (append) setLoadingMore(true); else setItemsLoading(true);
     setItemsErr("");
     listItems({
@@ -264,11 +284,12 @@ export default function App() {
       uncategorized: catQuery.uncategorized || undefined,
       pendingCategory: filters.pendingCategory || undefined,
       sort: filters.sort, limit: PAGE_SIZE, offset: append ? itemsRef.current.length : 0,
-    })
+    }, controller.signal)
       .then((r) => {
         if (token !== loadToken.current) return;      // 过期响应：筛选已变
         setItemsScope(queryScope);
         setTotal(r.total);
+        setSearchInfo(r.search);
         setItems((prev) => {
           if (!append) { itemsRef.current = r.items; return r.items; }
           const seen = new Set(prev.map((x) => x.id));
@@ -281,7 +302,7 @@ export default function App() {
       .finally(() => { if (token !== loadToken.current) return; setItemsLoading(false); setLoadingMore(false); });
   }, [commonQuery, catQuery, filters.pendingCategory, filters.sort, queryScope]);
   const loadMore = useCallback(() => loadItems({ append: true }), [loadItems]);
-  useEffect(() => { loadItems(); }, [loadItems]);
+  useEffect(() => { loadItems(); return () => itemsRequest.current?.abort(); }, [loadItems]);
 
   /** 滚到底部自动续页（哨兵进入视口附近触发；不支持 IntersectionObserver 时只靠按钮）。 */
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -298,12 +319,16 @@ export default function App() {
 
   // 分类计数：随**其它**筛选变化（分类选择本身不参与，否则只会剩被选中的那个分类）。
   // 端点不可用（旧后端 / 404）时静默退回树上的全局 itemCount，并在分类栏标注来源。
+  const countsRequest = useRef<AbortController | null>(null);
   const loadCounts = useCallback(() => {
-    getCategoryCounts(commonQuery)
-      .then(setCatCounts)
-      .catch(() => setCatCounts(null));
+    countsRequest.current?.abort();
+    const request = new AbortController();
+    countsRequest.current = request;
+    getCategoryCounts(commonQuery, request.signal)
+      .then((counts) => { if (!request.signal.aborted) setCatCounts(counts); })
+      .catch(() => { if (!request.signal.aborted) setCatCounts(null); });
   }, [commonQuery]);
-  useEffect(() => { loadCounts(); }, [loadCounts, mode]);
+  useEffect(() => { loadCounts(); return () => countsRequest.current?.abort(); }, [loadCounts, mode]);
   const refreshLibrary = () => { loadItems(); loadJobs(); loadMeta(); loadAvatars(); loadCategories(); loadCounts(); };
   const refreshAfterScan = useCallback(() => { loadItems(); loadMeta(); loadCounts(); }, [loadItems, loadMeta, loadCounts]);
   const refreshCategoryResults = useRef({ loadItems, loadCounts });
@@ -539,12 +564,16 @@ export default function App() {
         </div>
         <SearchBar
           text={text} onText={setText} filters={filters} onFilters={setFilters}
-          atAvatars={parsed.avatars} unresolved={resolved.unresolved} onRemoveAt={removeAtName}
+          atAvatars={mode === "mock" ? parsed.avatars : []} unresolved={mode === "mock" ? resolved.unresolved : []} onRemoveAt={removeAtName}
+          searchSuggestions={mode === "live"}
           loading={itemsLoading} total={total}
           categories={categories} catCounts={catCounts}
           countsScope={catCounts ? "filtered" : "global"} catErr={catErr}
           avatarCount={effAvatarIds.length} onClearAll={clearAll}
         />
+        {mode === "live" && <SearchTools text={text} query={searchScope} result={itemsScope === queryScope ? searchInfo : undefined}
+          loading={itemsLoading || !!itemsErr || text !== debounced} total={total} onText={setText}
+          listView={searchListView} onListView={setSearchListView} onGlobal={searchGlobally} onRefresh={refreshAfterScan} />}
         {selectMode && (
           <CategoryBatchBar
             selectedIds={selectedIds}
@@ -564,25 +593,23 @@ export default function App() {
             }}
           />
         )}
-        <div className="col-scroll">
+        <div className="col-scroll" ref={searchScroller}>
           {itemsErr && <div className="pane-body"><div className="err">{itemsErr}</div></div>}
           {!itemsErr && !itemsLoading && !shownItems.length && (
             <div className="empty">
-              没有匹配的条目
-              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前是内置 mock 数据（后端不可达）：左栏「更多工具 → 重连」，或等它每 4 秒自动重连。" : "试着放宽过滤器或清空 @头像。"}</div>
+              当前条件没有匹配的素材
+              <div className="hint" style={{ marginTop: "6px" }}>{mode === "mock" ? "当前是内置 mock 数据（后端不可达）：左栏「更多工具 → 重连」，或等它每 4 秒自动重连。" : "可检查条件标签，或查看搜索建议和索引状态。"}</div>
             </div>
           )}
           {itemsLoading && !shownItems.length && <div className="empty"><Spinner /> 载入条目…</div>}
-          <div className="grid">
-            {(!selectMode || batchReady) && shownItems.map((it) => (
+          {(!selectMode || batchReady) && <VirtualSearchResults items={shownItems} list={searchListView} render={(it) => (
               <ItemCardView
                 key={it.id} item={it} onOpen={setSelectedItemId} onToggleFavorite={toggleFavorite}
                 imported={importedIds.includes(it.id) || filters.imported === "yes"}
                 selectMode={selectMode} selected={selectedIds.includes(it.id)} onToggleSelect={toggleSelect}
-                tagColors={tagColors}
+                tagColors={tagColors} searchText={searchText}
               />
-            ))}
-          </div>
+            )} />}
           {selectMode && !batchReady && !itemsErr && <div className="empty"><Spinner /> 加载当前筛选的素材…</div>}
           {shownItems.length < total && (
             <div ref={sentinelRef} style={{ display: "flex", justifyContent: "center", padding: "2px 12px 14px" }}>

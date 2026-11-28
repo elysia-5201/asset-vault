@@ -10,7 +10,7 @@ export interface FilterState {
   container: ContainerKind | "";
 
   imported: "any" | "yes" | "no";
-  sort: "updated" | "title" | "size";
+  sort: "relevance" | "updated" | "title" | "size";
   catTop: string;
   catSub: string;
   pendingCategory: boolean;
@@ -18,7 +18,7 @@ export interface FilterState {
 }
 
 export const EMPTY_FILTERS: FilterState = {
-  site: "", status: "", container: "", imported: "any", sort: "updated",
+  site: "", status: "", container: "", imported: "any", sort: "relevance",
   catTop: "", catSub: "", pendingCategory: false, favoriteOnly: false,
 };
 

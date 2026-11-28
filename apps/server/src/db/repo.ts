@@ -1,20 +1,24 @@
 import type Database from "better-sqlite3";
-import { now, uid, ftsPhrase, sha256Text } from "../util";
+import { now, uid, sha256Text } from "../util";
 import { normalizePath } from "../../../../packages/core/src/pathnorm";
 import { AppError, normKey, type AssetRow, type AvatarAliasRow, type AvatarKind, type AvatarMatch, type AvatarRow, type CategoryAssignment, type CategoryNode, type CategoryRefSource, type CategorySuggestion, type ImageOrigin, type ImageRole, type ImageRow, type ItemCard, type ItemDetail, type ItemRow, type ItemStatus, type JobEvent, type JobKind, type JobRow, type JobState, type RootMode, type SourceSite, type UpdateKind } from "../../../../packages/core/src/contracts";
 import { UNCATEGORIZED_ID, type CategoryDef } from "../../../../packages/core/src/categories/taxonomy";
 import { resolveTransition } from "../../../../packages/core/src/contracts";
 import { mergeLoadoutItemsTx, type MergeLoadoutItemsResult } from "./loadouts";
 import { mergeCleanupIgnoresTx } from "./cleanup";
+import { SEARCH_CANDIDATES_PER_LANE, compileSearch, searchFacetWords, searchPathPreviews, type SearchOmit, type SearchPlan } from "../services/search";
+import type { SearchFacet } from "../../../../packages/core/src/search-query";
+
 
 const ACTIVE_UNIT_RELATIONS = `FROM unit_relations r
   JOIN asset_units fu ON fu.id=r.from_unit_id JOIN assets fa ON fa.id=fu.asset_id AND fa.status<>'trashed'
   JOIN asset_units tu ON tu.id=r.to_unit_id JOIN assets ta ON ta.id=tu.asset_id AND ta.status<>'trashed'`;
 
 export interface ItemQuery {
+  searchDebug?: boolean;
   q?: string; avatarIds?: number[]; avatarMatch?: "any" | "all"; ownedOnly?: boolean;
   site?: string; status?: string; tag?: string; container?: string;
-  sort?: "updated" | "title" | "size"; limit?: number; offset?: number; includeTrashed?: boolean; imported?: boolean; collectionId?: number;
+  sort?: "relevance" | "updated" | "title" | "size"; limit?: number; offset?: number; includeTrashed?: boolean; imported?: boolean; collectionId?: number;
   /** 分类筛选：选中主分类命中其自身，选中子分类命中子分类（any=命中任一；all=路径需同时满足选中的每个节点） */
   categoryIds?: string[]; categoryMatch?: "any" | "all";
   /** 只看未分类（cat_id IS NULL） */
@@ -158,22 +162,14 @@ export class Repo {
   removeRoot(id: number) { this.stmt("DELETE FROM library_roots WHERE id = ?").run(id); }
 
   // ---------- items ----------
-  private buildWhere(q: ItemQuery): { sql: string; params: unknown[] } {
+  private buildWhere(q: ItemQuery, search?: SearchPlan): { sql: string; params: unknown[] } {
     const w: string[] = []; const params: unknown[] = [];
-    if (!q.includeTrashed && q.status !== "trashed") w.push("i.status <> 'trashed'");
+    if (!q.includeTrashed && q.status !== "trashed" && !search?.query.filters.some((f) => f.field === "status" && f.value === "trashed" && !f.exclude)) w.push("i.status <> 'trashed'");
     if (q.status) { w.push("i.status = ?"); params.push(q.status); }
     if (q.site) { w.push("i.source_site = ?"); params.push(q.site); }
-    const text = (q.q ?? "").trim();
-    if (text) {
-      if (text.length >= 3) { w.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)"); params.push(ftsPhrase(text)); }
-      else {
-        // <3 字符（trigram 索引不了）回退 LIKE，且**标签也参与匹配**：
-        // 用户的心智是"搜什么就找什么"，不该为了找一个 2 字标签再去开单独筛选。
-        const l = `%${text}%`;
-        w.push("(i.title LIKE ? OR IFNULL(i.shop_name,'') LIKE ? OR IFNULL(i.author,'') LIKE ? OR IFNULL(i.notes,'') LIKE ?" +
-          " OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name LIKE ?))");
-        params.push(l, l, l, l, l);
-      }
+    for (const clause of search?.clauses ?? []) {
+      w.push("(" + clause.sql + ")");
+      params.push(...clause.values);
     }
     if (q.tag) { w.push("EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name = ?)"); params.push(q.tag); }
     if (q.container) { w.push("EXISTS (SELECT 1 FROM assets a WHERE a.item_id=i.id AND a.status<>'trashed' AND a.container = ?)"); params.push(q.container); }
@@ -236,28 +232,122 @@ export class Repo {
     };
   }
 
-  listItems(q: ItemQuery): { total: number; items: ItemCard[] } {
-    const { sql: where, params } = this.buildWhere(q);
+  listItems(q: ItemQuery) {
+    const search = q.q?.trim() ? compileSearch(this.db, q.q, undefined, q.searchDebug) : undefined;
+    const { sql: where, params } = this.buildWhere(q, search);
     const limit = Math.min(500, Math.max(1, q.limit ?? 60));
     const offset = Math.max(0, q.offset ?? 0);
     // 分页稳定性：排序键必须带唯一兜底列（id）。扫描产生的条目 updated_at 常落在同一毫秒，
     // 只按 updated_at 排序时 SQLite 的行序不保证稳定 → 翻页会重复或漏项。
-    const order = q.sort === "title" ? "i.title COLLATE NOCASE ASC, i.id ASC"
+    const order = search?.ranked && (q.sort === "relevance" || !q.sort) ? "sr.score DESC, i.favorite DESC, i.id DESC"
+      : q.sort === "title" ? "i.title COLLATE NOCASE ASC, i.id ASC"
       : q.sort === "size" ? "total_bytes DESC, i.id DESC"
       : "i.updated_at DESC, i.id DESC";
-    const total = (this.stmt(`SELECT COUNT(*) c FROM items i${where}`).get(...params as any[]) as any).c as number;
-    const rows = this.stmt(`
-      SELECT i.*,
+    const scope = "FROM items i" + (search?.join ?? "") + where;
+    const bound = [...(search?.values ?? []), ...params];
+    const count = () => (this.stmt((search?.prefix ?? "") + "SELECT COUNT(*) c " + scope).get(...bound) as { c: number }).c;
+    const bytes = "(SELECT COALESCE(SUM(a.size),0) FROM assets a WHERE a.item_id=i.id AND a.status<>'trashed')";
+    const searchColumns = search?.ranked ? ",sr.score,sr.reasons" + (search.debug ? ",sr.details" : "") : "";
+    const pagePrefix = search ? (search.prefix ? search.prefix + ", " : "WITH ")
+      + "search_scope AS MATERIALIZED (SELECT i.id" + searchColumns + " " + scope + "),"
+      + "search_page AS MATERIALIZED (SELECT sr.* FROM search_scope sr JOIN items i ON i.id=sr.id ORDER BY "
+      + order.replace("total_bytes", bytes) + " LIMIT ? OFFSET ?) "
+      : "";
+    const rows = this.stmt(pagePrefix + `
+      SELECT i.*,${search?.ranked ? "sr.score AS search_score,sr.reasons AS search_reasons," : ""}
+        ${search?.ranked && search.debug ? "sr.details AS search_details," : ""}
+        ${search ? "(SELECT COUNT(*) FROM search_scope) AS search_total," : ""}
         (SELECT COUNT(*) FROM item_images im WHERE im.item_id=i.id) AS image_count,
         (SELECT id FROM item_images im2 WHERE im2.item_id=i.id ORDER BY im2.position, im2.id LIMIT 1) AS first_image_id,
         (SELECT COUNT(*) FROM assets a WHERE a.item_id=i.id AND a.status<>'trashed') AS asset_count,
-        (SELECT COALESCE(SUM(a.size),0) FROM assets a WHERE a.item_id=i.id AND a.status<>'trashed') AS total_bytes,
+        ${bytes} AS total_bytes,
         (SELECT GROUP_CONCAT(c.id || char(30) || c.name, char(31)) FROM collection_items ci JOIN collections c ON c.id=ci.collection_id WHERE ci.item_id=i.id) AS collection_names
-      FROM items i${where} ORDER BY ${order} LIMIT ? OFFSET ?`).all(...params as any[], limit, offset) as any[];
+      ${search ? "FROM search_page sr JOIN items i ON i.id=sr.id" : scope}
+      ORDER BY ${order}${search ? "" : " LIMIT ? OFFSET ?"}`).all(...bound, limit, offset) as any[];
+    const total = search ? Number(rows[0]?.search_total ?? (offset > 0 ? count() : 0)) : count();
     const idsList = rows.map((r) => r.id);
     const avMap = this.itemAvatarsFor(idsList);
     const tagMap = this.itemTagsFor(idsList);
-    return { total, items: rows.map((r) => this.toCard(r, avMap.get(r.id) ?? [], tagMap.get(r.id) ?? [])) };
+    const items = rows.map((r) => {
+      const card = this.toCard(r, avMap.get(r.id) ?? [], tagMap.get(r.id) ?? []);
+      if (search) card.search = {
+        reasons: [...new Set<string>(String(r.search_reasons ?? (search.query.exactId || search.query.filters.some((f) => f.field === "id" && !f.exclude)
+          ? "exact-id" : search.query.exactPath ? "exact-path" : search.exactTitleOnly ? "exact-title" : "filter")).split(","))],
+        score: q.searchDebug ? Number(r.search_score ?? 0) : undefined,
+        contributions: r.search_details ? (JSON.parse(r.search_details) as { term: number; score: number; reason: string; channels: string }[]).map((detail) => ({
+          term: search.query.terms[detail.term]?.text ?? search.query.exactTitle,
+          score: detail.score, reason: detail.reason, channels: detail.channels.split(","),
+        })) : undefined,
+      };
+      return card;
+    });
+    if (search) {
+      const hasFileFilter = search.query.exactPath || search.query.filters.some((f) => !f.exclude && ["file", "format", "shader"].includes(f.field));
+      const pathItems = items.filter((item) => hasFileFilter || item.search?.reasons.some((s) => /^(?:files|contents)/u.test(s))).map((item) => item.id);
+      const previews = searchPathPreviews(this.db, pathItems, search.query);
+      for (const item of items) {
+        const paths = previews.get(item.id);
+        if (item.search && paths?.length) item.search.paths = paths;
+      }
+    }
+    return search ? { total, items, search: {
+      candidateLimit: search.ranked ? SEARCH_CANDIDATES_PER_LANE : undefined,
+      filters: search.query.filters,
+      intents: search.query.terms.filter((t) => t.avatarIds || t.concept).map((t) => ({
+        text: t.text, label: t.concept?.label ?? t.text, start: t.start, end: t.end,
+        field: t.avatarIds ? "avatar" : t.concept?.field ?? (t.concept?.type ? "type" : "text"),
+      })),
+    } } : { total, items };
+  }
+
+  searchFacets(q: ItemQuery, dimension: SearchFacet) {
+    const scope = { ...q };
+    const flags = { favorite: "is.favorite", imported: "is.imported", available: "is.availability", update: "has.update" } as const;
+    const omit = (flags[dimension as keyof typeof flags] ?? dimension) as SearchOmit;
+    if (dimension === "avatar") scope.avatarIds = undefined;
+    if (dimension === "tag") { scope.tag = undefined; scope.tagNames = undefined; }
+    if (dimension === "site") scope.site = undefined;
+    if (dimension === "status") { scope.status = undefined; scope.includeTrashed = true; }
+    if (dimension === "format") scope.container = undefined;
+    if (dimension === "imported") scope.imported = undefined;
+    if (dimension === "favorite") scope.favoriteOnly = undefined;
+    const search = scope.q?.trim() ? compileSearch(this.db, scope.q, omit) : undefined;
+    const { sql, params } = this.buildWhere(scope, search);
+    const from = "FROM items i" + (search?.join ?? "");
+    const tagJoin = "JOIN item_tags it ON it.item_id=i.id JOIN tags t ON t.id=it.tag_id";
+    const attribute = { value: "json_extract(v.value,'$[1]')", from: tagJoin + " JOIN json_each(?) v ON t.name COLLATE NOCASE=json_extract(v.value,'$[0]')" };
+    const relative = (column: "created_at" | "updated_at") => ({ value: "d.value",
+      from: "JOIN json_each('[\"7d\",\"30d\",\"90d\"]') d ON i." + column
+        + ">=strftime('%Y-%m-%dT%H:%M:%fZ','now','-'||rtrim(d.value,'d')||' days')" });
+    const options = {
+      avatar: { value: "v.name", from: "JOIN item_avatars a ON a.item_id=i.id AND a.match<>'exclude' JOIN avatars v ON v.id=a.avatar_id" },
+      author: { value: "COALESCE(NULLIF(i.author,''),i.shop_name)", from: "" },
+      tag: { value: "t.name", from: tagJoin },
+      color: attribute,
+      style: attribute,
+      site: { value: "i.source_site", from: "" },
+      status: { value: "i.status", from: "" },
+      format: { value: "v.value", from: "JOIN search_terms_fts f ON f.rowid=i.id JOIN json_each('[\"'||replace(f.formats,' ','\",\"')||'\"]') v" },
+      available: { value: "a.status", from: "JOIN assets a ON a.item_id=i.id AND a.status IN ('present','missing')" },
+      size: { value: "CASE WHEN sizes.bytes>=1000000000 THEN '>=1GB' WHEN sizes.bytes>=100000000 THEN '100MB..1GB' ELSE '<100MB' END",
+        from: "JOIN (SELECT item_id,sum(size) bytes FROM assets WHERE status<>'trashed' GROUP BY item_id) sizes ON sizes.item_id=i.id" },
+      favorite: { value: "CASE WHEN i.favorite=1 THEN 'favorite' ELSE '-favorite' END", from: "" },
+      imported: { value: "CASE WHEN EXISTS (SELECT 1 FROM project_imports r WHERE r.item_id=i.id) THEN 'imported' ELSE '-imported' END", from: "" },
+      update: { value: "CASE WHEN EXISTS (SELECT 1 FROM updates u WHERE u.item_id=i.id AND u.applied=0) THEN 'update' ELSE '-update' END", from: "" },
+      added: relative("created_at"),
+      updated: relative("updated_at"),
+    };
+    const column = options[dimension];
+    const query = (search?.prefix ?? "") + (search?.prefix ? "," : "WITH ")
+      + " search_scope AS MATERIALIZED (SELECT i.id " + from + sql + ")"
+      + " SELECT " + column.value + " AS value,COUNT(DISTINCT i.id) AS count FROM search_scope s JOIN items i ON i.id=s.id "
+      + column.from + " GROUP BY 1 HAVING value IS NOT NULL AND value<>'' ORDER BY count DESC,value COLLATE NOCASE LIMIT 30";
+    const extra = dimension === "color" || dimension === "style" ? [searchFacetWords(this.db, dimension)] : [];
+    const rows = this.stmt(query).all(...(search?.values ?? []), ...params, ...extra) as { value: string; count: number }[];
+    if (dimension !== "format") return rows;
+    return rows.filter((row) => /^x(?:[0-9a-f]{6}){1,20}$/u.test(row.value)).map((row) => ({
+      ...row, value: row.value.slice(1).match(/.{6}/gu)!.map((part) => String.fromCodePoint(parseInt(part, 16))).join(""),
+    }));
   }
 
   private itemAvatarsFor(ids: number[]): Map<number, { id: number; name: string; match: AvatarMatch }[]> {
@@ -1461,17 +1551,21 @@ export class Repo {
    * 分类筛选本身不参与计数（否则只会剩被选中的那个分类）；其它筛选（关键词/标签/avatar/来源/状态/容器/已导入/收藏）都生效。
    */
   categoryCounts(q: ItemQuery = {}): { all: number; uncategorized: number; tops: Record<string, number>; subs: Record<string, number> } {
-    const { sql: where, params } = this.buildWhere({ ...q, categoryIds: undefined, categoryMatch: undefined, uncategorized: false, pendingCategory: false });
-    const w = where || "";
-    const one = (extra: string) => (this.stmt("SELECT COUNT(*) c FROM items i" + w + extra).get(...params as any[]) as any).c as number;
-    const all = one("");
-    const uncategorized = one((w ? " AND " : " WHERE ") + "(i.cat_id IS NULL OR i.cat_id = '" + UNCATEGORIZED_ID + "')");
-    const rows = this.stmt("SELECT i.cat_id AS top, i.cat_sub_id AS sub, COUNT(*) c FROM items i" + w + " GROUP BY i.cat_id, i.cat_sub_id").all(...params as any[]) as any[];
+    const search = q.q?.trim() ? compileSearch(this.db, q.q, "type") : undefined;
+    const { sql: where, params } = this.buildWhere({ ...q, categoryIds: undefined, categoryMatch: undefined, uncategorized: false, pendingCategory: false }, search);
+    const rows = this.stmt((search?.prefix ?? "") + `SELECT i.cat_id AS top, i.cat_sub_id AS sub, COUNT(*) count
+      FROM items i${search?.join ?? ""}${where} GROUP BY i.cat_id, i.cat_sub_id`).all(...(search?.values ?? []), ...params) as {
+      top: string | null; sub: string | null; count: number;
+    }[];
+    let all = 0;
+    let uncategorized = 0;
     const tops: Record<string, number> = {}; const subs: Record<string, number> = {};
-    for (const r of rows) {
-      if (!r.top) continue;
-      tops[r.top] = (tops[r.top] ?? 0) + r.c;
-      if (r.sub) subs[r.sub] = (subs[r.sub] ?? 0) + r.c;
+    for (const { top, sub, count } of rows) {
+      all += count;
+      if (top === null || top === UNCATEGORIZED_ID) uncategorized += count;
+      if (!top) continue;
+      tops[top] = (tops[top] ?? 0) + count;
+      if (sub) subs[sub] = (subs[sub] ?? 0) + count;
     }
     tops[UNCATEGORIZED_ID] = uncategorized; // 未分类也作为一个"一级分类"参与导航计数
     return { all, uncategorized, tops, subs };

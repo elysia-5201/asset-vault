@@ -7,7 +7,7 @@
  */
 import { AppError, type ItemCard } from "../../../../packages/core/src/contracts";
 import type Database from "better-sqlite3";
-import { ftsPhrase } from "../util";
+import { compileSearch } from "../services/search";
 import type { Repo } from "./repo";
 
 export type CleanupRule = "missing_cover" | "missing_source" | "unlinked_model" | "missing_file";
@@ -90,21 +90,18 @@ function ruleUnion(policy: LocalSourcePolicy): { sql: string; params: unknown[] 
   return { sql: parts.join("\nUNION ALL\n"), params };
 }
 
-/** q/avatar/category 过滤（与 repo.buildWhere 同口径：>=3 字符走 trigram FTS，<3 回退 LIKE；全部参数化）。 */
-function filterClause(q: CleanupQuery): { sql: string; params: unknown[] } {
+/** Keep cleanup rule scope and reuse catalog search for text and advanced filters. */
+function filterClause(db: Database.Database, q: CleanupQuery): { sql: string; params: unknown[] } {
   const w: string[] = [];
   const params: unknown[] = [];
   const text = (q.q ?? "").trim();
   if (text) {
-    if (text.length >= 3) {
-      w.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
-      params.push(ftsPhrase(text));
-    } else {
-      const like = "%" + text + "%";
-      w.push("(i.title LIKE ? OR IFNULL(i.shop_name,'') LIKE ? OR IFNULL(i.author,'') LIKE ? OR IFNULL(i.notes,'') LIKE ?" +
-        " OR EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id=it.tag_id WHERE it.item_id=i.id AND t.name LIKE ?))");
-      params.push(like, like, like, like, like);
+    const search = compileSearch(db, text);
+    if (search.ranked) {
+      w.push("i.id IN (" + search.prefix + "SELECT item_id FROM search_rank)");
+      params.push(...search.values);
     }
+    for (const clause of search.clauses) { w.push("(" + clause.sql + ")"); params.push(...clause.values); }
   }
   const avatarIds = (q.avatarIds ?? []).filter((n) => Number.isFinite(n));
   if (avatarIds.length > 0) {
@@ -169,7 +166,7 @@ export function listCleanupTodos(repo: Repo, q: CleanupQuery): CleanupTodosResul
   const offset = Math.max(0, Number.isFinite(q.offset) ? Math.trunc(q.offset as number) : 0);
   const db = repo.connection;
   const union = ruleUnion(policy);
-  const filters = filterClause(q);
+  const filters = filterClause(db, q);
   const ruleParams: unknown[] = rule ? [rule] : [];
   const cardOf = cardGetter(repo);
 

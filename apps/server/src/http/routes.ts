@@ -1,3 +1,7 @@
+import { saveSearchConcept } from "../services/search";
+import { SEARCH_PAUSE_KEY, searchIndexStatus } from "../services/search-index";
+import { runSearchRead, type SearchReader } from "../services/search-reader";
+import { SEARCH_FACETS } from "../../../../packages/core/src/search-query";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { createReadStream, readFileSync, statSync, existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -61,6 +65,7 @@ export interface RouteDeps {
    * stage 下载与 commit 共用同一实例（重启即失效）。测试可注入已知 codec，不改变生产行为。
    */
   stageCodec?: StageTokenCodec;
+  searchReader?: SearchReader;
 }
 
 const DEFAULT_DOWNLOAD_SUBDIR = "downloads";
@@ -120,7 +125,7 @@ const csvParam = (v: unknown): string[] =>
  */
 function parseItemQuery(q: any): ItemQuery {
   return {
-    q: q.q,
+    q: typeof q.q === "string" ? q.q : undefined,
     avatarIds: String(q.avatar ?? "").split(",").map((s) => toInt(s, NaN)).filter((n) => Number.isFinite(n)),
     avatarMatch: q.avatarMatch === "all" ? "all" : "any",
     ownedOnly: isTrue(q.ownedOnly),
@@ -132,7 +137,9 @@ function parseItemQuery(q: any): ItemQuery {
     pendingCategory: isTrue(q.pendingCategory),
     tagNames: csvParam(q.tags), tagMatch: q.tagsMatch === "all" ? "all" : "any",
     favoriteOnly: isTrue(q.favoriteOnly),
-    sort: q.sort === "title" || q.sort === "size" ? q.sort : "updated",
+    sort: q.sort === "title" || q.sort === "size" || q.sort === "updated" || q.sort === "relevance" ? q.sort : undefined,
+    searchDebug: isTrue(q.debug),
+
     limit: toInt(q.limit, 60), offset: toInt(q.offset, 0),
   };
 }
@@ -245,6 +252,14 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
   deps_log = deps.log;
   setUnityLogger(deps.log);
   const { repo, media, booth } = deps;
+  const readSearch = async (task: Parameters<SearchReader["read"]>[0], reply: FastifyReply) => {
+    if (!deps.searchReader) return runSearchRead(repo, task);
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    reply.raw.once("close", cancel);
+    try { return await deps.searchReader.read(task, controller.signal); }
+    finally { reply.raw.off("close", cancel); }
+  };
   const itemAssetScans = new Map<number, ReturnType<typeof scanItemAssets>>();
   /** P1-T5：stage 下载与 commit 共用同一 codec（进程内一次构造；epoch 随进程变化）。 */
   const stageCodec = deps.stageCodec ?? createStageTokenCodec(randomBytes(32), randomUUID());
@@ -280,9 +295,70 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
     try {
       // 参数解析统一走 parseItemQuery（与 /api/categories/counts 同一口径）：
       // 关键词/分类(catIds+catMatch)/标签(tags+tagsMatch，或旧的 tag=)/收藏/未分类/待确认/来源/状态/容器/已导入/头像 全部落到真实 SQL。
-      return repo.listItems(parseItemQuery(req.query as any));
+      return await readSearch({ kind: "items", query: parseItemQuery(req.query) }, reply);
     } catch (e) { return fail(reply, e); }
   });
+
+  app.get("/api/search/suggestions", async (req, reply) => {
+    try { return await readSearch({ kind: "suggestions", input: String((req.query as { q?: string }).q ?? "") }, reply); }
+    catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/search/facets", async (req, reply) => {
+    try {
+      const query = req.query as Record<string, string>;
+      const dimension = SEARCH_FACETS.find((d) => d === query.dimension);
+      if (!dimension) return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "请选择有效的筛选维度" } });
+      return await readSearch({ kind: "facets", dimension, query: parseItemQuery(query) }, reply);
+    } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/search/alternatives", async (req, reply) => {
+    try {
+      return await readSearch({ kind: "alternatives", query: parseItemQuery(req.query) }, reply);
+    } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/search/index", async () => ({
+    ...searchIndexStatus(repo.connection), paused: repo.getSetting(SEARCH_PAUSE_KEY) === "1",
+  }));
+  app.post("/api/search/index", async (req, reply) => {
+    try {
+      const { action } = (req.body ?? {}) as { action?: string };
+      if (action === "pause" || action === "resume") {
+        repo.setSetting(SEARCH_PAUSE_KEY, action === "pause" ? "1" : "0");
+      } else if (action === "cancel-rebuild") {
+        repo.connection.transaction(() => {
+          const jobs = repo.connection.prepare("SELECT id,state FROM jobs WHERE kind='reindex' AND state IN ('queued','resolving','paused')"
+            + " AND json_extract(payload,'$.searchMaintenance')='rebuild'").all() as { id: number; state: string }[];
+          for (const job of jobs) {
+            if (job.state === "paused") repo.transitionJob(job.id, "resume");
+            repo.transitionJob(job.id, "stop");
+            repo.transitionJob(job.id, "cancel_apply");
+          }
+          repo.connection.prepare("DELETE FROM search_dirty WHERE refresh_only=1").run();
+        }).immediate();
+      } else if (action === "rebuild" || action === "repair") {
+        const job = repo.connection.transaction(() => {
+          const queued = repo.connection.prepare("SELECT id FROM jobs WHERE kind='reindex' AND state IN ('queued','resolving','paused')"
+            + " AND json_extract(payload,'$.searchMaintenance')=? ORDER BY id DESC LIMIT 1").pluck().get(action);
+          return queued ? { id: Number(queued) } : repo.createJob("reindex", null, { searchMaintenance: action });
+        }).immediate();
+        return { jobId: job.id };
+      } else return reply.status(400).send({ error: { code: "INVALID_INPUT", message: "未知搜索维护操作" } });
+      return { ...searchIndexStatus(repo.connection), paused: repo.getSetting(SEARCH_PAUSE_KEY) === "1" };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.get("/api/search/lexicon", async () => ({
+    concepts: (repo.connection.prepare("SELECT concept_json FROM search_lexicon ORDER BY id").pluck().all() as string[]).map((json) => JSON.parse(json)),
+  }));
+  app.put("/api/search/lexicon/:id", async (req, reply) => {
+    try {
+      const id = (req.params as { id: string }).id;
+      saveSearchConcept(repo.connection, { ...(req.body as Parameters<typeof saveSearchConcept>[1]), id });
+      return { id };
+    } catch (e) { return fail(reply, e); }
+  });
+  app.delete("/api/search/lexicon/:id", async (req) => ({
+    removed: repo.connection.prepare("DELETE FROM search_lexicon WHERE id=?").run((req.params as { id: string }).id).changes > 0,
+  }));
 
   app.get("/api/items/:id", async (req, reply) => {
     try {
@@ -1391,7 +1467,8 @@ export function registerRoutes(app: FastifyInstance, deps: RouteDeps): void {
    * 恒等式：counts.all === GET /api/items（同一 query）.total。
    */
   app.get("/api/categories/counts", async (req, reply) => {
-    try { return repo.categoryCounts(parseItemQuery(req.query as any)); } catch (e) { return fail(reply, e); }
+    try { return await readSearch({ kind: "counts", query: parseItemQuery(req.query) }, reply); }
+    catch (e) { return fail(reply, e); }
   });
 
   app.post("/api/categories", async (req, reply) => {

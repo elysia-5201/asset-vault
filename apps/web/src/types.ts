@@ -84,6 +84,11 @@ export interface HealthResponse {
 export interface ItemsResponse {
   total: number;
   items: ItemCardWeb[];
+  search?: {
+    candidateLimit?: number;
+    filters: import("@core/search-query").SearchFilter[];
+    intents: { text: string; label: string; start: number; end: number; field: string }[];
+  };
 }
 export interface AvatarsResponse {
   avatars: AvatarCard[];
@@ -326,7 +331,7 @@ export interface ItemQuery {
   tagsMatch?: "any" | "all";
   /** 只看收藏（URL 键 favoriteOnly=1） */
   favoriteOnly?: boolean;
-  sort?: "updated" | "title" | "size";
+  sort?: "relevance" | "updated" | "title" | "size";
   limit?: number;
   offset?: number;
 }
